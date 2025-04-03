@@ -1866,6 +1866,15 @@ VMMR0_INT_DECL(void) hmR0DumpDescriptor(PCX86DESCHC pDesc, RTSEL Sel, const char
  * @param   pVCpu   The cross context virtual CPU structure.
  * @param   fFlags  The dumping flags (HM_DUMP_REG_FLAGS_XXX).
  */
+/*
+  通用寄存器(GPRs)
+  控制寄存器(CR0-CR4)
+  段寄存器(CS,DS,ES等)
+  调试寄存器(DR0-DR7)
+  标志寄存器(EFLAGS)
+  FPU/MMX/SSE 状态
+  特殊模式寄存器(MSRs)
+*/
 VMMR0_INT_DECL(void) hmR0DumpRegs(PVMCPUCC pVCpu, uint32_t fFlags)
 {
     /*
@@ -1884,14 +1893,17 @@ VMMR0_INT_DECL(void) hmR0DumpRegs(PVMCPUCC pVCpu, uint32_t fFlags)
         { "vm",  NULL, X86_EFL_VM  },
         { "rf",  NULL, X86_EFL_RF  },
         { "nt",  NULL, X86_EFL_NT  },
+		//"ov"/"nv" 表示溢出标志(OF)
         { "ov",  "nv", X86_EFL_OF  },
         { "dn",  "up", X86_EFL_DF  },
+		//"ei"/"di" 表示中断使能标志(IF)
         { "ei",  "di", X86_EFL_IF  },
         { "tf",  NULL, X86_EFL_TF  },
         { "nt",  "pl", X86_EFL_SF  },
         { "nz",  "zr", X86_EFL_ZF  },
         { "ac",  "na", X86_EFL_AF  },
         { "po",  "pe", X86_EFL_PF  },
+		//"cy"/"nc" 表示进位标志(CF)
         { "cy",  "nc", X86_EFL_CF  },
     };
     char szEFlags[80];
