@@ -1753,6 +1753,19 @@ VMMR0_INT_DECL(void) hmR0DumpDescriptor(PCX86DESCHC pDesc, RTSEL Sel, const char
     {
         unsigned    cch;
         const char *psz;
+/*
+  这个数组定义了 32 种可能的描述符类型，包括：
+  系统描述符类型(0x00-0x0F)：
+  TSS(任务状态段)
+  LDT(局部描述符表)
+  调用门
+  中断门
+  陷阱门
+  非系统描述符类型(0x10-0x1F)：
+  数据段(只读/读写)
+  代码段(只执行/可读)
+  各种访问权限组合
+*/
     } const s_aTypes[32] =
     {
 # define STRENTRY(str) { sizeof(str) - 1, str }
@@ -1819,6 +1832,16 @@ VMMR0_INT_DECL(void) hmR0DumpDescriptor(PCX86DESCHC pDesc, RTSEL Sel, const char
     memcpy(psz, s_aTypes[i].psz, s_aTypes[i].cch);
     psz += s_aTypes[i].cch;
 
+/*
+  函数会检查并输出以下描述符属性：
+  Present/Not-Present (存在位)
+  64-bit/Comp (64位模式特有)
+  Page/Granularity (粒度)
+  32-bit/16-bit (默认操作数大小)
+
+  64 bit: CS { 0x0010 - 0x00000000 0x00209b00 - base=0x00000000 limit=0x000fffff dpl=0 } CodeER Present 64-bit
+  32 bit: DS { 0x0023 - 0x0000ffff 0x00cf9300 - base=0x00000000 limit=0xffffffff dpl=3 } DataRW Present Page 32-bit
+*/
     if (pDesc->Gen.u1Present)
         ADD_STR(psz, "Present ");
     else
@@ -1834,7 +1857,7 @@ VMMR0_INT_DECL(void) hmR0DumpDescriptor(PCX86DESCHC pDesc, RTSEL Sel, const char
     if (pDesc->Gen.u1DefBig)
         ADD_STR(psz, "32-bit ");
     else
-        ADD_STR(psz, "16-bit ");
+        ADD_STR(psz, "16-bit ");//拼接字符串的辅助宏
 # endif
 # undef ADD_STR
     *psz = '\0';
@@ -1843,14 +1866,14 @@ VMMR0_INT_DECL(void) hmR0DumpDescriptor(PCX86DESCHC pDesc, RTSEL Sel, const char
      * Limit and Base and format the output.
      */
 #ifdef LOG_ENABLED
-    uint32_t u32Limit = X86DESC_LIMIT_G(pDesc);
+    uint32_t u32Limit = X86DESC_LIMIT_G(pDesc); //计算考虑粒度的段界限
 
 # if HC_ARCH_BITS == 64
-    uint64_t const u64Base  = X86DESC64_BASE(pDesc);
+    uint64_t const u64Base  = X86DESC64_BASE(pDesc);//获取段基址
     Log(("  %s { %#04x - %#RX64 %#RX64 - base=%#RX64 limit=%#08x dpl=%d } %s\n", pszSel,
          Sel, pDesc->au64[0], pDesc->au64[1], u64Base, u32Limit, pDesc->Gen.u2Dpl, szMsg));
 # else
-    uint32_t const u32Base  = X86DESC_BASE(pDesc);
+    uint32_t const u32Base  = X86DESC_BASE(pDesc);//获取段基址
     Log(("  %s { %#04x - %#08x %#08x - base=%#08x limit=%#08x dpl=%d } %s\n", pszSel,
          Sel, pDesc->au32[0], pDesc->au32[1], u32Base, u32Limit, pDesc->Gen.u2Dpl, szMsg));
 # endif
@@ -1927,7 +1950,9 @@ VMMR0_INT_DECL(void) hmR0DumpRegs(PVMCPUCC pVCpu, uint32_t fFlags)
         /*
          * Format the registers.
          */
+        // 输出通用寄存器
         if (CPUMIsGuestIn64BitCode(pVCpu))
+            // 64位模式寄存器输出
             Log(("rax=%016RX64 rbx=%016RX64 rcx=%016RX64 rdx=%016RX64\n"
                  "rsi=%016RX64 rdi=%016RX64 r8 =%016RX64 r9 =%016RX64\n"
                  "r10=%016RX64 r11=%016RX64 r12=%016RX64 r13=%016RX64\n"

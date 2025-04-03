@@ -498,6 +498,7 @@ typedef struct SSMSTRMOPS const *PCSSMSTRMOPS;
 /** Pointer to a CPUMCTX. */
 typedef struct CPUMCTX *PCPUMCTX;
 /** Pointer to a const CPUMCTX. */
+//armv8/amd64
 typedef const struct CPUMCTX *PCCPUMCTX;
 
 /** Pointer to a selector register. */

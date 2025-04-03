@@ -379,10 +379,12 @@ typedef struct CPUMCTX
 
     /** 0x0110 - The task register.
      * Only the guest context uses all the members. */
-    CPUMSELREG          ldtr;
+	//主机环境不需要完整模拟这些寄存器
+    //嵌套虚拟化场景下需要区分不同层级的状态
+    CPUMSELREG          ldtr;//作用：指向当前任务的 LDT（局部描述符表）
     /** 0x0128 - The task register.
      * Only the guest context uses all the members. */
-    CPUMSELREG          tr;
+    CPUMSELREG          tr; //作用：指向当前任务的 TSS（任务状态段）
 
     /** 0x0140 - The program counter. */
     union
