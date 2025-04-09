@@ -391,6 +391,11 @@ DECLASM(int) VMXEnable(RTHCPHYS HCPhysVmxOn);
 #else
 DECLINLINE(int) VMXEnable(RTHCPHYS HCPhysVmxOn)
 {
+/*
+    检查CR4.VMXE是否启用
+    将VMXON区域物理地址加载到VMXON指针寄存器
+    执行VMXON指令
+*/
 # if VMX_USE_MSC_INTRINSICS
     unsigned char rcMsc = __vmx_on(&HCPhysVmxOn);
     if (RT_LIKELY(rcMsc == 0))

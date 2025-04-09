@@ -345,37 +345,51 @@ static RTCPUID hmR0FirstRcGetCpuId(PHMR0FIRSTRC pFirstRc)
  * @returns VBox status code.
  * @param   uVmxBasicMsr    The host's IA32_VMX_BASIC_MSR value.
  */
+//验证当前CPU能否安全进入和退出Intel VT-x（VMX）根模式
+/*
+    硬件支持性：VMX指令是否可用
+    环境冲突：是否已被其他虚拟化软件（如KVM）占用
+    内存/寄存器状态：VMXON区域配置是否正确
+*/
 static int hmR0InitIntelVerifyVmxUsability(uint64_t uVmxBasicMsr)
 {
     /* Allocate a temporary VMXON region. */
     RTR0MEMOBJ hScatchMemObj;
-    int rc = RTR0MemObjAllocCont(&hScatchMemObj, HOST_PAGE_SIZE, NIL_RTHCPHYS /* PhysHighest */, false /* fExecutable */);
+    //VT-x规范要求VMXON区域必须位于4KB对齐的物理连续内存
+    //安全考虑（false参数），防止该区域被误执行为代码。
+    int rc = RTR0MemObjAllocCont(&hScatchMemObj, HOST_PAGE_SIZE, NIL_RTHCPHYS /* PhysHighest */, false /* fExecutable */);//分配临时VMXON区域
     if (RT_FAILURE(rc))
     {
         LogRelFunc(("RTR0MemObjAllocCont(,HOST_PAGE_SIZE,false) -> %Rrc\n", rc));
         return rc;
     }
+
+    //设置VMXON区域头
     void          *pvScatchPage      = RTR0MemObjAddress(hScatchMemObj);
     RTHCPHYS const HCPhysScratchPage = RTR0MemObjGetPagePhysAddr(hScatchMemObj, 0);
     RT_BZERO(pvScatchPage, HOST_PAGE_SIZE);
 
     /* Set revision dword at the beginning of the VMXON structure. */
+    //uVmxBasicMsr来源：MSR_IA32_VMX_BASIC（通过CPUID读取）
+    //VMX_BF_BASIC_VMCS_ID是VMCS修订标识符，必须写入VMXON区域首4字节。
     *(uint32_t *)pvScatchPage = RT_BF_GET(uVmxBasicMsr, VMX_BF_BASIC_VMCS_ID);
 
     /* Make sure we don't get rescheduled to another CPU during this probe. */
-    RTCCUINTREG const fEFlags = ASMIntDisableFlags();
+    RTCCUINTREG const fEFlags = ASMIntDisableFlags(); // 关闭中断
 
     /* Enable CR4.VMXE if it isn't already set. */
-    RTCCUINTREG const uOldCr4 = SUPR0ChangeCR4(X86_CR4_VMXE, RTCCUINTREG_MAX);
+    //若原未启用（!(uOldCr4 & X86_CR4_VMXE)），后续必须恢复，否则可能导致宿主系统崩溃。
+    RTCCUINTREG const uOldCr4 = SUPR0ChangeCR4(X86_CR4_VMXE, RTCCUINTREG_MAX);// 启用CR4.VMXE
 
     /*
      * The only way of checking if we're in VMX root mode is to try and enter it.
      * There is no instruction or control bit that tells us if we're in VMX root mode.
      * Therefore, try and enter and exit VMX root mode.
      */
-    rc = VMXEnable(HCPhysScratchPage);
+    //VMXON区域仅存在数微秒，操作后立即释放资源。
+    rc = VMXEnable(HCPhysScratchPage);// 执行VMXON指令
     if (RT_SUCCESS(rc))
-        VMXDisable();
+        VMXDisable(); // 执行VMXOFF指令
     else
     {
         /*
@@ -389,6 +403,12 @@ static int hmR0InitIntelVerifyVmxUsability(uint64_t uVmxBasicMsr)
          *
          * They should fix their code, but until they do we simply refuse to run.
          */
+        /*
+            当CPU处于VMX根模式时：
+            清除CR4.VMXE会触发#GP异常（违反Intel SDM规则）
+            关闭分页（如切换到实模式）也会触发#GP
+            直接拒绝启动（而非强制清理，避免宿主崩溃）。
+        */
         rc = VERR_VMX_IN_VMX_ROOT_MODE;
     }
 
@@ -430,6 +450,13 @@ static DECLCALLBACK(void) hmR0InitIntelCpu(RTCPUID idCpu, void *pvUser1, void *p
  *
  * @returns VBox status code (will only fail if out of memory).
  */
+/*
+    检测并启用 VT-x 支持通过主机OS接口或直接操作CPU）。
+    读取关键 CPU 寄存器与 MSR如 CR4、EFER、VMX_BASIC）。
+    验证 VT-x 可用性检查 VMX 根模式能否正常进入）。
+    初始化全局 VT-x 状态如 VPID、抢占定时器、EFER 交换支持）。
+    安装 VT-x 操作函数集替换默认的 g_HmR0Ops）。
+ * */
 static int hmR0InitIntel(void)
 {
     /* Read this MSR now as it may be useful for error reporting when initializing VT-x fails. */
@@ -440,8 +467,8 @@ static int hmR0InitIntel(void)
      * (This is only supported by some Mac OS X kernels atm.)
      */
     int rc;
-    g_rcHmInit = rc = SUPR0EnableVTx(true /* fEnable */);
-    g_fHmVmxUsingSUPR0EnableVTx = rc != VERR_NOT_SUPPORTED;
+    g_rcHmInit = rc = SUPR0EnableVTx(true /* fEnable */);//调用宿主内核接口尝试启用 VT-x。
+    g_fHmVmxUsingSUPR0EnableVTx = rc != VERR_NOT_SUPPORTED;//成功（VINF_SUCCESS）：标记 g_fHmVmxUsingSUPR0EnableVTx = true，后续依赖宿主OS管理。
     if (g_fHmVmxUsingSUPR0EnableVTx)
     {
         AssertLogRelMsg(rc == VINF_SUCCESS || rc == VERR_VMX_IN_VMX_ROOT_MODE || rc == VERR_VMX_NO_VMX, ("%Rrc\n", rc));
@@ -457,27 +484,33 @@ static int hmR0InitIntel(void)
     {
         HMR0FIRSTRC FirstRc;
         hmR0FirstRcInit(&FirstRc);
-        g_rcHmInit = rc = RTMpOnAll(hmR0InitIntelCpu, &FirstRc, NULL);
+        /*
+            hmR0InitIntelCpu的职责：
+              执行 VMXON 指令进入 VMX 根模式。
+              检查 BIOS 是否启用 VT-x（MSR_IA32_FEATURE_CONTROL）。
+              返回 VERR_VMX_NO_VMX（硬件不支持）或 VERR_VMX_IN_VMX_ROOT_MODE（已被占用）。
+        */
+        g_rcHmInit = rc = RTMpOnAll(hmR0InitIntelCpu, &FirstRc, NULL); // 在所有CPU核上初始化VT-x
         if (RT_SUCCESS(rc))
-            g_rcHmInit = rc = hmR0FirstRcGetStatus(&FirstRc);
+            g_rcHmInit = rc = hmR0FirstRcGetStatus(&FirstRc); // 获取首个错误
     }
 
     if (RT_SUCCESS(rc))
     {
         /* Read CR4 and EFER for logging/diagnostic purposes. */
         g_uHmVmxHostCr0     = ASMGetCR0();
-        g_uHmVmxHostCr4     = ASMGetCR4();
-        g_uHmVmxHostMsrEfer = ASMRdMsr(MSR_K6_EFER);
+        g_uHmVmxHostCr4     = ASMGetCR4();// 读取CR4（含VMXE标志）
+        g_uHmVmxHostMsrEfer = ASMRdMsr(MSR_K6_EFER)// 读取EFER MSR
 
         /* Get VMX MSRs (and feature control MSR) for determining VMX features we can ultimately use. */
-        SUPR0GetHwvirtMsrs(&g_HmMsrs, SUPVTCAPS_VT_X, false /* fForce */);
+        SUPR0GetHwvirtMsrs(&g_HmMsrs, SUPVTCAPS_VT_X, false /* fForce */);// 获取VMX相关MSR
 
         /*
          * Nested KVM workaround: Intel SDM section 34.15.5 describes that
          * MSR_IA32_SMM_MONITOR_CTL depends on bit 49 of MSR_IA32_VMX_BASIC while
          * table 35-2 says that this MSR is available if either VMX or SMX is supported.
          */
-        uint64_t const uVmxBasicMsr = g_HmMsrs.u.vmx.u64Basic;
+        uint64_t const uVmxBasicMsr = g_HmMsrs.u.vmx.u64Basic;//确定 VMCS 字段宽度、支持的功能。
         if (RT_BF_GET(uVmxBasicMsr, VMX_BF_BASIC_DUAL_MON))
             g_uHmVmxHostSmmMonitorCtl = ASMRdMsr(MSR_IA32_SMM_MONITOR_CTL);
 
@@ -513,6 +546,7 @@ static int hmR0InitIntel(void)
              *
              * This is just a quick sanity check.
              */
+            //临时进入 VMX 根模式，验证是否能正常执行 VMLAUNCH。验证后立即退出，避免长期占用 VT-x。
             rc = hmR0InitIntelVerifyVmxUsability(uVmxBasicMsr);
             if (RT_SUCCESS(rc))
                 g_fHmVmxSupported = true;
@@ -525,24 +559,30 @@ static int hmR0InitIntel(void)
 
         if (g_fHmVmxSupported)
         {
-            rc = VMXR0GlobalInit();
+            rc = VMXR0GlobalInit(); // 初始化VMX全局资源
             if (RT_SUCCESS(rc))
             {
                 /*
                  * Install the VT-x methods.
                  */
-                g_HmR0Ops = g_HmR0OpsVmx;
+                /*
+                  pfnEnterCpu → VMXEnableCpu
+                  pfnExitCpu → VMXDisableCpu
+                  pfnRunVm → VMXR0RunGuest
+                */
+                g_HmR0Ops = g_HmR0OpsVmx;// 绑定VT-x操作函数
 
                 /*
                  * Check for the VMX-Preemption Timer and adjust for the "VMX-Preemption
                  * Timer Does Not Count Down at the Rate Specified" CPU erratum.
                  */
+                // 抢占定时器校准
                 if (g_HmMsrs.u.vmx.PinCtls.n.allowed1 & VMX_PIN_CTLS_PREEMPT_TIMER)
                 {
                     g_fHmVmxUsePreemptTimer   = true;
                     g_cHmVmxPreemptTimerShift = RT_BF_GET(g_HmMsrs.u.vmx.u64Misc, VMX_BF_MISC_PREEMPT_TIMER_TSC);
                     if (HMIsSubjectToVmxPreemptTimerErratum())
-                        g_cHmVmxPreemptTimerShift = 0; /* This is about right most of the time here. */
+                        g_cHmVmxPreemptTimerShift = 0; /* This is about right most of the time here. */// 根据CPU勘误调整
                 }
                 else
                     g_fHmVmxUsePreemptTimer   = false;
@@ -550,6 +590,7 @@ static int hmR0InitIntel(void)
                 /*
                  * Check for EFER swapping support.
                  */
+                //EFER交换支持
                 g_fHmVmxSupportsVmcsEfer = (g_HmMsrs.u.vmx.EntryCtls.n.allowed1 & VMX_ENTRY_CTLS_LOAD_EFER_MSR)
                                         && (g_HmMsrs.u.vmx.ExitCtls.n.allowed1  & VMX_EXIT_CTLS_LOAD_EFER_MSR)
                                         && (g_HmMsrs.u.vmx.ExitCtls.n.allowed1  & VMX_EXIT_CTLS_SAVE_EFER_MSR);
@@ -594,6 +635,13 @@ static DECLCALLBACK(void) hmR0InitAmdCpu(RTCPUID idCpu, void *pvUser1, void *pvU
  *
  * @returns VBox status code (will only fail if out of memory).
  */
+/*
+    全局 AMD-V 初始化调用 SVMR0GlobalInit）。
+    安装 AMD-V 操作函数集替换默认的 g_HmR0Ops）。
+    检测 CPU 的 AMD-V 特性通过 CPUID 指令）。
+    验证所有 CPU 核的 AMD-V 状态防止 BIOS 配置错误）。
+    处理错误降级（如 AMD-V 被禁用或被其他程序占用）。 
+*/
 static int hmR0InitAmd(void)
 {
     /* Call the global AMD-V initialization routine (should only fail in out-of-memory situations). */
@@ -646,16 +694,24 @@ static int hmR0InitAmd(void)
  *
  * @returns VBox status code.
  */
+/*
+    HMR0Init 是 VirtualBox 硬件虚拟化模块（HM）的全局初始化函数，负责在 Ring-0（内核态）完成以下核心任务：
+
+    初始化全局状态（如 CPU 信息数组、虚拟化支持标志）。
+    检测硬件虚拟化能力（Intel VT-x 或 AMD-V）。
+    注册系统回调（CPU 热插拔、电源事件）。
+    架构特定初始化（调用 hmR0InitIntel 或 hmR0InitAmd）。
+*/
 VMMR0_INT_DECL(int) HMR0Init(void)
 {
     /*
      * Initialize the globals.
      */
-    g_fHmEnabled = false;
+    g_fHmEnabled = false;// 标记虚拟化模块未启用
     for (unsigned i = 0; i < RT_ELEMENTS(g_aHmCpuInfo); i++)
     {
-        g_aHmCpuInfo[i].idCpu        = NIL_RTCPUID;
-        g_aHmCpuInfo[i].hMemObj      = NIL_RTR0MEMOBJ;
+        g_aHmCpuInfo[i].idCpu        = NIL_RTCPUID; // 重置CPU ID
+        g_aHmCpuInfo[i].hMemObj      = NIL_RTR0MEMOBJ;// 释放内存对象
         g_aHmCpuInfo[i].HCPhysMemObj = NIL_RTHCPHYS;
         g_aHmCpuInfo[i].pvMemObj     = NULL;
 #ifdef VBOX_WITH_NESTED_HWVIRT_SVM
@@ -666,10 +722,10 @@ VMMR0_INT_DECL(int) HMR0Init(void)
     }
 
     /* Fill in all callbacks with placeholders. */
-    g_HmR0Ops          = g_HmR0OpsDummy;
+    g_HmR0Ops          = g_HmR0OpsDummy; // 设置虚拟化操作为空实现
 
     /* Default is global VT-x/AMD-V init. */
-    g_fHmGlobalInit    = true;
+    g_fHmGlobalInit    = true;// 标记全局初始化开始
 
     g_fHmVmxSupported  = false;
     g_fHmSvmSupported  = false;
@@ -679,7 +735,7 @@ VMMR0_INT_DECL(int) HMR0Init(void)
      * Get host kernel features that HM might need to know in order
      * to co-operate and function properly with the host OS (e.g. SMAP).
      */
-    g_fHmHostKernelFeatures = SUPR0GetKernelFeatures();
+    g_fHmHostKernelFeatures = SUPR0GetKernelFeatures();//获取宿主内核特性（如 SMAP/SMEP），用于后续虚拟化配置的兼容性处理。
 
     /*
      * Make sure aCpuInfo is big enough for all the CPUs on this system.
@@ -695,15 +751,15 @@ VMMR0_INT_DECL(int) HMR0Init(void)
      * Return failure only in out-of-memory situations.
      */
     uint32_t fCaps = 0;
-    int rc = SUPR0GetVTSupport(&fCaps);
+    int rc = SUPR0GetVTSupport(&fCaps); // 调用底层接口检测VT-x/AMD-V
     if (RT_SUCCESS(rc))
     {
         if (fCaps & SUPVTCAPS_VT_X)
-            rc = hmR0InitIntel();
+            rc = hmR0InitIntel(); // 初始化Intel VT-x
         else
         {
             Assert(fCaps & SUPVTCAPS_AMD_V);
-            rc = hmR0InitAmd();
+            rc = hmR0InitAmd();// 初始化AMD-V
         }
         if (RT_SUCCESS(rc))
         {
@@ -713,10 +769,10 @@ VMMR0_INT_DECL(int) HMR0Init(void)
              */
             if (!g_fHmVmxUsingSUPR0EnableVTx)
             {
-                rc = RTMpNotificationRegister(hmR0MpEventCallback, NULL);
+                rc = RTMpNotificationRegister(hmR0MpEventCallback, NULL);// CPU热插拔回调
                 if (RT_SUCCESS(rc))
                 {
-                    rc = RTPowerNotificationRegister(hmR0PowerCallback, NULL);
+                    rc = RTPowerNotificationRegister(hmR0PowerCallback, NULL);// 电源事件回调,响应系统休眠/唤醒事件
                     if (RT_FAILURE(rc))
                         RTMpNotificationDeregister(hmR0MpEventCallback, NULL);
                 }
@@ -725,11 +781,11 @@ VMMR0_INT_DECL(int) HMR0Init(void)
                     /* There shouldn't be any per-cpu allocations at this point,
                        so just have to call SVMR0GlobalTerm and VMXR0GlobalTerm. */
                     if (fCaps & SUPVTCAPS_VT_X)
-                        VMXR0GlobalTerm();
+                        VMXR0GlobalTerm();// 清理VT-x资源
                     else
-                        SVMR0GlobalTerm();
-                    g_HmR0Ops         = g_HmR0OpsDummy;
-                    g_rcHmInit     = rc;
+                        SVMR0GlobalTerm();// 清理AMD-V资源
+                    g_HmR0Ops         = g_HmR0OpsDummy;// 重置操作为空实现
+                    g_rcHmInit     = rc;// 保存错误码
                     g_fHmSvmSupported = false;
                     g_fHmVmxSupported = false;
                 }
@@ -750,11 +806,18 @@ VMMR0_INT_DECL(int) HMR0Init(void)
  *
  * @returns VBox status code (ignored).
  */
+/*
+    全局终止函数，负责清理硬件虚拟化（VT-x/AMD-V）相关的所有资源，包括：
+        禁用 CPU 核的虚拟化功能如执行 VMXOFF）
+        释放内存资源（如 VMXON 区域、VMCB 结构）
+        注销系统回调（如 CPU 热插拔、电源事件）
+        调用架构特定的终止逻辑（Intel VT-x 或 AMD SVM）
+ */
 VMMR0_INT_DECL(int) HMR0Term(void)
 {
     int rc;
     if (   g_fHmVmxSupported
-        && g_fHmVmxUsingSUPR0EnableVTx)
+        && g_fHmVmxUsingSUPR0EnableVTx)//当 VirtualBox ‌依赖主机OS‌（如 macOS 的 vmm.kext）管理 VT-x 时。
     {
         /*
          * Simple if the host OS manages VT-x.
@@ -763,8 +826,8 @@ VMMR0_INT_DECL(int) HMR0Term(void)
 
         if (g_fHmVmxCalledSUPR0EnableVTx)
         {
-            rc = SUPR0EnableVTx(false /* fEnable */);
-            g_fHmVmxCalledSUPR0EnableVTx = false;
+            rc = SUPR0EnableVTx(false /* fEnable */);//禁用 VT-x
+            g_fHmVmxCalledSUPR0EnableVTx = false;//重置 CPU 状态
         }
         else
             rc = VINF_SUCCESS;
@@ -772,16 +835,16 @@ VMMR0_INT_DECL(int) HMR0Term(void)
         for (unsigned iCpu = 0; iCpu < RT_ELEMENTS(g_aHmCpuInfo); iCpu++)
         {
             g_aHmCpuInfo[iCpu].fConfigured = false;
-            Assert(g_aHmCpuInfo[iCpu].hMemObj == NIL_RTR0MEMOBJ);
+            Assert(g_aHmCpuInfo[iCpu].hMemObj == NIL_RTR0MEMOBJ);//确保内存对象已释放
         }
     }
-    else
+    else//默认路径，VirtualBox 自行管理 VT-x/AMD-V 资源。
     {
         Assert(!g_fHmVmxSupported || !g_fHmVmxUsingSUPR0EnableVTx);
 
         /* Doesn't really matter if this fails. */
-        RTMpNotificationDeregister(hmR0MpEventCallback, NULL);
-        RTPowerNotificationDeregister(hmR0PowerCallback, NULL);
+        RTMpNotificationDeregister(hmR0MpEventCallback, NULL);// CPU热插拔
+        RTPowerNotificationDeregister(hmR0PowerCallback, NULL);// 电源事件
         rc = VINF_SUCCESS;
 
         /*
@@ -791,6 +854,10 @@ VMMR0_INT_DECL(int) HMR0Term(void)
         {
             HMR0FIRSTRC FirstRc;
             hmR0FirstRcInit(&FirstRc);
+            /*
+                通过 RTMpOnAll 在所有 CPU 核上调用 hmR0DisableCpuCallback。
+                使用 HMR0FIRSTRC 记录首个错误（多核同步）。
+            */
             rc = RTMpOnAll(hmR0DisableCpuCallback, NULL /* pvUser 1 */, &FirstRc);
             Assert(RT_SUCCESS(rc) || rc == VERR_NOT_SUPPORTED);
             if (RT_SUCCESS(rc))
@@ -800,6 +867,9 @@ VMMR0_INT_DECL(int) HMR0Term(void)
         /*
          * Free the per-cpu pages used for VT-x and AMD-V.
          */
+        //释放对象：
+        //VT-x 的 VMXON 区域或 AMD-V 的 VMCB 结构。
+        //嵌套虚拟化相关资源（如 SVM 的 MSRPM 页）。
         for (unsigned i = 0; i < RT_ELEMENTS(g_aHmCpuInfo); i++)
         {
             if (g_aHmCpuInfo[i].hMemObj != NIL_RTR0MEMOBJ)
@@ -845,27 +915,30 @@ VMMR0_INT_DECL(int) HMR0Term(void)
  */
 static int hmR0EnableCpu(PVMCC pVM, RTCPUID idCpu)
 {
-    PHMPHYSCPU pHostCpu = &g_aHmCpuInfo[idCpu];
+    PHMPHYSCPU pHostCpu = &g_aHmCpuInfo[idCpu];// 获取当前CPU核的硬件虚拟化状态结构体
 
-    Assert(idCpu == (RTCPUID)RTMpCpuIdToSetIndex(idCpu)); /** @todo fix idCpu == index assumption (rainy day) */
-    Assert(idCpu < RT_ELEMENTS(g_aHmCpuInfo));
-    Assert(!pHostCpu->fConfigured);
-    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
+    Assert(idCpu == (RTCPUID)RTMpCpuIdToSetIndex(idCpu)); /** @todo fix idCpu == index assumption (rainy day) */// 确保CPU逻辑ID与索引一致
+    Assert(idCpu < RT_ELEMENTS(g_aHmCpuInfo));// 防止数组越界
+    Assert(!pHostCpu->fConfigured);// 确保当前CPU未配置过虚拟化
+    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));// 必须在非抢占上下文中执行
 
-    pHostCpu->idCpu = idCpu;
+    pHostCpu->idCpu = idCpu;// 记录当前CPU核ID
     /* Do NOT reset cTlbFlushes here, see @bugref{6255}. */
 
     int rc;
     if (   g_fHmVmxSupported
         && g_fHmVmxUsingSUPR0EnableVTx)
+        // 情况1：使用SUPR0模块直接启用VT-x（依赖主机OS支持）
+        // 手动路径需确保内存对象有效（hMemObj != NIL_RTR0MEMOBJ）
         rc = g_HmR0Ops.pfnEnableCpu(pHostCpu, pVM, NULL /* pvCpuPage */, NIL_RTHCPHYS, true, &g_HmMsrs);
     else
     {
+        //情况2：手动配置虚拟化资源（默认路径）
         AssertLogRelMsgReturn(pHostCpu->hMemObj != NIL_RTR0MEMOBJ, ("hmR0EnableCpu failed idCpu=%u.\n", idCpu), VERR_HM_IPE_1);
         rc = g_HmR0Ops.pfnEnableCpu(pHostCpu, pVM, pHostCpu->pvMemObj, pHostCpu->HCPhysMemObj, false, &g_HmMsrs);
     }
     if (RT_SUCCESS(rc))
-        pHostCpu->fConfigured = true;
+        pHostCpu->fConfigured = true;// 标记当前CPU已配置虚拟化
     return rc;
 }
 
@@ -877,12 +950,25 @@ static int hmR0EnableCpu(PVMCC pVM, RTCPUID idCpu)
  * @param   pvUser1     Opaque pointer to the VM (can be NULL!).
  * @param   pvUser2     The 2nd user argument.
  */
+//在指定 CPU 核上启用硬件虚拟化功
+//pvUser2: 用户参数 2，此处为多核同步结构体指针 PHMR0FIRSTRC。
 static DECLCALLBACK(void) hmR0EnableCpuCallback(RTCPUID idCpu, void *pvUser1, void *pvUser2)
 {
     PVMCC           pVM      = (PVMCC)pvUser1;     /* can be NULL! */
-    PHMR0FIRSTRC    pFirstRc = (PHMR0FIRSTRC)pvUser2;
-    AssertReturnVoid(g_fHmGlobalInit);
-    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
+    PHMR0FIRSTRC    pFirstRc = (PHMR0FIRSTRC)pvUser2;//多核同步结构体，用于记录首个 CPU 核的启用状态（其他核会跳过重复操作）。
+    AssertReturnVoid(g_fHmGlobalInit); // 确保全局初始化已完成
+    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));// 禁止抢占,硬件虚拟化操作（如执行 VMXON）需要原子性，抢占可能导致状态不一致。
+    /*
+      hmR0EnableCpu(pVM, idCpu)
+        实际启用目标 CPU 核的硬件虚拟化功能：
+        配置 CPU 专属的虚拟化资源（如 VMXON 区域、VMCS）。
+        执行硬件指令（如 VMXON 进入 VT-x 模式）。
+        返回状态码（VINF_SUCCESS 或错误码）。
+      hmR0FirstRcSetStatus
+        将结果记录到 pFirstRc 结构体中：
+        如果当前是首个执行的 CPU 核，保存其状态码。
+        其他核直接复用首个核的结果（避免重复操作）。
+    */
     hmR0FirstRcSetStatus(pFirstRc, hmR0EnableCpu(pVM, idCpu));
 }
 
@@ -893,9 +979,17 @@ static DECLCALLBACK(void) hmR0EnableCpuCallback(RTCPUID idCpu, void *pvUser1, vo
  * @returns VBox status code.
  * @param   pvUser          Pointer to the VM.
  */
+//在所有 CPU 核上启用硬件虚拟化功能
+/*
+    初始化全局状态g_fHmEnabled、g_fHmGlobalInit）。
+    检查 CPU 虚拟化支持VT-x/AMD-V）。
+    分配和管理 CPU 虚拟化资源如 VMXON 区域、MSRPM 页）。
+    处理嵌套虚拟化（Nested Virtualization）如 SVM 的 MSRPM 页）。
+    错误处理和状态同步多核环境下的原子操作）。
+*/
 static DECLCALLBACK(int32_t) hmR0EnableAllCpuOnce(void *pvUser)
 {
-    PVMCC pVM = (PVMCC)pvUser;
+    PVMCC pVM = (PVMCC)pvUser;// 获取虚拟机控制块
 
     /*
      * Indicate that we've initialized.
@@ -903,27 +997,28 @@ static DECLCALLBACK(int32_t) hmR0EnableAllCpuOnce(void *pvUser)
      * Note! There is a potential race between this function and the suspend
      *       notification.  Kind of unlikely though, so ignored for now.
      */
-    AssertReturn(!g_fHmEnabled, VERR_HM_ALREADY_ENABLED_IPE);
-    ASMAtomicWriteBool(&g_fHmEnabled, true);
+    AssertReturn(!g_fHmEnabled, VERR_HM_ALREADY_ENABLED_IPE);// 确保 HM 未启用
+    ASMAtomicWriteBool(&g_fHmEnabled, true);// 原子操作标记 HM 已启用
 
     /*
      * The global init variable is set by the first VM.
      */
-    g_fHmGlobalInit = pVM->hm.s.fGlobalInit;
+    g_fHmGlobalInit = pVM->hm.s.fGlobalInit;// 同步全局初始化标志
 
+//仅在调试模式下启用，用于检查内部一致性。
 #ifdef VBOX_STRICT
     for (unsigned i = 0; i < RT_ELEMENTS(g_aHmCpuInfo); i++)
     {
-        Assert(g_aHmCpuInfo[i].hMemObj      == NIL_RTR0MEMOBJ);
-        Assert(g_aHmCpuInfo[i].HCPhysMemObj == NIL_RTHCPHYS);
-        Assert(g_aHmCpuInfo[i].pvMemObj     == NULL);
-        Assert(!g_aHmCpuInfo[i].fConfigured);
-        Assert(!g_aHmCpuInfo[i].cTlbFlushes);
-        Assert(!g_aHmCpuInfo[i].uCurrentAsid);
+        Assert(g_aHmCpuInfo[i].hMemObj      == NIL_RTR0MEMOBJ);// 检查内存对象未分配
+        Assert(g_aHmCpuInfo[i].HCPhysMemObj == NIL_RTHCPHYS);// 检查物理地址未设置
+        Assert(g_aHmCpuInfo[i].pvMemObj     == NULL);// 检查虚拟地址未映射
+        Assert(!g_aHmCpuInfo[i].fConfigured);// 检查 CPU 未配置
+        Assert(!g_aHmCpuInfo[i].cTlbFlushes);// 检查 TLB 刷新计数为 0
+        Assert(!g_aHmCpuInfo[i].uCurrentAsid);// 检查 ASID（地址空间 ID）未设置
 # ifdef VBOX_WITH_NESTED_HWVIRT_SVM
-        Assert(g_aHmCpuInfo[i].n.svm.hNstGstMsrpm      == NIL_RTR0MEMOBJ);
-        Assert(g_aHmCpuInfo[i].n.svm.HCPhysNstGstMsrpm == NIL_RTHCPHYS);
-        Assert(g_aHmCpuInfo[i].n.svm.pvNstGstMsrpm     == NULL);
+        Assert(g_aHmCpuInfo[i].n.svm.hNstGstMsrpm      == NIL_RTR0MEMOBJ); // 嵌套虚拟化 MSRPM 页未分配
+        Assert(g_aHmCpuInfo[i].n.svm.HCPhysNstGstMsrpm == NIL_RTHCPHYS); // 物理地址未设置
+        Assert(g_aHmCpuInfo[i].n.svm.pvNstGstMsrpm     == NULL); // 虚拟地址未映射
 # endif
     }
 #endif
@@ -935,12 +1030,12 @@ static DECLCALLBACK(int32_t) hmR0EnableAllCpuOnce(void *pvUser)
         /*
          * Global VT-x initialization API (only darwin for now).
          */
-        rc = SUPR0EnableVTx(true /* fEnable */);
+        rc = SUPR0EnableVTx(true /* fEnable */);// 调用宿主系统的 VT-x 启用 API
         if (RT_SUCCESS(rc))
         {
-            g_fHmVmxCalledSUPR0EnableVTx = true;
+            g_fHmVmxCalledSUPR0EnableVTx = true; // 标记已调用宿主 API
             /* If the host provides a VT-x init API, then we'll rely on that for global init. */
-            g_fHmGlobalInit = pVM->hm.s.fGlobalInit = true;
+            g_fHmGlobalInit = pVM->hm.s.fGlobalInit = true; // 更新全局初始化标志
         }
         else
             AssertMsgFailed(("hmR0EnableAllCpuOnce/SUPR0EnableVTx: rc=%Rrc\n", rc));
@@ -957,21 +1052,23 @@ static DECLCALLBACK(int32_t) hmR0EnableAllCpuOnce(void *pvUser)
 #ifdef VBOX_WITH_NESTED_HWVIRT_SVM
             Assert(g_aHmCpuInfo[i].n.svm.hNstGstMsrpm == NIL_RTR0MEMOBJ);
 #endif
-            if (RTMpIsCpuPossible(RTMpCpuIdFromSetIndex(i)))
+            if (RTMpIsCpuPossible(RTMpCpuIdFromSetIndex(i)))// 检查 CPU 是否可用
             {
                 /** @todo NUMA */
+				//分配 VMXON/AMD-V 区域（每个 CPU 一页）
                 rc = RTR0MemObjAllocCont(&g_aHmCpuInfo[i].hMemObj, HOST_PAGE_SIZE, NIL_RTHCPHYS /*PhysHighest*/, false /* executable R0 mapping */);
-                AssertLogRelRCReturn(rc, rc);
+                AssertLogRelRCReturn(rc, rc);// 错误则终止
 
                 g_aHmCpuInfo[i].HCPhysMemObj = RTR0MemObjGetPagePhysAddr(g_aHmCpuInfo[i].hMemObj, 0);
                 Assert(g_aHmCpuInfo[i].HCPhysMemObj != NIL_RTHCPHYS);
                 Assert(!(g_aHmCpuInfo[i].HCPhysMemObj & HOST_PAGE_OFFSET_MASK));
 
-                g_aHmCpuInfo[i].pvMemObj     = RTR0MemObjAddress(g_aHmCpuInfo[i].hMemObj);
-                AssertPtr(g_aHmCpuInfo[i].pvMemObj);
-                RT_BZERO(g_aHmCpuInfo[i].pvMemObj, HOST_PAGE_SIZE);
+                g_aHmCpuInfo[i].pvMemObj     = RTR0MemObjAddress(g_aHmCpuInfo[i].hMemObj);// 获取物理地址
+                AssertPtr(g_aHmCpuInfo[i].pvMemObj);// 获取虚拟地址
+                RT_BZERO(g_aHmCpuInfo[i].pvMemObj, HOST_PAGE_SIZE);// 清零内存
 
 #ifdef VBOX_WITH_NESTED_HWVIRT_SVM
+                //分配嵌套虚拟化的 MSRPM 页（SVM 专用）
                 rc = RTR0MemObjAllocCont(&g_aHmCpuInfo[i].n.svm.hNstGstMsrpm, SVM_MSRPM_PAGES << X86_PAGE_4K_SHIFT,
                                          NIL_RTHCPHYS /*PhysHighest*/, false /* executable R0 mapping */);
                 AssertLogRelRCReturn(rc, rc);
@@ -982,12 +1079,12 @@ static DECLCALLBACK(int32_t) hmR0EnableAllCpuOnce(void *pvUser)
 
                 g_aHmCpuInfo[i].n.svm.pvNstGstMsrpm    = RTR0MemObjAddress(g_aHmCpuInfo[i].n.svm.hNstGstMsrpm);
                 AssertPtr(g_aHmCpuInfo[i].n.svm.pvNstGstMsrpm);
-                ASMMemFill32(g_aHmCpuInfo[i].n.svm.pvNstGstMsrpm, SVM_MSRPM_PAGES << X86_PAGE_4K_SHIFT, UINT32_C(0xffffffff));
+                ASMMemFill32(g_aHmCpuInfo[i].n.svm.pvNstGstMsrpm, SVM_MSRPM_PAGES << X86_PAGE_4K_SHIFT, UINT32_C(0xffffffff)); // 初始化 MSRPM 页
 #endif
             }
         }
 
-        rc = VINF_SUCCESS;
+        rc = VINF_SUCCESS;// 标记成功
     }
 
     if (   RT_SUCCESS(rc)
@@ -1001,18 +1098,19 @@ static DECLCALLBACK(int32_t) hmR0EnableAllCpuOnce(void *pvUser)
          * ring-3 especially since we now have a VM instance.
          */
         if (   !g_fHmVmxSupported
-            && !g_fHmSvmSupported)
+            && !g_fHmSvmSupported) // 检查是否无硬件虚拟化支持
         {
-            Assert(g_HmR0Ops.pfnEnableCpu == hmR0DummyEnableCpu);
-            Assert(RT_FAILURE(g_rcHmInit));
-            rc = g_rcHmInit;
+            Assert(g_HmR0Ops.pfnEnableCpu == hmR0DummyEnableCpu); // 确认使用的是空操作函数
+            Assert(RT_FAILURE(g_rcHmInit));// 确认初始化已失败
+            rc = g_rcHmInit;// 返回错误码
         }
         else
         {
             /* First time, so initialize each cpu/core. */
             HMR0FIRSTRC FirstRc;
-            hmR0FirstRcInit(&FirstRc);
+            hmR0FirstRcInit(&FirstRc);// 初始化多核同步结构体
             Assert(g_HmR0Ops.pfnEnableCpu != hmR0DummyEnableCpu);
+            // 后续逻辑：在所有 CPU 上执行实际启用操作（如 VMXON）
             rc = RTMpOnAll(hmR0EnableCpuCallback, (void *)pVM, &FirstRc);
             if (RT_SUCCESS(rc))
                 rc = hmR0FirstRcGetStatus(&FirstRc);
@@ -1029,12 +1127,19 @@ static DECLCALLBACK(int32_t) hmR0EnableAllCpuOnce(void *pvUser)
  * @returns VBox status code.
  * @param   pVM                 The cross context VM structure.
  */
+//用于在所有 CPU 核上启用硬件虚拟化功能
+//PVMCC pVM
+//指向虚拟机控制块（VM Control Context）的指针，包含虚拟机的运行时状态。
 VMMR0_INT_DECL(int) HMR0EnableAllCpus(PVMCC pVM)
 {
     /* Make sure we don't touch HM after we've disabled HM in preparation of a suspend. */
     if (ASMAtomicReadBool(&g_fHmSuspended))
         return VERR_HM_SUSPEND_PENDING;
 
+	//RTOnce: VirtualBox 的一次性执行机制，确保 hmR0EnableAllCpuOnce 函数仅在所有 CPU 上执行一次。
+	//g_HmEnableAllCpusOnce全局控制结构，用于同步多核初始化。
+	//hmR0EnableAllCpuOnce
+    //实际执行函数，负责在每个 CPU 核上启用虚拟化（如执行 VMXON 指令）。
     return RTOnce(&g_HmEnableAllCpusOnce, hmR0EnableAllCpuOnce, pVM);
 }
 
@@ -1117,9 +1222,12 @@ static DECLCALLBACK(void) hmR0DisableCpuOnSpecificCallback(RTCPUID idCpu, void *
  * @param   idCpu               The identifier for the CPU the function is called on.
  * @param   pvData              Opaque data (PVMCC pointer).
  */
+//主要用于处理CPU的离线事件（RTMPEVENT_OFFLINE），属于虚拟化或硬件监控模块（如Hypervisor或CPU热插拔管理模块）
 static DECLCALLBACK(void) hmR0MpEventCallback(RTMPEVENT enmEvent, RTCPUID idCpu, void *pvData)
 {
     NOREF(pvData);
+    //当前环境不支持硬件虚拟化（g_fHmVmxSupported为false）。
+    //或未通过SUPR0EnableVTx启用虚拟化扩展。
     Assert(!g_fHmVmxSupported || !g_fHmVmxUsingSUPR0EnableVTx);
 
     /*
@@ -1131,9 +1239,11 @@ static DECLCALLBACK(void) hmR0MpEventCallback(RTMPEVENT enmEvent, RTCPUID idCpu,
         case RTMPEVENT_OFFLINE:
         {
             RTTHREADPREEMPTSTATE PreemptState = RTTHREADPREEMPTSTATE_INITIALIZER;
+            //通过RTThreadPreemptDisable禁止当前线程被抢占，确保操作的原子性。
             RTThreadPreemptDisable(&PreemptState);
             if (idCpu == RTMpCpuId())
             {
+                //调用hmR0DisableCpu禁用当前CPU的虚拟化功能
                 int rc = hmR0DisableCpu(idCpu);
                 AssertRC(rc);
                 RTThreadPreemptRestore(&PreemptState);
@@ -1141,6 +1251,7 @@ static DECLCALLBACK(void) hmR0MpEventCallback(RTMPEVENT enmEvent, RTCPUID idCpu,
             else
             {
                 RTThreadPreemptRestore(&PreemptState);
+                //恢复抢占后，通过RTMpOnSpecific在目标CPU上异步执行hmR0DisableCpuOnSpecificCallback，确保操作在目标CPU的上下文中完成。
                 RTMpOnSpecific(idCpu, hmR0DisableCpuOnSpecificCallback, NULL /* pvUser1 */, NULL /* pvUser2 */);
             }
             break;

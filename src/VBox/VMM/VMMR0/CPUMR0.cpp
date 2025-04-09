@@ -461,17 +461,26 @@ VMMR0_INT_DECL(int) CPUMR0InitVM(PVMCC pVM)
  * @param   pVM         The cross context VM structure.
  * @param   pVCpu       The cross context virtual CPU structure.
  */
+//处理 #NM（设备不可用）异常的 Ring-0 函数
+/*
+    区分异常来源（宿主或 Guest）。
+    根据 Guest CR0 状态决策处理逻辑（加载 FPU 或注入 Guest 异常）。
+    处理 FPU 状态切换（通过调用 CPUMR0LoadGuestFPU）。 
+*/
 VMMR0_INT_DECL(int) CPUMR0Trap07Handler(PVMCC pVM, PVMCPUCC pVCpu)
 {
-    Assert(pVM->cpum.s.HostFeatures.fFxSaveRstor);
-    Assert(ASMGetCR4() & X86_CR4_OSFXSR);
+    Assert(pVM->cpum.s.HostFeatures.fFxSaveRstor);//确认宿主 CPU 支持 FXSAVE/FXRSTOR 指令。
+    Assert(ASMGetCR4() & X86_CR4_OSFXSR);//检查 CR4 寄存器的 OSFXSR 位是否启用（必须为 1 才能使用 SSE/XMM 指令）。
 
     /* If the FPU state has already been loaded, then it's a guest trap. */
-    if (CPUMIsGuestFPUStateActive(pVCpu))
+    if (CPUMIsGuestFPUStateActive(pVCpu))//若 Guest FPU 状态已激活（CPUM_USED_FPU_GUEST 标志被设置），说明异常来自 Guest。
     {
+        //断言 Guest CR0 必须满足以下组合之一：
+        //MP=1 + TS=1（典型配置，触发 #NM）。
+        //MP=1 + TS=1 + EM=1（模拟模式）。
         Assert(    ((pVCpu->cpum.s.Guest.cr0 & (X86_CR0_MP | X86_CR0_EM | X86_CR0_TS)) == (X86_CR0_MP | X86_CR0_TS))
                ||  ((pVCpu->cpum.s.Guest.cr0 & (X86_CR0_MP | X86_CR0_EM | X86_CR0_TS)) == (X86_CR0_MP | X86_CR0_TS | X86_CR0_EM)));
-        return VINF_EM_RAW_GUEST_TRAP;
+        return VINF_EM_RAW_GUEST_TRAP;//返回 VINF_EM_RAW_GUEST_TRAP，由 VirtualBox 将异常注入 Guest。
     }
 
     /*
@@ -498,16 +507,23 @@ VMMR0_INT_DECL(int) CPUMR0Trap07Handler(PVMCC pVM, PVMCPUCC pVCpu)
      *   1 |  1 |  0 | #NM      | Exec :: Clear MP, Save HC, Load GC. (EM is already set.)
      *   1 |  1 |  1 | #NM      | #NM  :: Go to guest taking trap there.
      */
-
+    //CR0 标志作用：
+    //MP（Monitor Coprocessor）：与 TS 配合控制 WAIT 指令行为。
+    //EM（Emulation）：若置 1，则浮点指令触发 #UD（无效操作码）。
+    //TS（Task Switched）：若置 1，则浮点指令触发 #NM。
     switch (pVCpu->cpum.s.Guest.cr0 & (X86_CR0_MP | X86_CR0_EM | X86_CR0_TS))
     {
+        //若 MP=1 + TS=1（无论 EM），直接注入 Guest 异常。
         case X86_CR0_MP | X86_CR0_TS:
         case X86_CR0_MP | X86_CR0_TS | X86_CR0_EM:
             return VINF_EM_RAW_GUEST_TRAP;
         default:
+            //其他情况（如 TS=0），继续执行 FPU 状态加载
             break;
     }
 
+    //保存宿主 FPU 状态，加载 Guest FPU 状态。
+    //返回状态码（如 VINF_SUCCESS 或错误码）。
     return CPUMR0LoadGuestFPU(pVM, pVCpu);
 }
 
@@ -523,20 +539,34 @@ VMMR0_INT_DECL(int) CPUMR0Trap07Handler(PVMCC pVM, PVMCPUCC pVCpu)
  * @param   pVM     The cross context VM structure.
  * @param   pVCpu   The cross context virtual CPU structure.
  */
+//加载 Guest FPU 状态‌ 的 Ring-0 函数
+/*
+    保存宿主 FPU 状态（确保宿主状态不被 Guest 破坏）。
+    加载 Guest FPU 状态（恢复 Guest 的浮点运算环境）。
+    处理特殊 CPU 特性（如 FFXSR 模式下的 XMM 寄存器加载问题）。
+    原子化更新状态标志（避免多核竞争）。
+*/
 VMMR0_INT_DECL(int) CPUMR0LoadGuestFPU(PVMCC pVM, PVMCPUCC pVCpu)
 {
     int rc;
-    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
-    Assert(!(pVCpu->cpum.s.fUseFlags & CPUM_USED_FPU_GUEST));
+    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));//确保当前线程不可被抢占（防止 FPU 状态切换过程中被中断
+    Assert(!(pVCpu->cpum.s.fUseFlags & CPUM_USED_FPU_GUEST));//断言 Guest 未占用 FPU
 
     /* Notify the support driver prior to loading the guest-FPU register state. */
-    SUPR0FpuBegin(VMMR0ThreadCtxHookIsEnabled(pVCpu));
+    //若启用（VMMR0ThreadCtxHookIsEnabled），需额外处理线程绑定。
+    SUPR0FpuBegin(VMMR0ThreadCtxHookIsEnabled(pVCpu));//通知 VirtualBox 支持驱动（如 VBoxDrv）即将加载 Guest FPU 状态。
     /** @todo use return value? Currently skipping that to be on the safe side
      *        wrt. extended state (linux). */
 
+    //fLeakyFxSR‌：
+    //标记某些 CPU（如早期 AMD）的 FXSAVE/FXRSTOR 指令存在缺陷，需特殊处理。
     if (!pVM->cpum.s.HostFeatures.fLeakyFxSR)
     {
         Assert(!(pVCpu->cpum.s.fUseFlags & CPUM_USED_MANUAL_XMM_RESTORE));
+        /*
+            内部调用 FXSAVE 保存宿主 FPU 状态到 pVCpu->cpum.s.Host。
+            调用 FXRSTOR 从 pVCpu->cpum.s.Guest 加载 Guest FPU 状态。
+        */
         rc = cpumR0SaveHostRestoreGuestFPUState(&pVCpu->cpum.s);
     }
     else
@@ -550,12 +580,12 @@ VMMR0_INT_DECL(int) CPUMR0LoadGuestFPU(PVMCC pVM, PVMCPUCC pVCpu)
             rc = cpumR0SaveHostRestoreGuestFPUState(&pVCpu->cpum.s);
         else
         {
-            RTCCUINTREG const uSavedFlags = ASMIntDisableFlags();
-            pVCpu->cpum.s.fUseFlags |= CPUM_USED_MANUAL_XMM_RESTORE;
-            ASMWrMsr(MSR_K6_EFER, uHostEfer & ~MSR_K6_EFER_FFXSR);
+            RTCCUINTREG const uSavedFlags = ASMIntDisableFlags();//禁用中断（ASMIntDisableFlags）。
+            pVCpu->cpum.s.fUseFlags |= CPUM_USED_MANUAL_XMM_RESTORE;//设置 CPUM_USED_MANUAL_XMM_RESTORE 标志（标记需手动处理 XMM 状态）。
+            ASMWrMsr(MSR_K6_EFER, uHostEfer & ~MSR_K6_EFER_FFXSR); //AMD CPU 的 FFXSR（Fast FXSAVE/RSTOR）模式会跳过 XMM 寄存器的加载，需临时禁用。
             rc = cpumR0SaveHostRestoreGuestFPUState(&pVCpu->cpum.s);
             ASMWrMsr(MSR_K6_EFER, uHostEfer | MSR_K6_EFER_FFXSR);
-            ASMSetFlags(uSavedFlags);
+            ASMSetFlags(uSavedFlags);//恢复 FFXSR 和中断状态。
         }
     }
     Assert(   (pVCpu->cpum.s.fUseFlags & (CPUM_USED_FPU_GUEST | CPUM_USED_FPU_HOST | CPUM_USED_FPU_SINCE_REM))
@@ -572,16 +602,33 @@ VMMR0_INT_DECL(int) CPUMR0LoadGuestFPU(PVMCC pVM, PVMCPUCC pVCpu)
  * @returns true if we saved the guest state.
  * @param   pVCpu       The cross context virtual CPU structure.
  */
+//是 VirtualBox 中用于 管理 FPU（浮点单元）状态切换的 Ring-0 函数
+/*
+    保存 Guest 的 FPU 状态（若 Guest 使用了 FPU）。
+    恢复宿主的 FPU 状态（确保宿主浮点运算不受干扰）。
+    处理特殊 CPU 特性（如 AMD CPU 的 FFXSR 模式）。
+    原子化更新状态标志（避免多核竞争）。
+*/
 VMMR0_INT_DECL(bool) CPUMR0FpuStateMaybeSaveGuestAndRestoreHost(PVMCPUCC pVCpu)
 {
     bool fSavedGuest;
+	//确认宿主 CPU 支持 FXSAVE/FXRSTOR 指令（现代 x86 CPU 均支持）。
     Assert(pVCpu->CTX_SUFF(pVM)->cpum.s.HostFeatures.fFxSaveRstor);
+    //检查 CR4 寄存器的 OSFXSR 位是否启用（必须为 1 才能使用 SSE/XMM 指令）。
     Assert(ASMGetCR4() & X86_CR4_OSFXSR);
+
+    //若 CPUM_USED_FPU_GUEST 被标记，表示 Guest 曾使用 FPU，需保存其状态。
     if (pVCpu->cpum.s.fUseFlags & (CPUM_USED_FPU_GUEST | CPUM_USED_FPU_HOST))
     {
         fSavedGuest = RT_BOOL(pVCpu->cpum.s.fUseFlags & CPUM_USED_FPU_GUEST);
+        //断言 fSavedGuest 与 Guest.fUsedFpuGuest 一致（防止状态不一致）。
         Assert(fSavedGuest == pVCpu->cpum.s.Guest.fUsedFpuGuest);
         if (!(pVCpu->cpum.s.fUseFlags & CPUM_USED_MANUAL_XMM_RESTORE))
+        /*
+            cpumR0SaveGuestRestoreHostFPUState：
+              内部调用 FXSAVE 保存 Guest FPU 状态到 pVCpu->cpum.s.Guest。
+              调用 FXRSTOR 从 pVCpu->cpum.s.Host 恢复宿主 FPU 状态。
+        */
             cpumR0SaveGuestRestoreHostFPUState(&pVCpu->cpum.s);
         else
         {
@@ -590,11 +637,11 @@ VMMR0_INT_DECL(bool) CPUMR0FpuStateMaybeSaveGuestAndRestoreHost(PVMCPUCC pVCpu)
             uint64_t uHostEfer = ASMRdMsr(MSR_K6_EFER);
             if (uHostEfer & MSR_K6_EFER_FFXSR)
             {
-                RTCCUINTREG const uSavedFlags = ASMIntDisableFlags();
-                ASMWrMsr(MSR_K6_EFER, uHostEfer & ~MSR_K6_EFER_FFXSR);
-                cpumR0SaveGuestRestoreHostFPUState(&pVCpu->cpum.s);
-                ASMWrMsr(MSR_K6_EFER, uHostEfer | MSR_K6_EFER_FFXSR);
-                ASMSetFlags(uSavedFlags);
+                RTCCUINTREG const uSavedFlags = ASMIntDisableFlags();//禁用中断
+                ASMWrMsr(MSR_K6_EFER, uHostEfer & ~MSR_K6_EFER_FFXSR);// 临时禁用 FFXSR
+                cpumR0SaveGuestRestoreHostFPUState(&pVCpu->cpum.s);//执行常规 FPU 状态保存/恢复。
+                ASMWrMsr(MSR_K6_EFER, uHostEfer | MSR_K6_EFER_FFXSR); // 恢复 FFXSR
+                ASMSetFlags(uSavedFlags);//恢复 FFXSR 和中断状态。
             }
             else
                 cpumR0SaveGuestRestoreHostFPUState(&pVCpu->cpum.s);
@@ -602,13 +649,13 @@ VMMR0_INT_DECL(bool) CPUMR0FpuStateMaybeSaveGuestAndRestoreHost(PVMCPUCC pVCpu)
         }
 
         /* Notify the support driver after loading the host-FPU register state. */
-        SUPR0FpuEnd(VMMR0ThreadCtxHookIsEnabled(pVCpu));
+        SUPR0FpuEnd(VMMR0ThreadCtxHookIsEnabled(pVCpu));//通知 VirtualBox 支持驱动（如 VBoxDrv）宿主 FPU 状态已恢复。
     }
     else
         fSavedGuest = false;
     Assert(!(  pVCpu->cpum.s.fUseFlags
-             & (CPUM_USED_FPU_GUEST | CPUM_USED_FPU_HOST | CPUM_USED_MANUAL_XMM_RESTORE)));
-    Assert(!pVCpu->cpum.s.Guest.fUsedFpuGuest);
+             & (CPUM_USED_FPU_GUEST | CPUM_USED_FPU_HOST | CPUM_USED_MANUAL_XMM_RESTORE)));//确保所有 FPU 相关标志已被清除
+    Assert(!pVCpu->cpum.s.Guest.fUsedFpuGuest);//断言 Guest 不再占用 FPU（fUsedFpuGuest=0）。
     return fSavedGuest;
 }
 
@@ -663,13 +710,18 @@ static int cpumR0SaveHostDebugState(PVMCPUCC pVCpu)
  */
 VMMR0_INT_DECL(bool) CPUMR0DebugStateMaybeSaveGuestAndRestoreHost(PVMCPUCC pVCpu, bool fDr6)
 {
+    //禁止抢占：确保当前线程不会被调度到其他 CPU 核（调试寄存器是 CPU 核特定的资源）。
+    //关键性：若抢占未被禁用，可能导致寄存器状态保存/恢复到错误的 CPU 核。
     Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
+    //返回 true 表示当前有 Guest 或 Hypervisor 的调试寄存器被加载到宿主 CPU。
     bool const fDrXLoaded = RT_BOOL(pVCpu->cpum.s.fUseFlags & (CPUM_USED_DEBUG_REGS_GUEST | CPUM_USED_DEBUG_REGS_HYPER));
 
     /*
      * Do we need to save the guest DRx registered loaded into host registers?
      * (DR7 and DR6 (if fDr6 is true) are left to the caller.)
      */
+	//保存 Guest 的断点地址
+    //确保 Guest 调试状态在 VM-Exit 后不丢失，同时避免泄漏宿主状态。
     if (pVCpu->cpum.s.fUseFlags & CPUM_USED_DEBUG_REGS_GUEST)
     {
         pVCpu->cpum.s.Guest.dr[0] = ASMGetDR0();
@@ -679,24 +731,29 @@ VMMR0_INT_DECL(bool) CPUMR0DebugStateMaybeSaveGuestAndRestoreHost(PVMCPUCC pVCpu
         if (fDr6)
             pVCpu->cpum.s.Guest.dr[6] = ASMGetDR6() | X86_DR6_RA1_MASK; /* ASSUMES no guest supprot for TSX-NI / RTM. */
     }
+
+    //标记 Guest/Hypervisor 不再占用调试寄存器，允许后续操作（如宿主调试）。
     ASMAtomicAndU32(&pVCpu->cpum.s.fUseFlags, ~(CPUM_USED_DEBUG_REGS_GUEST | CPUM_USED_DEBUG_REGS_HYPER));
 
     /*
      * Restore the host's debug state. DR0-3, DR6 and only then DR7!
      */
+    //恢复宿主调试寄存器状态
     if (pVCpu->cpum.s.fUseFlags & CPUM_USED_DEBUG_REGS_HOST)
     {
         /* A bit of paranoia first... */
         uint64_t uCurDR7 = ASMGetDR7();
         if (uCurDR7 != X86_DR7_INIT_VAL)
-            ASMSetDR7(X86_DR7_INIT_VAL);
+            ASMSetDR7(X86_DR7_INIT_VAL); // 强制禁用所有断点
 
+        //恢复 0-3: 宿主断点地址
         ASMSetDR0(pVCpu->cpum.s.Host.dr0);
         ASMSetDR1(pVCpu->cpum.s.Host.dr1);
         ASMSetDR2(pVCpu->cpum.s.Host.dr2);
         ASMSetDR3(pVCpu->cpum.s.Host.dr3);
         /** @todo consider only updating if they differ, esp. DR6. Need to figure how
          *        expensive DRx reads are over DRx writes.  */
+        //恢复 DR6/DR7：宿主调试状态和控制寄存器。
         ASMSetDR6(pVCpu->cpum.s.Host.dr6);
         ASMSetDR7(pVCpu->cpum.s.Host.dr7);
 
@@ -746,11 +803,13 @@ VMMR0_INT_DECL(bool) CPUMR0DebugStateMaybeSaveGuest(PVMCPUCC pVCpu, bool fDr6)
  * @param   fDr6        Whether to include DR6 or not.
  * @thread  EMT(pVCpu)
  */
+//加载 Guest（虚拟机）调试寄存器状态
 VMMR0_INT_DECL(void) CPUMR0LoadGuestDebugState(PVMCPUCC pVCpu, bool fDr6)
 {
     /*
      * Save the host state and disarm all host BPs.
      */
+    //保存宿主调试寄存器状态（防止破坏宿主调试环境）。
     cpumR0SaveHostDebugState(pVCpu);
     Assert(ASMGetDR7() == X86_DR7_INIT_VAL);
 
@@ -758,6 +817,7 @@ VMMR0_INT_DECL(void) CPUMR0LoadGuestDebugState(PVMCPUCC pVCpu, bool fDr6)
      * Activate the guest state DR0-3.
      * DR7 and DR6 (if fDr6 is true) are left to the caller.
      */
+    //加载 Guest 的调试寄存器值（DR0-DR3）。
     ASMSetDR0(pVCpu->cpum.s.Guest.dr[0]);
     ASMSetDR1(pVCpu->cpum.s.Guest.dr[1]);
     ASMSetDR2(pVCpu->cpum.s.Guest.dr[2]);
@@ -765,6 +825,7 @@ VMMR0_INT_DECL(void) CPUMR0LoadGuestDebugState(PVMCPUCC pVCpu, bool fDr6)
     if (fDr6)
         ASMSetDR6(pVCpu->cpum.s.Guest.dr[6]);
 
+    //标记调试寄存器已用于 Guest（避免冲突）。
     ASMAtomicOrU32(&pVCpu->cpum.s.fUseFlags, CPUM_USED_DEBUG_REGS_GUEST);
 }
 
@@ -776,30 +837,54 @@ VMMR0_INT_DECL(void) CPUMR0LoadGuestDebugState(PVMCPUCC pVCpu, bool fDr6)
  * @param   fDr6        Whether to include DR6 or not.
  * @thread  EMT(pVCpu)
  */
+/*
+    加载 Hypervisor（VMM）调试寄存器状态的 Ring-0 函数，核心职责包括：
+        保存宿主调试寄存器状态, 防止破坏宿主调试环境）。
+        更新 Hypervisor 的调试寄存器值DR0-DR3）。
+        选择性加载 DR6(根据 fDr6 参数）。
+        标记调试寄存器已使用（避免冲突）。
+ * */
+/*
+调试寄存器上下文切换
+    宿主 → Hypervisor：
+    保存宿主状态 → 加载 Hypervisor 状态。
+    Hypervisor → Guest：
+    通过 VMCS 的 DR_EXITING 字段自动保存/恢复（硬件辅助）。 
+*/
 VMMR0_INT_DECL(void) CPUMR0LoadHyperDebugState(PVMCPUCC pVCpu, bool fDr6)
 {
     /*
      * Save the host state and disarm all host BPs.
      */
-    cpumR0SaveHostDebugState(pVCpu);
-    Assert(ASMGetDR7() == X86_DR7_INIT_VAL);
+    cpumR0SaveHostDebugState(pVCpu);//将当前 CPU 的 DR0-DR7 保存到 pVCpu->cpum.s.Host.dr[]。
+    //确保 DR7（调试控制寄存器）处于初始值（X86_DR7_INIT_VAL），即所有断点禁用。
+    Assert(ASMGetDR7() == X86_DR7_INIT_VAL);//通过 ASMGetDRx() 读取寄存器值
 
     /*
      * Make sure the hypervisor values are up to date.
      */
+    /*
+	   重新计算 Hypervisor 的 DR0-DR7 值（基于虚拟 CPU 状态）。
+       参数 UINT8_MAX：表示不立即加载到物理寄存器（仅更新内存中的值）。
+	*/
     CPUMRecalcHyperDRx(pVCpu, UINT8_MAX /* no loading, please */);
 
     /*
      * Activate the guest state DR0-3.
      * DR7 and DR6 (if fDr6 is true) are left to the caller.
      */
+    //DR0-DR3 无条件加载 Hypervisor 的断点地址（用于 VMM 自身调试）。
     ASMSetDR0(pVCpu->cpum.s.Hyper.dr[0]);
     ASMSetDR1(pVCpu->cpum.s.Hyper.dr[1]);
     ASMSetDR2(pVCpu->cpum.s.Hyper.dr[2]);
     ASMSetDR3(pVCpu->cpum.s.Hyper.dr[3]);
+	//仅在 fDr6=true 时初始化为 X86_DR6_INIT_VAL（清除断点触发状态）。
+    //典型场景：在 VM-Entry 前重置 DR6，避免遗留状态干扰。
     if (fDr6)
         ASMSetDR6(X86_DR6_INIT_VAL);
 
+    //原子操作设置 CPUM_USED_DEBUG_REGS_HYPER 标志，表示 Hypervisor 正在使用调试寄存器。
+    //作用防止 Guest OS 误修改调试寄存器（需通过 VMM 拦截）。
     ASMAtomicOrU32(&pVCpu->cpum.s.fUseFlags, CPUM_USED_DEBUG_REGS_HYPER);
 }
 
