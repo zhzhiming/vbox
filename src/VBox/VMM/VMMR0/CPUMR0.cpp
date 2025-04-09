@@ -123,12 +123,14 @@ VMMR0_INT_DECL(int) CPUMR0ModuleInit(void)
      * Query the hardware virtualization capabilities of the host CPU first.
      */
     uint32_t fHwCaps = 0;
+    //调用 SUPR0GetVTSupport() 检测主机 CPU 的硬件虚拟化支持(VT-x 或 AMD-V)
     int rc = SUPR0GetVTSupport(&fHwCaps);
     AssertLogRelMsg(RT_SUCCESS(rc) || rc == VERR_UNSUPPORTED_CPU || rc == VERR_SVM_NO_SVM || rc == VERR_VMX_NO_VMX,
                     ("SUPR0GetHwvirtMsrs -> %Rrc\n", rc));
     if (RT_SUCCESS(rc))
     {
         SUPHWVIRTMSRS HwvirtMsrs;
+        //获取与硬件虚拟化相关的 MSR(Model Specific Register)值
         rc = SUPR0GetHwvirtMsrs(&HwvirtMsrs, fHwCaps, false /*fIgnored*/);
         AssertLogRelRC(rc);
         if (RT_SUCCESS(rc))
@@ -145,6 +147,8 @@ VMMR0_INT_DECL(int) CPUMR0ModuleInit(void)
      */
     PCPUMCPUIDLEAF  paLeaves;
     uint32_t        cLeaves;
+    //调用 CPUMCpuIdCollectLeavesX86() 收集主机 CPU 的所有 CPUID 叶子节点
+    //结果存储在动态分配的 paLeaves 数组中，cLeaves 记录数量
     rc = CPUMCpuIdCollectLeavesX86(&paLeaves, &cLeaves);
     AssertLogRelRCReturn(rc, rc);
 
@@ -152,11 +156,16 @@ VMMR0_INT_DECL(int) CPUMR0ModuleInit(void)
      * Unify/cross check some CPUID feature bits on all available CPU cores
      * and threads.  We've seen CPUs where the monitor support differed.
      */
+    //确保所有 CPU 核心报告的 CPUID 特性一致(解决某些 CPU 多核心特性不一致的问题)
     RTMpOnAll(cpumR0CheckCpuid, paLeaves, (void *)(uintptr_t)cLeaves);
 
     /*
      * Populate the host CPU feature global variable.
      */
+    //解析收集到的 CPUID 信息，填充全局的 g_CpumHostFeatures 结构
+    //包含 CPU 特性标志如 SSE/AVX/TSX 等支持情况
+    //g_CpumHostMsrs - 存储主机 CPU 的 MSR 值
+    //g_CpumHostFeatures - 存储解析出的 CPU 特性标志
     rc = cpumCpuIdExplodeFeaturesX86(paLeaves, cLeaves, &g_CpumHostMsrs, &g_CpumHostFeatures.s);
     RTMemFree(paLeaves);
     AssertLogRelRCReturn(rc, rc);
@@ -164,6 +173,8 @@ VMMR0_INT_DECL(int) CPUMR0ModuleInit(void)
     /*
      * Get MSR_IA32_ARCH_CAPABILITIES and expand it into the host feature structure.
      */
+    //检测 CPU 的架构相关能力(主要与安全相关)
+    //包括 RDCL_NO(缓解 Meltdown)、IBRS_ALL(间接分支限制)等安全特性
     if (ASMHasCpuId())
     {
         /** @todo Should add this MSR to CPUMMSRS and expose it via SUPDrv... */
@@ -228,14 +239,19 @@ VMMR0_INT_DECL(void) CPUMR0InitPerVMData(PGVM pGVM)
  * @note This function might be called simultaneously on more than one CPU!
  *
  * @param   idCpu       The identifier for the CPU the function is called on.
- * @param   pvUser1     Pointer to the VM structure.
+ * @param   pvUser1     Pointer to the VM structure.指向虚拟机控制块
  * @param   pvUser2     Ignored.
  */
+//确保虚拟机在不同物理 CPU 上运行时看到的 CPU 特性一致
+//通过回调机制在多核 CPU 上并行执行。
+//当 VirtualBox 需要屏蔽某些物理 CPU 的特性（或模拟特定 CPU 型号）时调用
 static DECLCALLBACK(void) cpumR0CheckCpuidLegacy(RTCPUID idCpu, void *pvUser1, void *pvUser2)
 {
     PVMCC     pVM   = (PVMCC)pvUser1;
 
     NOREF(idCpu); NOREF(pvUser2);
+    //g_aCpuidUnifyBits 是一个全局数组，定义了需要标准化的 CPUID 叶子节点
+    //（如 0x1、0x80000001）及其掩码（ECX/EDX 中哪些位需要统一）。
     for (uint32_t i = 0; i < RT_ELEMENTS(g_aCpuidUnifyBits); i++)
     {
         /* Note! Cannot use cpumCpuIdGetLeaf from here because we're not
@@ -244,18 +260,27 @@ static DECLCALLBACK(void) cpumR0CheckCpuidLegacy(RTCPUID idCpu, void *pvUser1, v
 
         uint32_t   uLeaf = g_aCpuidUnifyBits[i].uLeaf;
         PCPUMCPUID pLegacyLeaf;
+        //标准 CPUID（如 0x1）：存储于 aGuestCpuIdPatmStd。
         if (uLeaf < RT_ELEMENTS(pVM->cpum.s.aGuestCpuIdPatmStd))
             pLegacyLeaf = &pVM->cpum.s.aGuestCpuIdPatmStd[uLeaf];
+        //扩展 CPUID（如 0x80000001）：存储于 aGuestCpuIdPatmExt
         else if (uLeaf - UINT32_C(0x80000000) < RT_ELEMENTS(pVM->cpum.s.aGuestCpuIdPatmExt))
             pLegacyLeaf = &pVM->cpum.s.aGuestCpuIdPatmExt[uLeaf - UINT32_C(0x80000000)];
+        //Centaur/VIA 专用 CPUID‌（如 0xC0000000）：存储于 aGuestCpuIdPatmCentaur。
         else if (uLeaf - UINT32_C(0xc0000000) < RT_ELEMENTS(pVM->cpum.s.aGuestCpuIdPatmCentaur))
             pLegacyLeaf = &pVM->cpum.s.aGuestCpuIdPatmCentaur[uLeaf - UINT32_C(0xc0000000)];
         else
             continue;
 
         uint32_t eax, ebx, ecx, edx;
+        //调用 ASMCpuIdExSlow 执行实际的 CPUID 指令，获取物理 CPU 的原始值（忽略 EAX/EBX，仅需 ECX/EDX）。
         ASMCpuIdExSlow(uLeaf, 0, 0, 0, &eax, &ebx, &ecx, &edx);
 
+        /*
+            g_aCpuidUnifyBits[i].uEcx/uEdx 是掩码，标识哪些位需要保留（1）或强制清零（0）。
+            ecx | ~mask：将物理 CPU 的位与掩码取反结合，确保掩码中为 0 的位被强制设为 1（后续与操作会保留这些位）。
+            ASMAtomicAndU32：原子化地更新虚拟 CPUID，避免多核竞争。
+        */
         ASMAtomicAndU32(&pLegacyLeaf->uEcx, ecx | ~g_aCpuidUnifyBits[i].uEcx);
         ASMAtomicAndU32(&pLegacyLeaf->uEdx, edx | ~g_aCpuidUnifyBits[i].uEdx);
     }
@@ -274,12 +299,14 @@ static DECLCALLBACK(void) cpumR0CheckCpuidLegacy(RTCPUID idCpu, void *pvUser1, v
 VMMR0_INT_DECL(int) CPUMR0InitVM(PVMCC pVM)
 {
     LogFlow(("CPUMR0Init: %p\n", pVM));
+    //记录初始化日志，静态断言确保 Host 的 XState 缓冲区足够容纳 Guest 的，避免内存溢出。
     AssertCompile(sizeof(pVM->aCpus[0].cpum.s.Host.abXState) >= sizeof(pVM->aCpus[0].cpum.s.Guest.abXState));
 
     /*
      * Check CR0 & CR4 flags.
      */
     uint32_t u32CR0 = ASMGetCR0();
+    //确认主机 CPU 运行在保护模式（Protected Mode, PE）和分页模式（Paging, PG）
     if ((u32CR0 & (X86_CR0_PE | X86_CR0_PG)) != (X86_CR0_PE | X86_CR0_PG)) /* a bit paranoid perhaps.. */
     {
         Log(("CPUMR0Init: PE or PG not set. cr0=%#x\n", u32CR0));
@@ -305,10 +332,15 @@ VMMR0_INT_DECL(int) CPUMR0InitVM(PVMCC pVM)
         uint32_t u32CpuVersion;
         uint32_t u32Dummy;
         uint32_t fFeatures; /* (Used further down to check for MSRs, so don't clobber.) */
+        /*
+            Intel CPU：家族（Family）、型号（Model）、步进（Stepping）需满足特定条件（如家族非6或型号≥3）。
+            AMD CPU：始终允许（因可能在32位模式下支持）。
+        */
         ASMCpuId(1, &u32CpuVersion, &u32Dummy, &u32Dummy, &fFeatures);
         uint32_t const u32Family   = u32CpuVersion >> 8;
         uint32_t const u32Model    = (u32CpuVersion >> 4) & 0xF;
         uint32_t const u32Stepping = u32CpuVersion & 0xF;
+        //检查是否支持 SYSENTER/SYSEXIT。
         if (    (fFeatures & X86_CPUID_FEATURE_EDX_SEP)
             &&  (   u32Family   != 6    /* (> pentium pro) */
                  || u32Model    >= 3
@@ -337,6 +369,7 @@ VMMR0_INT_DECL(int) CPUMR0InitVM(PVMCC pVM)
          */
         uint32_t cExt = 0;
         ASMCpuId(0x80000000, &cExt, &u32Dummy, &u32Dummy, &u32Dummy);
+        //确认支持 SYSCALL/SYSRET。
         if (RTX86IsValidExtRange(cExt))
         {
             uint32_t fExtFeaturesEDX = ASMCpuId_EDX(0x80000001);
@@ -347,6 +380,7 @@ VMMR0_INT_DECL(int) CPUMR0InitVM(PVMCC pVM)
 #endif
                 {
                     uint64_t fEfer = ASMRdMsr(MSR_K6_EFER);
+                    //若 EFER.SCE 置位，标记主机使用 SYSCALL。
                     if (fEfer & MSR_K6_EFER_SCE)
                     {
                         pVM->cpum.s.fHostUseFlags |= CPUM_USE_SYSCALL;
@@ -407,12 +441,14 @@ VMMR0_INT_DECL(int) CPUMR0InitVM(PVMCC pVM)
          * as temp ring-0 accessible memory instead, ASSUMING that they're all
          * up to date when we get here.
          */
+        //遍历所有 CPU 核心，检查关键 CPUID 特性（如 MONITOR/MWAIT）是否一致。
         RTMpOnAll(cpumR0CheckCpuidLegacy, pVM, NULL);
 
         for (uint32_t i = 0; i < RT_ELEMENTS(g_aCpuidUnifyBits); i++)
         {
             bool            fIgnored;
             uint32_t        uLeaf = g_aCpuidUnifyBits[i].uLeaf;
+            //确保新旧 CPUID 数据结构的兼容性，避免特性差异。
             PCPUMCPUIDLEAF  pLeaf = cpumCpuIdGetLeafEx(pVM, uLeaf, 0, &fIgnored);
             if (pLeaf)
             {
@@ -439,6 +475,7 @@ VMMR0_INT_DECL(int) CPUMR0InitVM(PVMCC pVM)
      * This ASSUMES that DR7.GD is not set, or that it's handled transparently!
      */
     uint32_t u32DR7 = ASMGetDR7();
+    //若主机启用了硬件断点（DR7 的启用位），标记需模拟调试寄存器访问。
     if (u32DR7 & X86_DR7_ENABLED_MASK)
     {
         VMCC_FOR_EACH_VMCPU_STMT(pVM, pVCpu->cpum.s.fUseFlags |= CPUM_USE_DEBUG_REGS_HOST);
@@ -539,7 +576,7 @@ VMMR0_INT_DECL(int) CPUMR0Trap07Handler(PVMCC pVM, PVMCPUCC pVCpu)
  * @param   pVM     The cross context VM structure.
  * @param   pVCpu   The cross context virtual CPU structure.
  */
-//加载 Guest FPU 状态‌ 的 Ring-0 函数
+//加载 Guest FPU 状态的 Ring-0 函数
 /*
     保存宿主 FPU 状态（确保宿主状态不被 Guest 破坏）。
     加载 Guest FPU 状态（恢复 Guest 的浮点运算环境）。
