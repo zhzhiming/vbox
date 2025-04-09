@@ -92,20 +92,27 @@ static int  cpumR0SaveHostDebugState(PVMCPUCC pVCpu);
  * @param   pvUser1     Leaf array.
  * @param   pvUser2     Number of leaves.
  */
+// 统一多核 CPU 的 CPUID 特性
 static DECLCALLBACK(void) cpumR0CheckCpuid(RTCPUID idCpu, void *pvUser1, void *pvUser2)
 {
-    PCPUMCPUIDLEAF const paLeaves = (PCPUMCPUIDLEAF)pvUser1;
-    uint32_t const       cLeaves  = (uint32_t)(uintptr_t)pvUser2;
+    //使用动态分配的 CPUMCPUIDLEAF 数组（paLeaves）替代旧版的静态数组，支持更灵活的 CPUID 叶子节点管理。
+    PCPUMCPUIDLEAF const paLeaves = (PCPUMCPUIDLEAF)pvUser1; //动态分配的CPUID叶子数组
+    uint32_t const       cLeaves  = (uint32_t)(uintptr_t)pvUser2; //叶子节点数量
     RT_NOREF(idCpu);
 
+    //g_aCpuidUnifyBits 是全局数组，定义需要统一的 CPUID 叶子（如 0x1、0x80000001）及其 ECX/EDX 掩码。
     for (uint32_t i = 0; i < RT_ELEMENTS(g_aCpuidUnifyBits); i++)
     {
+        //调用 cpumCpuIdGetLeafInt 从动态数组中查找指定叶子节点（uLeaf）。
+        //相比旧版的静态数组分类（标准/扩展/Centaur），新方法通过单一动态数组简化了查找逻辑。
         PCPUMCPUIDLEAF pLeaf = cpumCpuIdGetLeafInt(paLeaves, cLeaves, g_aCpuidUnifyBits[i].uLeaf, 0);
         if (pLeaf)
         {
             uint32_t uEax, uEbx, uEcx, uEdx;
+            //执行 CPUID 指令获取当前物理 CPU 的原始值（仅需 ECX/EDX）。
             ASMCpuIdExSlow(g_aCpuidUnifyBits[i].uLeaf, 0, 0, 0, &uEax, &uEbx, &uEcx, &uEdx);
 
+            //最终虚拟 CPUID 的 ECX/EDX 仅保留掩码中为 1 的位（其余强制清零）。
             ASMAtomicAndU32(&pLeaf->uEcx, uEcx | ~g_aCpuidUnifyBits[i].uEcx);
             ASMAtomicAndU32(&pLeaf->uEdx, uEdx | ~g_aCpuidUnifyBits[i].uEdx);
         }
