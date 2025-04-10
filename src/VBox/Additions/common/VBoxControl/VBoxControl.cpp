@@ -1192,9 +1192,20 @@ static DECLCALLBACK(RTEXITCODE) handleRemoveCustomMode(int argc, char *argv[])
  * @returns Command exit code.
  * @note see the command line API description for parameters
  */
+/*
+特性	      Guest Property	共享文件夹
+数据传输方向	  双向	        单向（依赖挂载）
+实时性	          毫秒级更新	文件系统延迟
+适用场景	  小数据量、高频交互	大文件批量传输
+*/
+//从宿主机-客户机共享的 Guest Property 服务中读取指定属性值，
+//支持 基础模式（仅值）和 详细模式（含时间戳、标志）两种输出形式
+//自动处理属性值动态更新（通过 u64Timestamp 标识最后修改时间）
+//支持缓冲区动态扩容（应对属性值超限场景）
 static RTEXITCODE getGuestProperty(int argc, char **argv)
 {
     bool fVerbose = false;
+    //[属性名] --verbose	输出值+时间戳+标志
     if (   argc == 2
         && (   strcmp(argv[1], "-verbose")  == 0
             || strcmp(argv[1], "--verbose") == 0)
@@ -1223,6 +1234,7 @@ static RTEXITCODE getGuestProperty(int argc, char **argv)
     /* The buffer for storing the data and its initial size.  We leave a bit
      * of space here in case the maximum values are raised. */
     void *pvBuf = NULL;
+    //初始大小 = GUEST_PROP_MAX_VALUE_LEN (64KB) + GUEST_PROP_MAX_FLAGS_LEN (64B) + 冗余 1KB
     uint32_t cbBuf = GUEST_PROP_MAX_VALUE_LEN + GUEST_PROP_MAX_FLAGS_LEN + 1024;
     if (RT_SUCCESS(rc))
     {
@@ -1231,8 +1243,10 @@ static RTEXITCODE getGuestProperty(int argc, char **argv)
          * hope.  Actually this should never go wrong, as we are generous
          * enough with buffer space. */
         bool fFinished = false;
+        //最多尝试 10 次（应对属性值被并发更新的竞争条件）
         for (unsigned i = 0; i < 10 && !fFinished; ++i)
         {
+            //使用 RTMemRealloc 动态调整缓冲区（避免内存浪费
             void *pvTmpBuf = RTMemRealloc(pvBuf, cbBuf);
             if (NULL == pvTmpBuf)
             {
@@ -1242,18 +1256,22 @@ static RTEXITCODE getGuestProperty(int argc, char **argv)
             else
             {
                 pvBuf = pvTmpBuf;
+                //VbglR3GuestPropRead 返回的 pszValue 和 pszFlags 指向缓冲区内部地址，无需单独释放
                 rc = VbglR3GuestPropRead(u32ClientId, pszName, pvBuf, cbBuf,
                                          &pszValue, &u64Timestamp, &pszFlags,
                                          &cbBuf);
             }
+            //自动扩容 1KB 后重试
             if (VERR_BUFFER_OVERFLOW == rc)
                 /* Leave a bit of extra space to be safe */
                 cbBuf += 1024;
             else
                 fFinished = true;
         }
+        //放弃并提示临时不可用
         if (VERR_TOO_MUCH_DATA == rc)
             VBoxControlError("Temporarily unable to retrieve the property\n");
+        //属性未设置
         else if (RT_FAILURE(rc) && rc != VERR_NOT_FOUND)
             VBoxControlError("Failed to retrieve the property value, error %Rrc\n", rc);
     }
@@ -1287,6 +1305,8 @@ static RTEXITCODE getGuestProperty(int argc, char **argv)
  * @returns Command exit code.
  * @note see the command line API description for parameters
  */
+//设置宿主机与客户机共享的 Guest Property（如 /VirtualBox/GuestInfo/OS/Version），
+//支持 值和 属性标志（如 TRANSIENT、RDONLYGUEST）的原子性写入
 static RTEXITCODE setGuestProperty(int argc, char *argv[])
 {
     /*
@@ -1297,12 +1317,14 @@ static RTEXITCODE setGuestProperty(int argc, char *argv[])
     const char *pszName = NULL;
     const char *pszValue = NULL;
     const char *pszFlags = NULL;
+    //[属性名] [值]	 : 仅设置值
     if (2 == argc)
     {
         pszValue = argv[1];
     }
     else if (3 == argc)
         fUsageOK = false;
+    //[属性名] [值] --flags [标志]	设置值+标志
     else if (4 == argc)
     {
         pszValue = argv[1];
@@ -1332,14 +1354,19 @@ static RTEXITCODE setGuestProperty(int argc, char *argv[])
     else
     {
         if (pszFlags != NULL)
+            //同时设置值和标志, 有标志时调用 VbglR3GuestPropWrite，标志字符串需符合 文档规范
             rc = VbglR3GuestPropWrite(u32ClientId, pszName, pszValue, pszFlags);
         else
+            //仅设置属性值, 无标志时调用 VbglR3GuestPropWriteValue
             rc = VbglR3GuestPropWriteValue(u32ClientId, pszName, pszValue);
+        //VERR_TOO_MUCH_DATA：值超过 64KB 限制
+        //VERR_PERMISSION_DENIED：尝试修改只读属性‌
         if (RT_FAILURE(rc))
             VBoxControlError("Failed to store the property value, error %Rrc\n", rc);
     }
 
     if (u32ClientId != 0)
+        // 关闭连接
         VbglR3GuestPropDisconnect(u32ClientId);
     return RT_SUCCESS(rc) ? RTEXITCODE_SUCCESS : RTEXITCODE_FAILURE;
 }
@@ -1352,6 +1379,7 @@ static RTEXITCODE setGuestProperty(int argc, char *argv[])
  * @returns Command exit code.
  * @note see the command line API description for parameters
  */
+//删除 VirtualBox 客户机中的指定 Guest Property（宿主机-客户机共享属性），通过 VbglR3GuestPropDelete 实现底层操作
 static RTEXITCODE deleteGuestProperty(int argc, char *argv[])
 {
     /*
@@ -1374,16 +1402,20 @@ static RTEXITCODE deleteGuestProperty(int argc, char *argv[])
      * Do the actual setting.
      */
     uint32_t u32ClientId = 0;
+    //初始化与宿主机属性服务的 RPC 连接，返回客户端 ID
     int rc = VbglR3GuestPropConnect(&u32ClientId);
+    //连接失败通过 VBoxControlError 输出日志，但继续执行后续资源释放逻辑
     if (RT_FAILURE(rc))
         VBoxControlError("Failed to connect to the guest property service, error %Rrc\n", rc);
     else
     {
+        //VbglR3GuestPropDelete 发送删除请求至宿主机，属性名经 UTF-8 编码传输，失败时返回 VERR_NOT_FOUND（属性不存在）等错误
         rc = VbglR3GuestPropDelete(u32ClientId, pszName);
         if (RT_FAILURE(rc))
             VBoxControlError("Failed to delete the property value, error %Rrc\n", rc);
     }
 
+    //无论操作成功与否，均通过 VbglR3GuestPropDisconnect 关闭 RPC 连接，避免句柄泄漏
     if (u32ClientId != 0)
         VbglR3GuestPropDisconnect(u32ClientId);
     return RT_SUCCESS(rc) ? RTEXITCODE_SUCCESS : RTEXITCODE_FAILURE;
@@ -2093,18 +2125,19 @@ struct COMMANDHANDLER
 int main(int argc, char **argv)
 {
     /** The application's global return code */
-    RTEXITCODE rcExit = RTEXITCODE_SUCCESS;
+    RTEXITCODE rcExit = RTEXITCODE_SUCCESS; // 程序最终退出码
     /** An IPRT return code for local use */
     int rrc = VINF_SUCCESS;
     /** The index of the command line argument we are currently processing */
     int iArg = 1;
     /** Should we show the logo text? */
-    bool fShowLogo = true;
+    bool fShowLogo = true; //控制是否显示 VirtualBox 版权信息
     /** Should we print the usage after the logo?  For the -help switch. */
-    bool fDoHelp = false;
+    bool fDoHelp = false; //标记是否需要打印帮助信息
     /** Will we be executing a command or just printing information? */
     bool fOnlyInfo = false;
 
+    //初始化 IPRT 运行时库，失败时通过 RTMsgInitFailure 返回错误码。
     rrc = RTR3InitExe(argc, &argv, 0);
     if (RT_FAILURE(rrc))
         return RTMsgInitFailure(rrc);
@@ -2150,6 +2183,7 @@ int main(int argc, char **argv)
      * Find the application name, show our logo if the user hasn't suppressed it,
      * and show the usage if the user asked us to
      */
+    //RTPathFilename(argv) 提取可执行文件名称（如 VBoxControl）。
     g_pszProgName = RTPathFilename(argv[0]);
     if (fShowLogo)
         RTPrintf(VBOX_PRODUCT " Guest Additions Command Line Management Interface Version "
@@ -2169,9 +2203,11 @@ int main(int argc, char **argv)
              * Try locate the command and execute it, complain if not found.
              */
             unsigned i;
+            //遍历静态数组 g_aCommandHandlers，匹配用户输入的命令名
             for (i = 0; i < RT_ELEMENTS(g_aCommandHandlers); i++)
                 if (!strcmp(argv[iArg], g_aCommandHandlers[i].pszCommand))
                 {
+                    //若命令需要宿主机通信（fNeedDevice），先初始化 VbglR3Init()。
                     if (g_aCommandHandlers[i].fNeedDevice)
                     {
                         rrc = VbglR3Init();
@@ -2183,6 +2219,7 @@ int main(int argc, char **argv)
                             rcExit = RTEXITCODE_FAILURE;
                         }
                     }
+                    //调用匹配到的处理函数指针：
                     if (rcExit == RTEXITCODE_SUCCESS)
                         rcExit = g_aCommandHandlers[i].pfnHandler(argc - iArg - 1, argv + iArg + 1);
                     break;
