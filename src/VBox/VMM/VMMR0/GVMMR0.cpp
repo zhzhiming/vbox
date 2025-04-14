@@ -55,6 +55,14 @@
  * AMD-V and raw-mode execution environments.
  */
 
+#if 0
+  虚拟机创建/销毁（GVMMR0CreateVM / GVMMR0DestroyVM）
+  虚拟机调度（GVMMR0SchedHalt / GVMMR0SchedWakeUp）
+  CPU 管理（GVMMR0RegisterVCpu / GVMMR0DeregisterVCpu）
+  中断处理（GVMMR0AcknowledgeInterrupt）
+  内存管理（GVMMR0AllocateHandyPages）
+  调试与统计（GVMMR0QueryStatistics）
+#endif
 
 /*********************************************************************************************************************************
 *   Header Files                                                                                                                 *
