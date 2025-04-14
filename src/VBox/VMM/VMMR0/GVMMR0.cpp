@@ -124,25 +124,26 @@ AssertCompile(GVMM_RTNATIVETHREAD_DESTROYED != NIL_RTNATIVETHREAD);
 /**
  * Global VM handle.
  */
+//管理虚拟机(VM)相关的资源和权限控制
 typedef struct GVMHANDLE
 {
     /** The index of the next handle in the list (free or used). (0 is nil.) */
-    uint16_t volatile   iNext;
+    uint16_t volatile   iNext;//表示链表中下一个句柄的索引(0表示空
     /** Our own index / handle value. */
-    uint16_t            iSelf;
+    uint16_t            iSelf;//当前句柄自身的索引/值
     /** The process ID of the handle owner.
      * This is used for access checks. */
-    RTPROCESS           ProcId;
+    RTPROCESS           ProcId;//记录句柄所属进程的ID，用于访问权限检查
     /** The pointer to the ring-0 only (aka global) VM structure. */
-    PGVM                pGVM;
+    PGVM                pGVM;//指向仅限ring-0访问的全局VM结构体指针
     /** The virtual machine object. */
-    void               *pvObj;
+    void               *pvObj;//指向虚拟机对象的指针
     /** The session this VM is associated with. */
-    PSUPDRVSESSION      pSession;
+    PSUPDRVSESSION      pSession;//指向与此VM关联的会话指针
     /** The ring-0 handle of the EMT0 thread.
      * This is used for ownership checks as well as looking up a VM handle by thread
      * at times like assertions. */
-    RTNATIVETHREAD      hEMT0;
+    RTNATIVETHREAD      hEMT0;//记录EMT0线程的ring-0句柄，用于线程所有权检查和断言时通过线程查找VM句柄
 } GVMHANDLE;
 /** Pointer to a global VM handle. */
 typedef GVMHANDLE *PGVMHANDLE;
@@ -160,22 +161,22 @@ typedef GVMHANDLE *PGVMHANDLE;
 typedef struct GVMMHOSTCPU
 {
     /** Magic number (GVMMHOSTCPU_MAGIC). */
-    uint32_t volatile   u32Magic;
+    uint32_t volatile   u32Magic;//魔数（Magic Number），用于验证结构体的有效性
     /** The CPU ID. */
     RTCPUID             idCpu;
     /** The CPU set index. */
-    uint32_t            idxCpuSet;
+    uint32_t            idxCpuSet;//CPU 集合的索引，可能用于 NUMA（非统一内存访问）或 CPU 亲和性调度。
 
 #ifdef GVMM_SCHED_WITH_PPT
     /** Periodic preemption timer data. */
     struct
     {
         /** The handle to the periodic preemption timer. */
-        PRTTIMER            pTimer;
+        PRTTIMER            pTimer;//指向周期性抢占定时器的句柄（PRTTIMER），用于触发定时事件。
         /** Spinlock protecting the data below. */
-        RTSPINLOCK          hSpinlock;
+        RTSPINLOCK          hSpinlock;//自旋锁（Spinlock），保护 PPT 数据的并发访问。
         /** The smalles Hz that we need to care about. (static) */
-        uint32_t            uMinHz;
+        uint32_t            uMinHz;//最小的调度频率（Hz），低于此频率时 PPT 可能不会生效。
         /** The number of ticks between each historization. */
         uint32_t            cTicksHistoriziationInterval;
         /** The current historization tick (counting up to
@@ -219,36 +220,38 @@ typedef GVMMHOSTCPU *PGVMMHOSTCPU;
 /**
  * The GVMM instance data.
  */
+//虚拟机监控程序（VMM）中用于全局虚拟机管理（Global VM Manager, GVMM）的核心数据结构。
+//它主要用于管理虚拟机的调度、休眠和唤醒机制
 typedef struct GVMM
 {
     /** Eyecatcher / magic. */
     uint32_t            u32Magic;
     /** The index of the head of the free handle chain. (0 is nil.) */
-    uint16_t volatile   iFreeHead;
+    uint16_t volatile   iFreeHead;//链表头索引，分别指向空闲（未使用）和已使用的虚拟机句柄链表的头部。0 表示空链表（NIL）。
     /** The index of the head of the active handle chain. (0 is nil.) */
     uint16_t volatile   iUsedHead;
     /** The number of VMs. */
-    uint16_t volatile   cVMs;
+    uint16_t volatile   cVMs;//当前运行的虚拟机数量。
     /** Alignment padding. */
     uint16_t            u16Reserved;
     /** The number of EMTs. */
-    uint32_t volatile   cEMTs;
+    uint32_t volatile   cEMTs;//总 EMT（Emulation Threads，模拟线程）数量。
     /** The number of EMTs that have halted in GVMMR0SchedHalt. */
-    uint32_t volatile   cHaltedEMTs;
+    uint32_t volatile   cHaltedEMTs;//当前处于休眠（halted）状态的 EMT 数量。
     /** Mini lock for restricting early wake-ups to one thread. */
     bool volatile       fDoingEarlyWakeUps;
     bool                afPadding[3]; /**< explicit alignment padding. */
     /** When the next halted or sleeping EMT will wake up.
      * This is set to 0 when it needs recalculating and to UINT64_MAX when
      * there are no halted or sleeping EMTs in the GVMM. */
-    uint64_t            uNsNextEmtWakeup;
+    uint64_t            uNsNextEmtWakeup;//下一个 EMT 的唤醒时间（纳秒级时间戳）。0 表示需要重新计算。UINT64_MAX 表示没有休眠或待唤醒的 EMT。
     /** The lock used to serialize VM creation, destruction and associated events that
      * isn't performance critical. Owners may acquire the list lock. */
-    RTCRITSECT          CreateDestroyLock;
+    RTCRITSECT          CreateDestroyLock;//用于串行化虚拟机的创建和销毁操作（临界区锁）。
     /** The lock used to serialize used list updates and accesses.
      * This indirectly includes scheduling since the scheduler will have to walk the
      * used list to examin running VMs. Owners may not acquire any other locks. */
-    RTCRITSECTRW        UsedLock;
+    RTCRITSECTRW        UsedLock;//读写锁（RW Lock），保护已使用虚拟机链表（iUsedHead）的并发访问。注意：持有此锁时，不能获取其他锁以避免死锁。
     /** The handle array.
      * The size of this array defines the maximum number of currently running VMs.
      * The first entry is unused as it represents the NIL handle. */
@@ -258,15 +261,15 @@ typedef struct GVMM
      * The number of EMTs that means we no longer consider ourselves alone on a
      * CPU/Core.
      */
-    uint32_t            cEMTsMeansCompany;
+    uint32_t            cEMTsMeansCompany;//阈值：当活跃 EMT 数量超过此值时，认为系统处于“有负载”状态（非独占 CPU）。
     /** @gcfgm{/GVMM/MinSleepAlone,32-bit, 0, 100000000, 750000, ns}
      * The minimum sleep time for when we're alone, in nano seconds.
      */
-    uint32_t            nsMinSleepAlone;
+    uint32_t            nsMinSleepAlone;//无负载时的最小休眠时间（默认 750,000 ns）。
     /** @gcfgm{/GVMM/MinSleepCompany,32-bit,0, 100000000, 15000, ns}
      * The minimum sleep time for when we've got company, in nano seconds.
      */
-    uint32_t            nsMinSleepCompany;
+    uint32_t            nsMinSleepCompany;//有负载时的最小休眠时间（默认 15,000 ns）。
 #ifdef GVMM_SCHED_WITH_HR_WAKE_UP_TIMER
     /** @gcfgm{/GVMM/MinSleepWithHrWakeUp,32-bit,0, 100000000, 5000, ns}
      * The minimum sleep time for when we've got a high-resolution wake-up timer, in
@@ -277,19 +280,21 @@ typedef struct GVMM
     /** @gcfgm{/GVMM/EarlyWakeUp1, 32-bit, 0, 100000000, 25000, ns}
      * The limit for the first round of early wake-ups, given in nano seconds.
      */
-    uint32_t            nsEarlyWakeUp1;
+    uint32_t            nsEarlyWakeUp1;//第一轮提前唤醒：25,000 ns（nsEarlyWakeUp1）。
     /** @gcfgm{/GVMM/EarlyWakeUp2, 32-bit, 0, 100000000, 50000, ns}
      * The limit for the second round of early wake-ups, given in nano seconds.
      */
-    uint32_t            nsEarlyWakeUp2;
+    uint32_t            nsEarlyWakeUp2;//第二轮提前唤醒：50,000 ns（nsEarlyWakeUp2）。
 
     /** Set if we're doing early wake-ups.
      * This reflects  nsEarlyWakeUp1 and nsEarlyWakeUp2.  */
-    bool volatile       fDoEarlyWakeUps;
+    bool volatile       fDoEarlyWakeUps;//是否启用提前唤醒机制，由 nsEarlyWakeUp1 和 nsEarlyWakeUp2 配置决定。
 
     /** The number of entries in the host CPU array (aHostCpus). */
     uint32_t            cHostCpus;
     /** Per host CPU data (variable length). */
+    //主机 CPU 数据的动态数组（长度由 cHostCpus 定义），
+	//每个元素（GVMMHOSTCPU）存储单个 CPU 核心的调度状态（如负载、休眠统计等）。
     GVMMHOSTCPU         aHostCpus[1];
 } GVMM;
 AssertCompileMemberAlignment(GVMM, CreateDestroyLock, 8);
@@ -360,6 +365,11 @@ static DECLCALLBACK(void) gvmmR0EmtWakeUpTimerCallback(PRTTIMER pTimer, void *pv
  *
  * @returns VBox status code.
  */
+#if 0
+  分配并初始化 GVMM 的核心数据结构。
+    设置主机 CPU 相关的调度参数。
+    初始化同步机制（如锁、定时器）以支持多虚拟机管理。
+#endif
 GVMMR0DECL(int) GVMMR0Init(void)
 {
     LogFlow(("GVMMR0Init:\n"));
@@ -367,19 +377,23 @@ GVMMR0DECL(int) GVMMR0Init(void)
     /*
      * Allocate and initialize the instance data.
      */
-    uint32_t cHostCpus = RTMpGetArraySize();
+    uint32_t cHostCpus = RTMpGetArraySize();//调用 RTMpGetArraySize() 获取主机 CPU 核心数。
     AssertMsgReturn(cHostCpus > 0 && cHostCpus < _64K, ("%d", (int)cHostCpus), VERR_GVMM_HOST_CPU_RANGE);
 
+    //动态分配内存，大小 = GVMM 基础结构 + 主机 CPU 数量对应的数组空间。
     PGVMM pGVMM = (PGVMM)RTMemAllocZ(RT_UOFFSETOF_DYN(GVMM, aHostCpus[cHostCpus]));
     if (!pGVMM)
         return VERR_NO_MEMORY;
+    //CreateDestroyLock：用于保护虚拟机创建/销毁操作。
     int rc = RTCritSectInitEx(&pGVMM->CreateDestroyLock, 0, NIL_RTLOCKVALCLASS, RTLOCKVAL_SUB_CLASS_NONE,
                               "GVMM-CreateDestroyLock");
     if (RT_SUCCESS(rc))
     {
+        //UsedLock（读写锁）：用于管理虚拟机句柄的并发访问。
         rc = RTCritSectRwInitEx(&pGVMM->UsedLock, 0, NIL_RTLOCKVALCLASS, RTLOCKVAL_SUB_CLASS_NONE, "GVMM-UsedLock");
         if (RT_SUCCESS(rc))
         {
+            //将句柄数组组织为 空闲链表 和 已用链表，方便快速分配/释放。
             pGVMM->u32Magic = GVMM_MAGIC;
             pGVMM->iUsedHead = 0;
             pGVMM->iFreeHead = 1;
@@ -410,6 +424,8 @@ GVMMR0DECL(int) GVMMR0Init(void)
                 pGVMM->nsEarlyWakeUp1    =  25000 /* ns (0.025 ms) */;
                 pGVMM->nsEarlyWakeUp2    =  50000 /* ns (0.050 ms) */;
             }
+            //高分辨率：设置更精细的睡眠/唤醒阈值。
+            //低分辨率：使用保守值（如 2000 ns）。
             else if (cNsResolution > RT_NS_100US)
             {
                 pGVMM->nsMinSleepAlone   = cNsResolution / 2;
@@ -434,6 +450,9 @@ GVMMR0DECL(int) GVMMR0Init(void)
             uint32_t    iCpu = cHostCpus;
             RTCPUSET    PossibleSet;
             RTMpGetSet(&PossibleSet);
+			//遍历所有主机 CPU：
+              //检查 CPU 是否可用（通过 RTCpuSetIsMember）。
+              //为可用 CPU 初始化 周期抢占定时器（PPT） 和 自旋锁，用于调度虚拟机线程。
             while (iCpu-- > 0)
             {
                 pGVMM->aHostCpus[iCpu].idxCpuSet        = iCpu;
@@ -519,12 +538,13 @@ GVMMR0DECL(int) GVMMR0Init(void)
  * And unless something is wrong, there should be absolutely no VMs
  * registered at this point.
  */
+//在虚拟机监控程序（VMM）关闭时清理全局资源
 GVMMR0DECL(void) GVMMR0Term(void)
 {
     LogFlow(("GVMMR0Term:\n"));
 
     PGVMM pGVMM = g_pGVMM;
-    g_pGVMM = NULL;
+    g_pGVMM = NULL;// 立即置空全局指针，防止后续访问
     if (RT_UNLIKELY(!RT_VALID_PTR(pGVMM)))
     {
         SUPR0Printf("GVMMR0Term: pGVMM=%RKv\n", pGVMM);
@@ -539,27 +559,30 @@ GVMMR0DECL(void) GVMMR0Term(void)
     while (iCpu-- > 0)
     {
         ASMAtomicWriteU32(&pGVMM->aHostCpus[iCpu].u32Magic, ~GVMMHOSTCPU_MAGIC);
+        //遍历所有主机 CPU，停止每个 CPU 的 PPT（Periodic Preemption Timer）定时器（若启用 GVMM_SCHED_WITH_PPT）。
 #ifdef GVMM_SCHED_WITH_PPT
         if (    pGVMM->aHostCpus[iCpu].Ppt.pTimer != NULL
             &&  RT_SUCCESS(RTTimerStop(pGVMM->aHostCpus[iCpu].Ppt.pTimer)))
             cActiveTimers++;
 #endif
     }
+
+    //若有活跃定时器，睡眠 1ms 确保定时器线程安全退出。
     if (cActiveTimers)
         RTThreadSleep(1); /* fudge */
 
     /*
      * Invalidate the and free resources.
      */
-    pGVMM->u32Magic = ~GVMM_MAGIC;
-    RTCritSectRwDelete(&pGVMM->UsedLock);
-    RTCritSectDelete(&pGVMM->CreateDestroyLock);
+    pGVMM->u32Magic = ~GVMM_MAGIC;// 标记GVMM结构无效
+    RTCritSectRwDelete(&pGVMM->UsedLock);// 销毁读写锁
+    RTCritSectDelete(&pGVMM->CreateDestroyLock);// 销毁临界区锁
 
     pGVMM->iFreeHead = 0;
     if (pGVMM->iUsedHead)
     {
         SUPR0Printf("GVMMR0Term: iUsedHead=%#x! (cVMs=%#x cEMTs=%#x)\n", pGVMM->iUsedHead, pGVMM->cVMs, pGVMM->cEMTs);
-        pGVMM->iUsedHead = 0;
+        pGVMM->iUsedHead = 0;// 强制清空活跃虚拟机链表
     }
 
 #ifdef GVMM_SCHED_WITH_PPT
@@ -586,6 +609,30 @@ GVMMR0DECL(void) GVMMR0Term(void)
  * @param   pszName     The variable name.
  * @param   u64Value    The new value.
  */
+//用于动态调整虚拟机调度参数
+//通常由虚拟机的配置接口（如 VBoxManage）触发，实现运行时调优。
+#if 0
+    参数名	            作用域	      典型值	         说明
+    cEMTsMeansCompany	全局	      1	                当 cEMTs ≥ 1 即认为系统"拥挤"，触发更短的休眠策略（MinSleepCompany）
+    MinSleepAlone	    单vCPU运行	  750,000 ns	    无竞争时的默认休眠时间（0.75ms）
+    MinSleepCompany	    多vCPU竞争	  15,000 ns	        拥挤模式下的休眠时间（0.015ms）
+    EarlyWakeUp1/2	    抢占式调度	  25,000/50,000 ns	两级提前唤醒阈值，用于减少调度延迟
+#endif
+#if 0
+  调度策略逻辑
+  // 根据 cEMTs 数量选择休眠时间
+  uint64_t nsMinSleep = (pGVMM->cEMTs >= pGVMM->cEMTsMeansCompany)
+                      ? pGVMM->nsMinSleepCompany
+                      : pGVMM->nsMinSleepAlone;
+
+  // 若启用早期唤醒，进一步缩短实际休眠时间
+  if (pGVMM->fDoEarlyWakeUps) {
+      nsMinSleep = RT_MIN(nsMinSleep - pGVMM->nsEarlyWakeUp1,
+                         nsMinSleep - pGVMM->nsEarlyWakeUp2);
+  }
+  动态切换：cEMTs 增加会导致更短的休眠时间（MinSleepCompany），提升调度响应速度。
+  设计思想：通过 "拥挤检测"‌ 避免多个 vCPU 因过长休眠导致的调度延迟累积。
+#endif
 GVMMR0DECL(int) GVMMR0SetConfig(PSUPDRVSESSION pSession, const char *pszName, uint64_t u64Value)
 {
     /*
@@ -595,7 +642,10 @@ GVMMR0DECL(int) GVMMR0SetConfig(PSUPDRVSESSION pSession, const char *pszName, ui
     GVMM_GET_VALID_INSTANCE(pGVMM, VERR_GVMM_INSTANCE);
     AssertPtrReturn(pSession, VERR_INVALID_HANDLE);
     AssertPtrReturn(pszName, VERR_INVALID_POINTER);
-
+#if 0
+    cVMs：当前运行的虚拟机数量（在 GVMM 结构中定义）。
+    cEMTs：所有虚拟机的虚拟CPU总数（EMT = Emulation Thread，每个 vCPU 对应一个 EMT 线程）。
+#endif
     /*
      * String switch time!
      */
@@ -606,7 +656,9 @@ GVMMR0DECL(int) GVMMR0SetConfig(PSUPDRVSESSION pSession, const char *pszName, ui
     if (!strcmp(pszName, "cEMTsMeansCompany"))
     {
         if (u64Value <= UINT32_MAX)
-            pGVMM->cEMTsMeansCompany = u64Value;
+			//当活跃的 cEMTs ≥ cEMTsMeansCompany 时，GVMM 会从 "单独模式"（MinSleepAlone）
+			//切换到 "拥挤模式"（MinSleepCompany），调整 vCPU 的休眠时间以避免资源争抢。
+            pGVMM->cEMTsMeansCompany = u64Value;// 设置"需要调整策略的EMT阈值"
         else
             rc = VERR_OUT_OF_RANGE;
     }
