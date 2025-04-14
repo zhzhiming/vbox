@@ -631,7 +631,7 @@ GVMMR0DECL(void) GVMMR0Term(void)
                          nsMinSleep - pGVMM->nsEarlyWakeUp2);
   }
   动态切换：cEMTs 增加会导致更短的休眠时间（MinSleepCompany），提升调度响应速度。
-  设计思想：通过 "拥挤检测"‌ 避免多个 vCPU 因过长休眠导致的调度延迟累积。
+  设计思想：通过 "拥挤检测"避免多个 vCPU 因过长休眠导致的调度延迟累积。
 #endif
 GVMMR0DECL(int) GVMMR0SetConfig(PSUPDRVSESSION pSession, const char *pszName, uint64_t u64Value)
 {
@@ -808,6 +808,7 @@ GVMMR0DECL(int) GVMMR0QueryConfig(PSUPDRVSESSION pSession, const char *pszName, 
 DECLINLINE(int) gvmmR0CreateDestroyLock(PGVMM pGVMM)
 {
     LogFlow(("++gvmmR0CreateDestroyLock(%p)\n", pGVMM));
+    //用于获取全局虚拟机创建/销毁锁
     int rc = RTCritSectEnter(&pGVMM->CreateDestroyLock);
     LogFlow(("gvmmR0CreateDestroyLock(%p)->%Rrc\n", pGVMM, rc));
     return rc;
@@ -876,33 +877,52 @@ GVMMR0DECL(int) GVMMR0CreateVMReq(PGVMMCREATEVMREQ pReq, PSUPDRVSESSION pSession
  *
  * @thread  EMT.
  */
+//负责分配和初始化一个虚拟机实例(VM)
+#if 0
+    GVMM (Global)
+    ├─ aHandles[]            // 虚拟机句柄数组
+    │  ├─ iHandle → GVM      // 通过句柄索引到具体VM
+    ├─ iFreeHead             // 空闲句柄链表头
+    ├─ iUsedHead             // 已用句柄链表头
+    └─ cVMs                  // 当前活跃VM计数
+    
+    GVM (Per-VM)
+    ├─ aCpus[cCpus]          // vCPU状态数组
+    ├─ gvmm.s.VMMemObj       // VM内存对象（物理连续）
+    └─ gvmm.s.VMPagesMemObj  // 页表物理地址数组
+
+    按依赖顺序初始化子模块（GVMM → GMM → PGM → VMM）。
+#endif
 GVMMR0DECL(int) GVMMR0CreateVM(PSUPDRVSESSION pSession, uint32_t cCpus, PGVM *ppGVM)
 {
     LogFlow(("GVMMR0CreateVM: pSession=%p\n", pSession));
     PGVMM pGVMM;
-    GVMM_GET_VALID_INSTANCE(pGVMM, VERR_GVMM_INSTANCE);
+    GVMM_GET_VALID_INSTANCE(pGVMM, VERR_GVMM_INSTANCE);//检查GVMM全局实例有效性
 
-    AssertPtrReturn(ppGVM, VERR_INVALID_POINTER);
+    AssertPtrReturn(ppGVM, VERR_INVALID_POINTER); // 检查输出指针有效性
     *ppGVM = NULL;
 
     if (    cCpus == 0
-        ||  cCpus > VMM_MAX_CPU_COUNT)
+        ||  cCpus > VMM_MAX_CPU_COUNT)// 校验vCPU数量范围
         return VERR_INVALID_PARAMETER;
 
-    RTNATIVETHREAD hEMT0 = RTThreadNativeSelf();
+    //hEMT0 后续会绑定为虚拟机的第一个 vCPU（EMT0）的执行线程。
+    RTNATIVETHREAD hEMT0 = RTThreadNativeSelf();// 获取当前线程句柄
     AssertReturn(hEMT0 != NIL_RTNATIVETHREAD, VERR_GVMM_BROKEN_IPRT);
-    RTPROCESS      ProcId = RTProcSelf();
+    RTPROCESS      ProcId = RTProcSelf();  // 获取当前进程ID
     AssertReturn(ProcId != NIL_RTPROCESS, VERR_GVMM_BROKEN_IPRT);
 
     /*
      * The whole allocation process is protected by the lock.
      */
+    //串行化虚拟机创建/销毁操作。
     int rc = gvmmR0CreateDestroyLock(pGVMM);
     AssertRCReturn(rc, rc);
 
     /*
      * Only one VM per session.
      */
+    // 检查会话是否已绑定VM
     if (SUPR0GetSessionVM(pSession) != NULL)
     {
         gvmmR0CreateDestroyUnlock(pGVMM);
@@ -913,6 +933,7 @@ GVMMR0DECL(int) GVMMR0CreateVM(PSUPDRVSESSION pSession, uint32_t cCpus, PGVM *pp
     /*
      * Allocate a handle first so we don't waste resources unnecessarily.
      */
+    // 从空闲链表获取句柄
     uint16_t iHandle = pGVMM->iFreeHead;
     if (iHandle)
     {
@@ -923,7 +944,7 @@ GVMMR0DECL(int) GVMMR0CreateVM(PSUPDRVSESSION pSession, uint32_t cCpus, PGVM *pp
             &&  !pHandle->pvObj
             &&  pHandle->iSelf == iHandle)
         {
-            pHandle->pvObj = SUPR0ObjRegister(pSession, SUPDRVOBJTYPE_VM, gvmmR0HandleObjDestructor, pGVMM, pHandle);
+            pHandle->pvObj = SUPR0ObjRegister(pSession, SUPDRVOBJTYPE_VM, gvmmR0HandleObjDestructor, pGVMM, pHandle);// 注册会话对象
             if (pHandle->pvObj)
             {
                 /*
@@ -932,6 +953,8 @@ GVMMR0DECL(int) GVMMR0CreateVM(PSUPDRVSESSION pSession, uint32_t cCpus, PGVM *pp
                 rc = GVMMR0_USED_EXCLUSIVE_LOCK(pGVMM);
                 AssertRC(rc);
 
+                //GVMM 维护两个链表：iFreeHead（空闲句柄）和 iUsedHead（已用句柄）。
+                // 将句柄从空闲链表移至已用链表
                 pGVMM->iFreeHead = pHandle->iNext;
                 pHandle->iNext = pGVMM->iUsedHead;
                 pGVMM->iUsedHead = iHandle;
@@ -950,43 +973,52 @@ GVMMR0DECL(int) GVMMR0CreateVM(PSUPDRVSESSION pSession, uint32_t cCpus, PGVM *pp
                     /*
                      * Allocate memory for the VM structure (combined VM + GVM).
                      */
+                    // 动态计算GVM结构大小
                     const uint32_t  cbVM      = RT_UOFFSETOF_DYN(GVM, aCpus[cCpus]);
                     const uint32_t  cPages    = RT_ALIGN_32(cbVM, HOST_PAGE_SIZE) >> HOST_PAGE_SHIFT;
                     RTR0MEMOBJ      hVMMemObj = NIL_RTR0MEMOBJ;
+                    // 分配物理连续内存
+                    //使用 RTR0MemObjAllocPage 分配物理连续内存，满足硬件虚拟化（如 VT-x）的需求。
                     rc = RTR0MemObjAllocPage(&hVMMemObj, cPages << HOST_PAGE_SHIFT, false /* fExecutable */);
                     if (RT_SUCCESS(rc))
                     {
+                        // 获取虚拟地址
                         PGVM pGVM = (PGVM)RTR0MemObjAddress(hVMMemObj);
                         AssertPtr(pGVM);
 
                         /*
                          * Initialise the structure.
                          */
+                        //子模块初始化
                         RT_BZERO(pGVM, cPages << HOST_PAGE_SHIFT);
-                        gvmmR0InitPerVMData(pGVM, iHandle, cCpus, pSession);
+                        gvmmR0InitPerVMData(pGVM, iHandle, cCpus, pSession);//初始化GVMM私有数据
                         pGVM->gvmm.s.VMMemObj  = hVMMemObj;
-                        rc = GMMR0InitPerVMData(pGVM);
-                        int rc2 = PGMR0InitPerVMData(pGVM, hVMMemObj);
-                        int rc3 = VMMR0InitPerVMData(pGVM);
-                        CPUMR0InitPerVMData(pGVM);
+                        rc = GMMR0InitPerVMData(pGVM);                // 初始化全局内存管理（GMM）
+                        int rc2 = PGMR0InitPerVMData(pGVM, hVMMemObj);//初始化分页管理（PGM）
+                        int rc3 = VMMR0InitPerVMData(pGVM);           //初始化VMM核心
+                        CPUMR0InitPerVMData(pGVM);                    // 初始化CPU状态管理
                         DBGFR0InitPerVMData(pGVM);
                         PDMR0InitPerVMData(pGVM);
                         IOMR0InitPerVMData(pGVM);
                         TMR0InitPerVMData(pGVM);
+                        //通过返回值聚合（rc/rc2/rc3）确保所有模块初始化成功
                         if (RT_SUCCESS(rc) && RT_SUCCESS(rc2) && RT_SUCCESS(rc3))
                         {
                             /*
                              * Allocate page array.
                              * This currently have to be made available to ring-3, but this is should change eventually.
                              */
+                            // 分配页表描述符内存
                             rc = RTR0MemObjAllocPage(&pGVM->gvmm.s.VMPagesMemObj, cPages * sizeof(SUPPAGE), false /* fExecutable */);
                             if (RT_SUCCESS(rc))
                             {
+                                //为虚拟机的内存页生成物理地址数组（paPages），供 Ring-3（用户态）和硬件直接使用。
+                                //后续用于构建客户机的页表（EPT/NPT）。
                                 PSUPPAGE paPages = (PSUPPAGE)RTR0MemObjAddress(pGVM->gvmm.s.VMPagesMemObj); AssertPtr(paPages);
                                 for (uint32_t iPage = 0; iPage < cPages; iPage++)
                                 {
                                     paPages[iPage].uReserved = 0;
-                                    paPages[iPage].Phys = RTR0MemObjGetPagePhysAddr(pGVM->gvmm.s.VMMemObj, iPage);
+                                    paPages[iPage].Phys = RTR0MemObjGetPagePhysAddr(pGVM->gvmm.s.VMMemObj, iPage);// 填充物理地址
                                     Assert(paPages[iPage].Phys != NIL_RTHCPHYS);
                                 }
 
@@ -997,12 +1029,14 @@ GVMMR0DECL(int) GVMMR0CreateVM(PSUPDRVSESSION pSession, uint32_t cCpus, PGVM *pp
                                 rc = RTR0MemObjMapUserEx(&pGVM->gvmm.s.VMMapObj, pGVM->gvmm.s.VMMemObj, (RTR3PTR)-1, 0,
                                                          RTMEM_PROT_READ | RTMEM_PROT_WRITE, NIL_RTR0PROCESS,
                                                          0 /*offSub*/, sizeof(VM));
+                                //映射GVM到用户态
                                 for (VMCPUID i = 0; i < cCpus && RT_SUCCESS(rc); i++)
                                 {
                                     AssertCompileSizeAlignment(VMCPU, HOST_PAGE_SIZE);
+                                    //GVM 结构包含虚拟机核心状态，末尾动态扩展 aCpus 数组以容纳所有 vCPU。
                                     rc = RTR0MemObjMapUserEx(&pGVM->aCpus[i].gvmm.s.VMCpuMapObj, pGVM->gvmm.s.VMMemObj,
                                                              (RTR3PTR)-1, 0, RTMEM_PROT_READ | RTMEM_PROT_WRITE, NIL_RTR0PROCESS,
-                                                             RT_UOFFSETOF_DYN(GVM, aCpus[i]), sizeof(VMCPU));
+                                                             RT_UOFFSETOF_DYN(GVM, aCpus[i]), sizeof(VMCPU)); // 映射每个vCPU
                                 }
                                 if (RT_SUCCESS(rc))
                                     rc = RTR0MemObjMapUser(&pGVM->gvmm.s.VMPagesMapObj, pGVM->gvmm.s.VMPagesMemObj, (RTR3PTR)-1,
@@ -1040,7 +1074,7 @@ GVMMR0DECL(int) GVMMR0CreateVM(PSUPDRVSESSION pSession, uint32_t cCpus, PGVM *pp
                                         int rc4 = RTTimerCreateEx(&pGVM->aCpus[0].gvmm.s.hHrWakeUpTimer,
                                                                   0 /*one-shot, no interval*/,
                                                                   RTTIMER_FLAGS_HIGH_RES, gvmmR0EmtWakeUpTimerCallback,
-                                                                  &pGVM->aCpus[0]);
+                                                                  &pGVM->aCpus[0]); // 创建高精度定时器
                                         if (RT_FAILURE(rc4))
                                             pGVM->aCpus[0].gvmm.s.hHrWakeUpTimer = NULL;
                                     }
@@ -1051,9 +1085,9 @@ GVMMR0DECL(int) GVMMR0CreateVM(PSUPDRVSESSION pSession, uint32_t cCpus, PGVM *pp
                                      */
                                     rc = GVMMR0_USED_EXCLUSIVE_LOCK(pGVMM);
                                     AssertRC(rc);
-
-                                    pHandle->pGVM                       = pGVM;
-                                    pHandle->hEMT0                      = hEMT0;
+                                    //完成绑定
+                                    pHandle->pGVM                       = pGVM; // 关联句柄与GVM
+                                    pHandle->hEMT0                      = hEMT0; // 绑定EMT0线程
                                     pHandle->ProcId                     = ProcId;
                                     pGVM->pVMR3                         = pVMR3;
                                     pGVM->pVMR3Unsafe                   = pVMR3;
@@ -1067,10 +1101,10 @@ GVMMR0DECL(int) GVMMR0CreateVM(PSUPDRVSESSION pSession, uint32_t cCpus, PGVM *pp
                                     pGVMM->cEMTs += cCpus;
 
                                     /* Associate it with the session and create the context hook for EMT0. */
-                                    rc = SUPR0SetSessionVM(pSession, pGVM, pGVM);
+                                    rc = SUPR0SetSessionVM(pSession, pGVM, pGVM);    // 会话与VM关联
                                     if (RT_SUCCESS(rc))
                                     {
-                                        rc = VMMR0ThreadCtxHookCreateForEmt(&pGVM->aCpus[0]);
+                                        rc = VMMR0ThreadCtxHookCreateForEmt(&pGVM->aCpus[0]);// 创建线程上下文钩子,通过钩子实现 vCPU 状态切换（如 FPU 状态保存）。
                                         if (RT_SUCCESS(rc))
                                         {
                                             /*
@@ -1159,6 +1193,9 @@ GVMMR0DECL(int) GVMMR0CreateVM(PSUPDRVSESSION pSession, uint32_t cCpus, PGVM *pp
  * @param   cCpus       The CPU count.
  * @param   pSession    The session this VM is associated with.
  */
+//初始化虚拟机（VM）和虚拟CPU（vCPU）
+//初始化一个虚拟机实例（PGVM）及其所有 vCPU 的运行时数据结构。
+//调用时机：在 GVMMR0CreateVM 中分配完 VM 内存后立即调用，属于虚拟机创建的核心初始化阶段。
 static void gvmmR0InitPerVMData(PGVM pGVM, int16_t hSelf, VMCPUID cCpus, PSUPDRVSESSION pSession)
 {
     AssertCompile(RT_SIZEOFMEMB(GVM,gvmm.s) <= RT_SIZEOFMEMB(GVM,gvmm.padding));
@@ -1168,28 +1205,29 @@ static void gvmmR0InitPerVMData(PGVM pGVM, int16_t hSelf, VMCPUID cCpus, PSUPDRV
 
     /* GVM: */
     pGVM->u32Magic         = GVM_MAGIC;
-    pGVM->hSelf            = hSelf;
-    pGVM->cCpus            = cCpus;
-    pGVM->pSession         = pSession;
+    pGVM->hSelf            = hSelf;//虚拟机在全局 GVMM 中的句柄（索引）
+    pGVM->cCpus            = cCpus;//虚拟CPU数量
+    pGVM->pSession         = pSession;//关联的用户会话（驱动层）
     pGVM->pSelf            = pGVM;
 
     /* VM: */
-    pGVM->enmVMState       = VMSTATE_CREATING;
-    pGVM->hSelfUnsafe      = hSelf;
+    pGVM->enmVMState       = VMSTATE_CREATING;//虚拟机状态
+    pGVM->hSelfUnsafe      = hSelf;//pSelf 和 pVMR0ForCall 均指向自身，用于后续 Ring-0 调用自引用。
     pGVM->pSessionUnsafe   = pSession;
     pGVM->pVMR0ForCall     = pGVM;
     pGVM->cCpusUnsafe      = cCpus;
-    pGVM->uCpuExecutionCap = 100; /* default is no cap. */
+    pGVM->uCpuExecutionCap = 100; /* default is no cap. *///vCPU 执行能力上限（默认100%，即不限制）
     pGVM->uStructVersion   = 1;
     pGVM->cbSelf           = sizeof(VM);
     pGVM->cbVCpu           = sizeof(VMCPU);
 
     /* GVMM: */
-    pGVM->gvmm.s.VMMemObj       = NIL_RTR0MEMOBJ;
+	//gvmm.s :GVMM 私有数据（内存对象、线程句柄等）
+    pGVM->gvmm.s.VMMemObj       = NIL_RTR0MEMOBJ;  // 内存对象初始为空
     pGVM->gvmm.s.VMMapObj       = NIL_RTR0MEMOBJ;
     pGVM->gvmm.s.VMPagesMemObj  = NIL_RTR0MEMOBJ;
     pGVM->gvmm.s.VMPagesMapObj  = NIL_RTR0MEMOBJ;
-    pGVM->gvmm.s.fDoneVMMR0Init = false;
+    pGVM->gvmm.s.fDoneVMMR0Init = false;           // 标记VMM未初始化
     pGVM->gvmm.s.fDoneVMMR0Term = false;
 
     for (size_t i = 0; i < RT_ELEMENTS(pGVM->gvmm.s.aWorkerThreads); i++)
@@ -1210,19 +1248,19 @@ static void gvmmR0InitPerVMData(PGVM pGVM, int16_t hSelf, VMCPUID cCpus, PSUPDRV
      */
     for (VMCPUID i = 0; i < pGVM->cCpus; i++)
     {
-        pGVM->aCpus[i].idCpu                 = i;
+        pGVM->aCpus[i].idCpu                 = i;// 设置vCPU ID
         pGVM->aCpus[i].idCpuUnsafe           = i;
         pGVM->aCpus[i].gvmm.s.HaltEventMulti = NIL_RTSEMEVENTMULTI;
         pGVM->aCpus[i].gvmm.s.VMCpuMapObj    = NIL_RTR0MEMOBJ;
         pGVM->aCpus[i].gvmm.s.idxEmtHash     = UINT16_MAX;
         pGVM->aCpus[i].gvmm.s.hHrWakeUpTimer = NULL;
-        pGVM->aCpus[i].hEMT                  = NIL_RTNATIVETHREAD;
-        pGVM->aCpus[i].pGVM                  = pGVM;
+        pGVM->aCpus[i].hEMT                  = NIL_RTNATIVETHREAD;// EMT线程句柄暂为空
+        pGVM->aCpus[i].pGVM                  = pGVM;//指向所属的 GVM 结构
         pGVM->aCpus[i].idHostCpu             = NIL_RTCPUID;
         pGVM->aCpus[i].iHostCpuSet           = UINT32_MAX;
         pGVM->aCpus[i].hNativeThread         = NIL_RTNATIVETHREAD;
         pGVM->aCpus[i].hNativeThreadR0       = NIL_RTNATIVETHREAD;
-        pGVM->aCpus[i].enmState              = VMCPUSTATE_STOPPED;
+        pGVM->aCpus[i].enmState              = VMCPUSTATE_STOPPED;// 初始状态为停止
         pGVM->aCpus[i].pVCpuR0ForVtg         = &pGVM->aCpus[i];
     }
 }
@@ -1234,6 +1272,7 @@ static void gvmmR0InitPerVMData(PGVM pGVM, int16_t hSelf, VMCPUID cCpus, PSUPDRV
  * @returns VBox status code.
  * @param   pGVM        The global (ring-0) VM structure.
  */
+//为虚拟机的所有vCPU初始化HaltEventMulti信号量，用于vCPU的休眠/唤醒同步机制
 GVMMR0DECL(int) GVMMR0InitVM(PGVM pGVM)
 {
     LogFlow(("GVMMR0InitVM: pGVM=%p\n", pGVM));
@@ -1244,6 +1283,7 @@ GVMMR0DECL(int) GVMMR0InitVM(PGVM pGVM)
     {
         for (VMCPUID i = 0; i < pGVM->cCpus; i++)
         {
+            //通过RTSemEventMultiCreate创建可被多个线程等待的事件对象
             rc = RTSemEventMultiCreate(&pGVM->aCpus[i].gvmm.s.HaltEventMulti);
             if (RT_FAILURE(rc))
             {
@@ -1307,6 +1347,7 @@ GVMMR0DECL(bool) GVMMR0DoingTermVM(PGVM pGVM)
  *
  * @thread  EMT(0) if it's associated with the VM, otherwise any thread.
  */
+//销毁虚拟机
 GVMMR0DECL(int) GVMMR0DestroyVM(PGVM pGVM)
 {
     LogFlow(("GVMMR0DestroyVM: pGVM=%p\n", pGVM));
@@ -1316,21 +1357,23 @@ GVMMR0DECL(int) GVMMR0DestroyVM(PGVM pGVM)
     /*
      * Validate the VM structure, state and caller.
      */
-    AssertPtrReturn(pGVM, VERR_INVALID_POINTER);
-    AssertReturn(!((uintptr_t)pGVM & HOST_PAGE_OFFSET_MASK), VERR_INVALID_POINTER);
+    AssertPtrReturn(pGVM, VERR_INVALID_POINTER);                                    // 检查GVM指针有效性
+    AssertReturn(!((uintptr_t)pGVM & HOST_PAGE_OFFSET_MASK), VERR_INVALID_POINTER); // 检查内存对齐, 通过 HOST_PAGE_OFFSET_MASK 确保 pGVM 地址按页对齐（通常 4KB）
     AssertMsgReturn(pGVM->enmVMState >= VMSTATE_CREATING && pGVM->enmVMState <= VMSTATE_TERMINATED, ("%d\n", pGVM->enmVMState),
-                    VERR_WRONG_ORDER);
+                    VERR_WRONG_ORDER);                                              // 检查VM状态合法性
 
-    uint32_t        hGVM = pGVM->hSelf;
+    uint32_t        hGVM = pGVM->hSelf; // 获取虚拟机全局句柄
     ASMCompilerBarrier();
     AssertReturn(hGVM != NIL_GVM_HANDLE, VERR_INVALID_VM_HANDLE);
     AssertReturn(hGVM < RT_ELEMENTS(pGVMM->aHandles), VERR_INVALID_VM_HANDLE);
 
     PGVMHANDLE      pHandle = &pGVMM->aHandles[hGVM];
-    AssertReturn(pHandle->pGVM == pGVM, VERR_NOT_OWNER);
-
+    AssertReturn(pHandle->pGVM == pGVM, VERR_NOT_OWNER); // 验证句柄与GVM的绑定关系
+    // 检查调用者权限（必须是主EMT线程或未初始化的线程）
+    // 仅允许虚拟机的主 EMT 线程（hEMT0）或未绑定的线程执行销毁操作。
     RTPROCESS       ProcId = RTProcSelf();
     RTNATIVETHREAD  hSelf  = RTThreadNativeSelf();
+    //通过进程 ID（ProcId）和线程句柄（hSelf）双重验证调用者身份。
     AssertReturn(   (   pHandle->hEMT0  == hSelf
                      && pHandle->ProcId == ProcId)
                  || pHandle->hEMT0 == NIL_RTNATIVETHREAD, VERR_NOT_OWNER);
@@ -1340,10 +1383,11 @@ GVMMR0DECL(int) GVMMR0DestroyVM(PGVM pGVM)
      * Since the lock isn't recursive and we'll have to leave it before dereferencing the
      * object, we take some precautions against racing callers just in case...
      */
-    int rc = gvmmR0CreateDestroyLock(pGVMM);
+    int rc = gvmmR0CreateDestroyLock(pGVMM);  // 获取全局创建/销毁锁
     AssertRC(rc);
 
     /* Be careful here because we might theoretically be racing someone else cleaning up. */
+    // 二次验证句柄状态（防止竞态条件）
     if (   pHandle->pGVM == pGVM
         && (   (   pHandle->hEMT0  == hSelf
                 && pHandle->ProcId == ProcId)
@@ -1359,17 +1403,18 @@ GVMMR0DECL(int) GVMMR0DestroyVM(PGVM pGVM)
             cNotDeregistered += pGVM->aCpus[idCpu].hEMT != GVMM_RTNATIVETHREAD_DESTROYED;
         if (cNotDeregistered == 0)
         {
+            // 所有辅助EMT线程已注销，继续销毁...
             /* Grab the object pointer. */
             void *pvObj = pHandle->pvObj;
-            pHandle->pvObj = NULL;
-            gvmmR0CreateDestroyUnlock(pGVMM);
+            pHandle->pvObj = NULL;// 解除会话对象绑定
+            gvmmR0CreateDestroyUnlock(pGVMM);// 释放全局锁
 
-            SUPR0ObjRelease(pvObj, pHandle->pSession);
+            SUPR0ObjRelease(pvObj, pHandle->pSession); // 释放会话对象
         }
         else
         {
             gvmmR0CreateDestroyUnlock(pGVMM);
-            rc = VERR_GVMM_NOT_ALL_EMTS_DEREGISTERED;
+            rc = VERR_GVMM_NOT_ALL_EMTS_DEREGISTERED; // 存在未注销的EMT线程
         }
     }
     else
@@ -1389,6 +1434,7 @@ GVMMR0DECL(int) GVMMR0DestroyVM(PGVM pGVM)
  *
  * @param   pGVM        The GVM pointer.
  */
+//完成虚拟机各子系统的资源释放工作
 static void gvmmR0CleanupVM(PGVM pGVM)
 {
     if (    pGVM->gvmm.s.fDoneVMMR0Init
@@ -1404,16 +1450,16 @@ static void gvmmR0CleanupVM(PGVM pGVM)
             AssertMsgFailed(("gvmmR0CleanupVM: VMMemObj=%p pGVM=%p\n", pGVM->gvmm.s.VMMemObj, pGVM));
     }
 
-    GMMR0CleanupVM(pGVM);
+    GMMR0CleanupVM(pGVM);// 全局内存管理清理
 #ifdef VBOX_WITH_NEM_R0
-    NEMR0CleanupVM(pGVM);
+    NEMR0CleanupVM(pGVM); // 嵌套虚拟化模块清理
 #endif
-    PDMR0CleanupVM(pGVM);
-    IOMR0CleanupVM(pGVM);
-    DBGFR0CleanupVM(pGVM);
-    PGMR0CleanupVM(pGVM);
-    TMR0CleanupVM(pGVM);
-    VMMR0CleanupVM(pGVM);
+    PDMR0CleanupVM(pGVM); // 即插即用设备管理清理
+    IOMR0CleanupVM(pGVM); // I/O管理器清理
+    DBGFR0CleanupVM(pGVM);// 调试器支持清理
+    PGMR0CleanupVM(pGVM);// 页表管理清理
+    TMR0CleanupVM(pGVM); // 定时器模块清理
+    VMMR0CleanupVM(pGVM);// 虚拟机监控器最终清理
 }
 
 
@@ -1423,6 +1469,12 @@ static void gvmmR0CleanupVM(PGVM pGVM)
  * pvUser1 is the GVM instance pointer.
  * pvUser2 is the handle pointer.
  */
+/*
+  该函数是 GVMM（Global VM Manager） 中虚拟机句柄的析构回调，在以下场景触发：
+    显式销毁：当虚拟机被正常关闭时。
+    会话终止：用户进程（如 VirtualBox 主程序）异常退出时，通过会话对象引用计数机制触发。
+    错误回滚：在 GVMMR0CreateVM 初始化失败时清理半成品 VM。
+*/
 static DECLCALLBACK(void) gvmmR0HandleObjDestructor(void *pvObj, void *pvUser1, void *pvUser2)
 {
     LogFlow(("gvmmR0HandleObjDestructor: %p %p %p\n", pvObj, pvUser1, pvUser2));
@@ -1432,11 +1484,13 @@ static DECLCALLBACK(void) gvmmR0HandleObjDestructor(void *pvObj, void *pvUser1, 
     /*
      * Some quick, paranoid, input validation.
      */
-    PGVMHANDLE pHandle = (PGVMHANDLE)pvUser2;
+    PGVMHANDLE pHandle = (PGVMHANDLE)pvUser2; // 获取待销毁的句柄
     AssertPtr(pHandle);
-    PGVMM pGVMM = (PGVMM)pvUser1;
-    Assert(pGVMM == g_pGVMM);
+    PGVMM pGVMM = (PGVMM)pvUser1; // 获取GVMM全局实例
+    Assert(pGVMM == g_pGVMM);// 验证全局实例有效性
     const uint16_t iHandle = pHandle - &pGVMM->aHandles[0];
+
+    // 校验句柄索引合法性
     if (    !iHandle
         ||  iHandle >= RT_ELEMENTS(pGVMM->aHandles)
         ||  iHandle != pHandle->iSelf)
@@ -1445,9 +1499,10 @@ static DECLCALLBACK(void) gvmmR0HandleObjDestructor(void *pvObj, void *pvUser1, 
         return;
     }
 
-    int rc = gvmmR0CreateDestroyLock(pGVMM);
+    //CreateDestroyLock 粗粒度保护全局状态，UsedLock 细粒度保护句柄链表。
+    int rc = gvmmR0CreateDestroyLock(pGVMM); // 获取全局创建/销毁锁
     AssertRC(rc);
-    rc = GVMMR0_USED_EXCLUSIVE_LOCK(pGVMM);
+    rc = GVMMR0_USED_EXCLUSIVE_LOCK(pGVMM);  // 获取句柄链表写锁
     AssertRC(rc);
 
     /*
@@ -1461,10 +1516,12 @@ static DECLCALLBACK(void) gvmmR0HandleObjDestructor(void *pvObj, void *pvUser1, 
         return;
     }
 
+    // 从已用链表移除句柄
     if (pGVMM->iUsedHead == iHandle)
-        pGVMM->iUsedHead = pHandle->iNext;
+        pGVMM->iUsedHead = pHandle->iNext; // 直接更新头指针
     else
     {
+        // 遍历链表查找前驱节点（O(n)复杂度）
         uint16_t iPrev = pGVMM->iUsedHead;
         int c = RT_ELEMENTS(pGVMM->aHandles) + 2;
         while (iPrev)
@@ -1495,31 +1552,33 @@ static DECLCALLBACK(void) gvmmR0HandleObjDestructor(void *pvObj, void *pvUser1, 
         }
 
         Assert(pGVMM->aHandles[iPrev].iNext == iHandle);
-        pGVMM->aHandles[iPrev].iNext = pHandle->iNext;
+        pGVMM->aHandles[iPrev].iNext = pHandle->iNext;// 解除链接
     }
-    pHandle->iNext = 0;
-    pGVMM->cVMs--;
+    pHandle->iNext = 0;// 清空next指针
+    pGVMM->cVMs--;   // 更新VM计数
 
     /*
      * Do the global cleanup round.
      */
+    //虚拟机资源释放
     PGVM pGVM = pHandle->pGVM;
     if (   RT_VALID_PTR(pGVM)
         && pGVM->u32Magic == GVM_MAGIC)
     {
-        pGVMM->cEMTs -= pGVM->cCpus;
+        pGVMM->cEMTs -= pGVM->cCpus;   // 更新vCPU计数
 
         if (pGVM->pSession)
             SUPR0SetSessionVM(pGVM->pSession, NULL, NULL);
 
-        GVMMR0_USED_EXCLUSIVE_UNLOCK(pGVMM);
-
+        GVMMR0_USED_EXCLUSIVE_UNLOCK(pGVMM);// 临时释放锁（避免死锁）
+        // 调用子模块清理函数, 触发 GMM、PGM 等模块的清理。
         gvmmR0CleanupVM(pGVM);
 
         /*
          * Do the GVMM cleanup - must be done last.
          */
         /* The VM and VM pages mappings/allocations. */
+        // 释放Ring-3映射对象
         if (pGVM->gvmm.s.VMPagesMapObj != NIL_RTR0MEMOBJ)
         {
             rc = RTR0MemObjFree(pGVM->gvmm.s.VMPagesMapObj, false /* fFreeMappings */); AssertRC(rc);
@@ -1560,8 +1619,9 @@ static DECLCALLBACK(void) gvmmR0HandleObjDestructor(void *pvObj, void *pvUser1, 
         }
 
         /* the GVM structure itself. */
-        pGVM->u32Magic |= UINT32_C(0x80000000);
+        pGVM->u32Magic |= UINT32_C(0x80000000);// 标记为已销毁
         Assert(pGVM->gvmm.s.VMMemObj != NIL_RTR0MEMOBJ);
+        //释放GVM结构内存（物理连续）
         rc = RTR0MemObjFree(pGVM->gvmm.s.VMMemObj, true /*fFreeMappings*/); AssertRC(rc);
         pGVM = NULL;
 
@@ -1574,8 +1634,10 @@ static DECLCALLBACK(void) gvmmR0HandleObjDestructor(void *pvObj, void *pvUser1, 
     /*
      * Free the handle.
      */
+	//句柄回收
     pHandle->iNext = pGVMM->iFreeHead;
     pGVMM->iFreeHead = iHandle;
+    // 原子清零句柄字段
     ASMAtomicWriteNullPtr(&pHandle->pGVM);
     ASMAtomicWriteNullPtr(&pHandle->pvObj);
     ASMAtomicWriteNullPtr(&pHandle->pSession);
@@ -1597,30 +1659,32 @@ static DECLCALLBACK(void) gvmmR0HandleObjDestructor(void *pvObj, void *pvUser1, 
  * @param   pGVM        The global (ring-0) VM structure.
  * @param   idCpu       VCPU id to register the current thread as.
  */
+//注册虚拟 CPU（vCPU）线程
 GVMMR0DECL(int) GVMMR0RegisterVCpu(PGVM pGVM, VMCPUID idCpu)
 {
-    AssertReturn(idCpu != 0, VERR_INVALID_FUNCTION);
+    AssertReturn(idCpu != 0, VERR_INVALID_FUNCTION); // 禁止注册idCpu=0（主EMT线程）
 
     /*
      * Validate the VM structure, state and handle.
      */
     PGVMM pGVMM;
-    int rc = gvmmR0ByGVM(pGVM, &pGVMM, false /* fTakeUsedLock */);
+    int rc = gvmmR0ByGVM(pGVM, &pGVMM, false /* fTakeUsedLock */);// 获取GVMM实例
     if (RT_SUCCESS(rc))
     {
-        if (idCpu < pGVM->cCpus)
+        if (idCpu < pGVM->cCpus) // 检查vCPU ID合法性
         {
             PGVMCPU const        pGVCpu      = &pGVM->aCpus[idCpu];
             RTNATIVETHREAD const hNativeSelf = RTThreadNativeSelf();
 
-            gvmmR0CreateDestroyLock(pGVMM); /** @todo per-VM lock? */
+            gvmmR0CreateDestroyLock(pGVMM); /** @todo per-VM lock? */// 获取全局锁
 
             /* Check that the EMT isn't already assigned to a thread. */
-            if (pGVCpu->hEMT == NIL_RTNATIVETHREAD)
+            if (pGVCpu->hEMT == NIL_RTNATIVETHREAD) // 检查vCPU未绑定线程
             {
                 Assert(pGVCpu->hNativeThreadR0 == NIL_RTNATIVETHREAD);
 
                 /* A thread may only be one EMT (this makes sure hNativeSelf isn't NIL). */
+                //一个宿主线程（hNativeSelf）只能绑定到一个 vCPU，遍历所有 vCPU 检查是否重复注册。
                 for (VMCPUID iCpu = 0; iCpu < pGVM->cCpus; iCpu++)
                     AssertBreakStmt(pGVM->aCpus[iCpu].hEMT != hNativeSelf, rc = VERR_INVALID_PARAMETER);
                 if (RT_SUCCESS(rc))
@@ -1629,34 +1693,36 @@ GVMMR0DECL(int) GVMMR0RegisterVCpu(PGVM pGVM, VMCPUID idCpu)
                      * Do the assignment, then try setup the hook. Undo if that fails.
                      */
                     unsigned cCollisions = 0;
-                    uint32_t idxHash     = GVMM_EMT_HASH_1(hNativeSelf);
+                    uint32_t idxHash     = GVMM_EMT_HASH_1(hNativeSelf);// 主哈希槽
                     if (pGVM->gvmm.s.aEmtHash[idxHash].hNativeEmt != NIL_RTNATIVETHREAD)
                     {
-                        uint32_t const idxHash2 = GVMM_EMT_HASH_2(hNativeSelf);
+                        uint32_t const idxHash2 = GVMM_EMT_HASH_2(hNativeSelf); // 二级哈希
                         do
-                        {
-                            cCollisions++;
+                        {   // 线性探测解决冲突
+                            cCollisions++;//记录冲突次数（cCollisions）用于调试。
                             Assert(cCollisions < GVMM_EMT_HASH_SIZE);
                             idxHash = (idxHash + idxHash2) % GVMM_EMT_HASH_SIZE;
                         } while (pGVM->gvmm.s.aEmtHash[idxHash].hNativeEmt != NIL_RTNATIVETHREAD);
                     }
+                    // 更新哈希表
                     pGVM->gvmm.s.aEmtHash[idxHash].hNativeEmt = hNativeSelf;
                     pGVM->gvmm.s.aEmtHash[idxHash].idVCpu     = idCpu;
-
+                    // 绑定线程到vCPU
                     pGVCpu->hNativeThreadR0        = hNativeSelf;
                     pGVCpu->hEMT                   = hNativeSelf;
                     pGVCpu->cEmtHashCollisions     = (uint8_t)cCollisions;
                     pGVCpu->gvmm.s.idxEmtHash      = (uint16_t)idxHash;
-
+                    // 初始化线程上下文钩子
                     rc = VMMR0ThreadCtxHookCreateForEmt(pGVCpu);
                     if (RT_SUCCESS(rc))
                     {
-                        CPUMR0RegisterVCpuThread(pGVCpu);
+                        CPUMR0RegisterVCpuThread(pGVCpu);// 注册CPU状态
 
 #ifdef GVMM_SCHED_WITH_HR_WAKE_UP_TIMER
                         /*
                          * Create the high resolution wake-up timer, ignore failures.
                          */
+                        // 高精度定时器初始化（可选）
                         if (RTTimerCanDoHighResolution())
                         {
                             int rc2 = RTTimerCreateEx(&pGVCpu->gvmm.s.hHrWakeUpTimer, 0 /*one-shot, no interval*/,
@@ -1666,11 +1732,11 @@ GVMMR0DECL(int) GVMMR0RegisterVCpu(PGVM pGVM, VMCPUID idCpu)
                         }
 #endif
                     }
-                    else
+                    else// 若钩子初始化失败
                     {
-                        pGVCpu->hNativeThreadR0                   = NIL_RTNATIVETHREAD;
+                        pGVCpu->hNativeThreadR0                   = NIL_RTNATIVETHREAD; // 解绑线程
                         pGVCpu->hEMT                              = NIL_RTNATIVETHREAD;
-                        pGVM->gvmm.s.aEmtHash[idxHash].hNativeEmt = NIL_RTNATIVETHREAD;
+                        pGVM->gvmm.s.aEmtHash[idxHash].hNativeEmt = NIL_RTNATIVETHREAD;// 清理哈希表
                         pGVM->gvmm.s.aEmtHash[idxHash].idVCpu     = NIL_VMCPUID;
                         pGVCpu->gvmm.s.idxEmtHash                 = UINT16_MAX;
                     }
@@ -1678,7 +1744,7 @@ GVMMR0DECL(int) GVMMR0RegisterVCpu(PGVM pGVM, VMCPUID idCpu)
             }
             else
                 rc = VERR_ACCESS_DENIED;
-
+            // 释放全局锁
             gvmmR0CreateDestroyUnlock(pGVMM);
         }
         else
@@ -1697,46 +1763,47 @@ GVMMR0DECL(int) GVMMR0RegisterVCpu(PGVM pGVM, VMCPUID idCpu)
  * @param   pGVM        The global (ring-0) VM structure.
  * @param   idCpu       VCPU id to register the current thread as.
  */
+//GVMM模块注销虚拟CPU（vCPU）的核心函数
 GVMMR0DECL(int) GVMMR0DeregisterVCpu(PGVM pGVM, VMCPUID idCpu)
 {
-    AssertReturn(idCpu != 0, VERR_INVALID_FUNCTION);
+    AssertReturn(idCpu != 0, VERR_INVALID_FUNCTION);// 禁止注销idCpu=0（主EMT线程）
 
     /*
      * Validate the VM structure, state and handle.
      */
     PGVMM pGVMM;
-    int rc = gvmmR0ByGVMandEMT(pGVM, idCpu, &pGVMM);
+    int rc = gvmmR0ByGVMandEMT(pGVM, idCpu, &pGVMM); // 验证GVM有效性及当前线程是否绑定目标vCPU
     if (RT_SUCCESS(rc))
     {
         /*
          * Take the destruction lock and recheck the handle state to
          * prevent racing GVMMR0DestroyVM.
          */
-        gvmmR0CreateDestroyLock(pGVMM);
+        gvmmR0CreateDestroyLock(pGVMM); // 获取全局销毁锁
 
         uint32_t hSelf = pGVM->hSelf;
-        ASMCompilerBarrier();
-        if (   hSelf < RT_ELEMENTS(pGVMM->aHandles)
+        ASMCompilerBarrier(); // 防止指令重排
+        if (   hSelf < RT_ELEMENTS(pGVMM->aHandles)// 二次校验GVM句柄状态
             && pGVMM->aHandles[hSelf].pvObj != NULL
             && pGVMM->aHandles[hSelf].pGVM  == pGVM)
         {
             /*
              * Do per-EMT cleanups.
              */
-            VMMR0ThreadCtxHookDestroyForEmt(&pGVM->aCpus[idCpu]);
+            VMMR0ThreadCtxHookDestroyForEmt(&pGVM->aCpus[idCpu]);// 移除线程切换回调
 
             /*
              * Invalidate hEMT.  We don't use NIL here as that would allow
              * GVMMR0RegisterVCpu to be called again, and we don't want that.
              */
-            pGVM->aCpus[idCpu].hEMT            = GVMM_RTNATIVETHREAD_DESTROYED;
-            pGVM->aCpus[idCpu].hNativeThreadR0 = NIL_RTNATIVETHREAD;
-
+            pGVM->aCpus[idCpu].hEMT            = GVMM_RTNATIVETHREAD_DESTROYED;// 特殊标记（非NIL）
+            pGVM->aCpus[idCpu].hNativeThreadR0 = NIL_RTNATIVETHREAD; // 清除R0线程句柄
+            //清除哈希表中线程→vCPU的映射，确保后续线程查询返回无效状态
             uint32_t const idxHash = pGVM->aCpus[idCpu].gvmm.s.idxEmtHash;
             if (idxHash < RT_ELEMENTS(pGVM->gvmm.s.aEmtHash))
                 pGVM->gvmm.s.aEmtHash[idxHash].hNativeEmt = GVMM_RTNATIVETHREAD_DESTROYED;
         }
-
+        // 释放全局锁
         gvmmR0CreateDestroyUnlock(pGVMM);
     }
     return rc;
@@ -1753,26 +1820,40 @@ GVMMR0DECL(int) GVMMR0DeregisterVCpu(PGVM pGVM, VMCPUID idCpu)
  * @param   enmWorker       The worker thread this is supposed to be.
  * @param   hNativeSelfR3   The ring-3 native self of the caller.
  */
+//用于注册工作线程的核心函数 GVMMR0RegisterWorkerThread，负责将宿主线程绑定到虚拟机的特定工作线程槽位
+#if 0
+    struct GVM {
+        GVMMWORKERTHREADINFO aWorkerThreads[GVMMWORKERTHREAD_END];  // 工作线程数组
+        // 成员包括：
+        //   RTNATIVETHREAD hNativeThread;   // R0层线程句柄
+        //   RTNATIVETHREAD hNativeThreadR3; // R3层线程句柄
+    };
+    设计意图：通过枚举类型 GVMMWORKERTHREAD 区分不同功能的工作线程（如I/O、定时器等）。
+#endif
 GVMMR0DECL(int) GVMMR0RegisterWorkerThread(PGVM pGVM, GVMMWORKERTHREAD enmWorker, RTNATIVETHREAD hNativeSelfR3)
 {
     /*
      * Validate input.
      */
+    //enmWorker 必须在有效枚举范围内
     AssertReturn(enmWorker > GVMMWORKERTHREAD_INVALID && enmWorker < GVMMWORKERTHREAD_END, VERR_INVALID_PARAMETER);
+	//R3层线程句柄（hNativeSelfR3）和当前R0层线程（hNativeSelf）均不能为 NIL。
     AssertReturn(hNativeSelfR3 != NIL_RTNATIVETHREAD, VERR_INVALID_HANDLE);
     RTNATIVETHREAD const hNativeSelf = RTThreadNativeSelf();
     AssertReturn(hNativeSelf != NIL_RTNATIVETHREAD, VERR_INTERNAL_ERROR_3);
     PGVMM pGVMM;
+    //通过 gvmmR0ByGVM 验证 pGVM 结构合法性。
     int rc = gvmmR0ByGVM(pGVM, &pGVMM, false /*fTakeUsedLock*/);
     AssertRCReturn(rc, rc);
+    //仅允许在虚拟机非销毁状态（VMSTATE_DESTROYING）下注册。
     AssertReturn(pGVM->enmVMState < VMSTATE_DESTROYING, VERR_VM_INVALID_VM_STATE);
 
     /*
      * Grab the big lock and check the VM state again.
      */
     uint32_t const hSelf = pGVM->hSelf;
-    gvmmR0CreateDestroyLock(pGVMM); /** @todo per-VM lock? */
-    if (   hSelf < RT_ELEMENTS(pGVMM->aHandles)
+    gvmmR0CreateDestroyLock(pGVMM); /** @todo per-VM lock? */// 获取全局锁
+    if (   hSelf < RT_ELEMENTS(pGVMM->aHandles)// 检查GVM句柄有效性
         && pGVMM->aHandles[hSelf].pvObj != NULL
         && pGVMM->aHandles[hSelf].pGVM  == pGVM
         && pGVMM->aHandles[hSelf].ProcId == RTProcSelf())
@@ -1782,8 +1863,11 @@ GVMMR0DECL(int) GVMMR0RegisterWorkerThread(PGVM pGVM, GVMMWORKERTHREAD enmWorker
             /*
              * Check that the thread isn't an EMT or serving in some other worker capacity.
              */
+            //禁止跨角色绑定：
+            //当前线程不能是任何 vCPU 的 EMT 线程
             for (VMCPUID iCpu = 0; iCpu < pGVM->cCpus; iCpu++)
                 AssertBreakStmt(pGVM->aCpus[iCpu].hEMT != hNativeSelf, rc = VERR_INVALID_PARAMETER);
+            //当前线程不能已注册为其他类型的工作线程
             for (size_t idx = 0; idx < RT_ELEMENTS(pGVM->gvmm.s.aWorkerThreads); idx++)
                 AssertBreakStmt(idx == (size_t)enmWorker || pGVM->gvmm.s.aWorkerThreads[enmWorker].hNativeThread != hNativeSelf,
                                 rc = VERR_INVALID_PARAMETER);
@@ -1792,6 +1876,7 @@ GVMMR0DECL(int) GVMMR0RegisterWorkerThread(PGVM pGVM, GVMMWORKERTHREAD enmWorker
                 /*
                  * Do the registration.
                  */
+                //目标槽位的 R0/R3 线程句柄必须均为 NIL。
                 if (   pGVM->gvmm.s.aWorkerThreads[enmWorker].hNativeThread   == NIL_RTNATIVETHREAD
                     && pGVM->gvmm.s.aWorkerThreads[enmWorker].hNativeThreadR3 == NIL_RTNATIVETHREAD)
                 {
@@ -1799,6 +1884,8 @@ GVMMR0DECL(int) GVMMR0RegisterWorkerThread(PGVM pGVM, GVMMWORKERTHREAD enmWorker
                     pGVM->gvmm.s.aWorkerThreads[enmWorker].hNativeThreadR3 = hNativeSelfR3;
                     rc = VINF_SUCCESS;
                 }
+                //若当前线程已正确注册，返回 VERR_ALREADY_EXISTS。
+				//状态码优先级：虚拟机状态 > GVM 句柄有效性 > 线程冲突。
                 else if (   pGVM->gvmm.s.aWorkerThreads[enmWorker].hNativeThread   == hNativeSelf
                          && pGVM->gvmm.s.aWorkerThreads[enmWorker].hNativeThreadR3 == hNativeSelfR3)
                     rc = VERR_ALREADY_EXISTS;
@@ -1807,10 +1894,10 @@ GVMMR0DECL(int) GVMMR0RegisterWorkerThread(PGVM pGVM, GVMMWORKERTHREAD enmWorker
             }
         }
         else
-            rc = VERR_VM_INVALID_VM_STATE;
+            rc = VERR_VM_INVALID_VM_STATE;// 虚拟机状态异常
     }
     else
-        rc = VERR_INVALID_VM_HANDLE;
+        rc = VERR_INVALID_VM_HANDLE;// GVM句柄无效
     gvmmR0CreateDestroyUnlock(pGVMM);
     return rc;
 }
