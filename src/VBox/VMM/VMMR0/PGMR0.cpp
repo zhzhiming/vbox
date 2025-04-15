@@ -82,6 +82,15 @@
  * @param   pGVM    Pointer to the global VM structure.
  * @param   hMemObj Handle to the memory object backing pGVM.
  */
+/*
+  初始化虚拟机（VM）的 PGM（Page Manager）相关数据结构，包括：
+  RAM 范围（物理内存区域）
+  MMIO2 范围（内存映射 I/O 区域）
+  ROM 范围（只读内存区域）
+  物理内存处理器（Physical Handlers）
+  零页（Zero Page）和 MMIO 哑页（Dummy Page）的物理地址
+*/
+
 VMMR0_INT_DECL(int) PGMR0InitPerVMData(PGVM pGVM, RTR0MEMOBJ hMemObj)
 {
     AssertCompile(sizeof(pGVM->pgm.s) <= sizeof(pGVM->pgm.padding));
@@ -169,27 +178,38 @@ VMMR0_INT_DECL(int) PGMR0InitPerVMData(PGVM pGVM, RTR0MEMOBJ hMemObj)
  * @returns VBox status code.
  * @param   pGVM    Pointer to the global VM structure.
  */
+//初始化虚拟机（VM）内存管理
 VMMR0_INT_DECL(int) PGMR0InitVM(PGVM pGVM)
 {
     /*
      * Set up the ring-0 context for our access handlers.
      */
+    //物理内存访问处理器（Physical Access Handlers）：注册特定内存区域的访问回调函数
+    //处理器类型：写操作
     int rc = PGMR0HandlerPhysicalTypeSetUpContext(pGVM, PGMPHYSHANDLERKIND_WRITE, 0 /*fFlags*/,
-                                                  pgmPhysRomWriteHandler, pgmPhysRomWritePfHandler,
-                                                  "ROM write protection", pGVM->pgm.s.hRomPhysHandlerType);
+                                                  pgmPhysRomWriteHandler,  // 正常写操作回调,当 Guest 尝试写入 ROM 时触发，通常返回错误
+												  pgmPhysRomWritePfHandler,// 缺页异常回调,处理因 ROM 写操作引发的缺页异常（Page Fault）
+                                                  "ROM write protection", // 处理器描述
+												  pGVM->pgm.s.hRomPhysHandlerType); // 返回处理器类型句柄
     AssertLogRelRCReturn(rc, rc);
 
     /*
      * Register the physical access handler doing dirty MMIO2 tracing.
      */
-    rc = PGMR0HandlerPhysicalTypeSetUpContext(pGVM, PGMPHYSHANDLERKIND_WRITE, PGMPHYSHANDLER_F_KEEP_PGM_LOCK,
-                                              pgmPhysMmio2WriteHandler, pgmPhysMmio2WritePfHandler,
+    //MMIO2 脏页追踪（Dirty Page Tracing）：用于动态内存快照（如保存虚拟机状态）。
+    //应用场景：动态内存调整（Ballooning）、快照（Snapshot）功能。
+    rc = PGMR0HandlerPhysicalTypeSetUpContext(pGVM, PGMPHYSHANDLERKIND_WRITE, PGMPHYSHANDLER_F_KEEP_PGM_LOCK,// 标志：保持 PGM 锁
+                                              pgmPhysMmio2WriteHandler, //记录脏页状态（如设置 PGM_PAGE_STATE_DIRTY）。
+											  pgmPhysMmio2WritePfHandler,
                                               "MMIO2 dirty page tracing", pGVM->pgm.s.hMmio2DirtyPhysHandlerType);
     AssertLogRelRCReturn(rc, rc);
 
     /*
      * The page pool.
      */
+    //内存页池（Page Pool）：初始化虚拟机专用的内存池，提升内存分配效率。
+	//预分配一定数量的内存页（如 4KB/2MB 大页），减少运行时分配开销。
+    //维护空闲页列表，加速页分配/释放操作。
     return pgmR0PoolInitVM(pGVM);
 }
 

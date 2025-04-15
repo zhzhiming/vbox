@@ -189,19 +189,19 @@ static DECLCALLBACK(bool) pdmR0DrvHlp_NetShaperAllocateBandwidth(PPDMDRVINS pDrv
 extern DECLEXPORT(const PDMDRVHLPR0) g_pdmR0DrvHlp =
 {
     PDM_DRVHLPRC_VERSION,
-    pdmR0DrvHlp_AssertEMT,
-    pdmR0DrvHlp_AssertOther,
-    pdmR0DrvHlp_CritSectEnter,
-    pdmR0DrvHlp_CritSectEnterDebug,
-    pdmR0DrvHlp_CritSectTryEnter,
-    pdmR0DrvHlp_CritSectTryEnterDebug,
-    pdmR0DrvHlp_CritSectLeave,
-    pdmR0DrvHlp_CritSectIsOwner,
-    pdmR0DrvHlp_CritSectIsInitialized,
-    pdmR0DrvHlp_CritSectHasWaiters,
-    pdmR0DrvHlp_CritSectGetRecursion,
-    pdmR0DrvHlp_CritSectScheduleExitEvent,
-    pdmR0DrvHlp_NetShaperAllocateBandwidth,
+    pdmR0DrvHlp_AssertEMT, //检查当前是否在 EMT（Emulation Thread，模拟线程）上下文中执行
+    pdmR0DrvHlp_AssertOther,//检查当前是否在非 EMT 线程（如 I/O 线程）中执行
+    pdmR0DrvHlp_CritSectEnter, //进入临界区（阻塞式）
+    pdmR0DrvHlp_CritSectEnterDebug,//带调试信息的临界区进入
+    pdmR0DrvHlp_CritSectTryEnter,//尝试进入临界区（非阻塞
+    pdmR0DrvHlp_CritSectTryEnterDebug,//带调试信息的尝试进入临界区
+    pdmR0DrvHlp_CritSectLeave,//离开临界区
+    pdmR0DrvHlp_CritSectIsOwner,//检查当前线程是否是临界区的所有者
+    pdmR0DrvHlp_CritSectIsInitialized,//检查临界区是否已初始化
+    pdmR0DrvHlp_CritSectHasWaiters,//检查是否有其他线程在等待该临界区
+    pdmR0DrvHlp_CritSectGetRecursion,//获取临界区的递归计数
+    pdmR0DrvHlp_CritSectScheduleExitEvent,//安排临界区退出事件（用于异步通知）
+    pdmR0DrvHlp_NetShaperAllocateBandwidth,//分配网络带宽（用于流量整形）
     PDM_DRVHLPRC_VERSION
 };
 
@@ -215,6 +215,13 @@ extern DECLEXPORT(const PDMDRVHLPR0) g_pdmR0DrvHlp =
  * @returns See PFNPDMDRVREQHANDLERR0.
  * @param   pGVM    The global (ring-0) VM structure. (For validation.)
  * @param   pReq    Pointer to the request buffer.
+ */
+//PDMR0DriverCallReqHandler 是用于处理来自R3（用户模式）对R0驱动程序请求的处理器。
+/*
+ 假设我们有一个虚拟网络驱动程序（VirtioNet），它需要在 R0 处理来自 R3（用户模式）的请求，例如：
+    设置 MAC 地址
+    查询统计数据
+    控制接收/发送队列
  */
 VMMR0_INT_DECL(int) PDMR0DriverCallReqHandler(PGVM pGVM, PPDMDRIVERCALLREQHANDLERREQ pReq)
 {

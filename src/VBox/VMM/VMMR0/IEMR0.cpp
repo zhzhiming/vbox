@@ -39,8 +39,9 @@
 #include <VBox/log.h>
 #include <iprt/errcore.h>
 
-
-
+//主要负责 VMX（Intel 虚拟化技术）相关的 APIC-access 页面处理程序注册
+//Intel VMX 规范中，APIC-access 页面是虚拟机监控程序（VMM）用于模拟 APIC（高级可编程中断控制器） 的特殊内存区域。
+//当 Guest 访问该页面时，会触发 VM-exit 并由 IEM 模拟访问行为。
 VMMR0_INT_DECL(int) IEMR0InitVM(PGVM pGVM)
 {
     AssertCompile(sizeof(pGVM->iem.s) <= sizeof(pGVM->iem.padding));
