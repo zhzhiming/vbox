@@ -2350,6 +2350,8 @@ GVMMR0DECL(PGVMCPU) GVMMR0GetGVCpuByGVMandEMT(PGVM pGVM, RTNATIVETHREAD hEMT)
  * @returns ring-3 native thread handle or NIL_RTNATIVETHREAD.
  * @param   pGVM    The global (ring-0) VM structure.
  */
+//查找对应的 Ring-3 线程句柄，
+//用于 VirtualBox 的 线程上下文切换和 跨层级通信。
 GVMMR0DECL(RTNATIVETHREAD) GVMMR0GetRing3ThreadForSelf(PGVM pGVM)
 {
     /*
@@ -2438,6 +2440,13 @@ GVMMR0DECL(RTHCPHYS) GVMMR0ConvertGVMPtr2HCPhys(PGVM pGVM, void *pv)
  * @param   pGVMM       Pointer to the GVMM instance data.
  * @param   u64Now      The current time.
  */
+//批量唤醒满足条件的休眠 VCPU，优化调度延迟和 CPU 利用率。
+/*
+触发场景：
+  定时器中断到期
+  I/O 事件完成
+  强制唤醒信号（如虚拟机终止）
+*/
 static unsigned gvmmR0SchedDoWakeUps(PGVMM pGVMM, uint64_t u64Now)
 {
     /*
@@ -2453,20 +2462,25 @@ static unsigned gvmmR0SchedDoWakeUps(PGVMM pGVMM, uint64_t u64Now)
      * A cheap optimization to stop wasting so much time here on big setups.
      */
     const uint64_t  uNsEarlyWakeUp2 = u64Now + pGVMM->nsEarlyWakeUp2;
+    //当前无休眠 VCPU 时跳过
     if (   pGVMM->cHaltedEMTs == 0
+        //时间窗口检查‌：避免频繁唤醒
         || uNsEarlyWakeUp2 > pGVMM->uNsNextEmtWakeup)
         return 0;
 
     /*
      * Only one thread doing this at a time.
      */
+    //通过原子操作 (ASMAtomicCmpXchgBool) 实现轻量级同步，减少锁争用。
     if (!ASMAtomicCmpXchgBool(&pGVMM->fDoingEarlyWakeUps, true, false))
-        return 0;
+        return 0;// 已有线程在处理唤醒，避免重复工作
 
     /*
      * The first pass will wake up VMs which have actually expired
      * and look for VMs that should be woken up in the 2nd and 3rd passes.
      */
+    //立即唤醒（已到期 VCPU）
+    //uNsEarlyWakeUp1 = 当前时间 + nsEarlyWakeUp1（短周期，如 1ms）
     const uint64_t  uNsEarlyWakeUp1 = u64Now + pGVMM->nsEarlyWakeUp1;
     uint64_t        u64Min          = UINT64_MAX;
     unsigned        cWoken          = 0;
@@ -2484,13 +2498,14 @@ static unsigned gvmmR0SchedDoWakeUps(PGVMM pGVMM, uint64_t u64Now)
             for (VMCPUID idCpu = 0; idCpu < pCurGVM->cCpus; idCpu++)
             {
                 PGVMCPU     pCurGVCpu = &pCurGVM->aCpus[idCpu];
-                uint64_t    u64       = ASMAtomicUoReadU64(&pCurGVCpu->gvmm.s.u64HaltExpire);
+                uint64_t    u64       = ASMAtomicUoReadU64(&pCurGVCpu->gvmm.s.u64HaltExpire);//u64HaltExpire：VCPU 休眠到期时间戳（0 表示非休眠状态）。
                 if (u64)
                 {
                     if (u64 <= u64Now)
                     {
                         if (ASMAtomicXchgU64(&pCurGVCpu->gvmm.s.u64HaltExpire, 0))
                         {
+                            //信号量唤醒
                             int rc = RTSemEventMultiSignal(pCurGVCpu->gvmm.s.HaltEventMulti);
                             AssertRC(rc);
                             cWoken++;
@@ -2498,13 +2513,14 @@ static unsigned gvmmR0SchedDoWakeUps(PGVMM pGVMM, uint64_t u64Now)
                     }
                     else
                     {
+                        //分级处理：根据到期时间分批次唤醒，平衡延迟与吞吐量。
                         cHalted++;
                         if (u64 <= uNsEarlyWakeUp1)
-                            cTodo2nd++;
+                            cTodo2nd++;// 近期到期（阶段2）
                         else if (u64 <= uNsEarlyWakeUp2)
-                            cTodo3rd++;
+                            cTodo3rd++; // 中期到期（阶段3）
                         else if (u64 < u64Min)
-                            u64 = u64Min;
+                            u64 = u64Min; // 更新下次唤醒时间
                     }
                 }
             }
@@ -2512,6 +2528,7 @@ static unsigned gvmmR0SchedDoWakeUps(PGVMM pGVMM, uint64_t u64Now)
         AssertLogRelBreak(cGuard++ < RT_ELEMENTS(pGVMM->aHandles));
     }
 
+    //通过分阶段唤醒（Phase 1/2/3）平衡 低延迟和 CPU 利用率，避免集中唤醒导致的性能抖动
     if (cTodo2nd)
     {
         for (unsigned i = pGVMM->iUsedHead, cGuard = 0;
@@ -2575,7 +2592,7 @@ static unsigned gvmmR0SchedDoWakeUps(PGVMM pGVMM, uint64_t u64Now)
     /*
      * Set the minimum value.
      */
-    pGVMM->uNsNextEmtWakeup = u64Min;
+    pGVMM->uNsNextEmtWakeup = u64Min;// 记录下次需唤醒的最早时间
 
     ASMAtomicWriteBool(&pGVMM->fDoingEarlyWakeUps, false);
     return cWoken;
@@ -3080,6 +3097,8 @@ GVMMR0DECL(int) GVMMR0SchedWakeUpAndPokeCpusReq(PGVM pGVM, PGVMMSCHEDWAKEUPANDPO
  *                          This is for when we're spinning in the halt loop.
  * @thread  EMT(idCpu).
  */
+//当 fYield = false 时，触发主动唤醒（WakeUp）机制，统计唤醒次数并更新调度状态
+//当 fYield = true 时，当前未实现（返回 VERR_NOT_IMPLEMENTED），预留为主动让出CPU的逻辑扩展
 GVMMR0DECL(int) GVMMR0SchedPoll(PGVM pGVM, VMCPUID idCpu, bool fYield)
 {
     /*
@@ -3127,6 +3146,9 @@ GVMMR0DECL(int) GVMMR0SchedPoll(PGVM pGVM, VMCPUID idCpu, bool fYield)
  * @param   pvUser      Pointer to the per cpu structure.
  * @param   iTick       The current tick.
  */
+// 周期性抢占定时器（PPT）的回调函数，动态调整定时器触发频率以优化虚拟机调度
+// 自适应频率：根据历史需求自动升频/降频，平衡调度精度与 CPU 开销。
+//负载平滑：通过滑动窗口统计历史频率需求，避免瞬时波动导致频繁调整。
 static DECLCALLBACK(void) gvmmR0SchedPeriodicPreemptionTimerCallback(PRTTIMER pTimer, void *pvUser, uint64_t iTick)
 {
     PGVMMHOSTCPU pCpu = (PGVMMHOSTCPU)pvUser;
@@ -3143,24 +3165,25 @@ static DECLCALLBACK(void) gvmmR0SchedPeriodicPreemptionTimerCallback(PRTTIMER pT
      */
     RTSpinlockAcquire(pCpu->Ppt.hSpinlock);
 
-    if (++pCpu->Ppt.iTickHistorization >= pCpu->Ppt.cTicksHistoriziationInterval)
+    if (++pCpu->Ppt.iTickHistorization >= pCpu->Ppt.cTicksHistoriziationInterval)//每 cTicksHistoriziationInterval 次回调记录一次,避免高频写入。
     {
         /*
          * Historicize the max frequency.
          */
         uint32_t iHzHistory = ++pCpu->Ppt.iHzHistory % RT_ELEMENTS(pCpu->Ppt.aHzHistory);
-        pCpu->Ppt.aHzHistory[iHzHistory] = pCpu->Ppt.uDesiredHz;
-        pCpu->Ppt.iTickHistorization = 0;
-        pCpu->Ppt.uDesiredHz         = 0;
+        pCpu->Ppt.aHzHistory[iHzHistory] = pCpu->Ppt.uDesiredHz; // 记录当前需求频率,aHzHistory 数组存储最近 N 次频率需求（默认 N=8）。
+        pCpu->Ppt.iTickHistorization = 0; // 重置计数
+        pCpu->Ppt.uDesiredHz         = 0;  // 清空当前需求
 
         /*
          * Check if the current timer frequency.
          */
         uint32_t uHistMaxHz = 0;
+        //以历史峰值频率作为调整依据，确保满足最严苛调度需求。
         for (uint32_t i = 0; i < RT_ELEMENTS(pCpu->Ppt.aHzHistory); i++)
             if (pCpu->Ppt.aHzHistory[i] > uHistMaxHz)
-                uHistMaxHz = pCpu->Ppt.aHzHistory[i];
-        if (uHistMaxHz == pCpu->Ppt.uTimerHz)
+                uHistMaxHz = pCpu->Ppt.aHzHistory[i]; // 取历史最大需求频率
+        if (uHistMaxHz == pCpu->Ppt.uTimerHz) // 频率无需调整，直接释放锁
             RTSpinlockRelease(pCpu->Ppt.hSpinlock);
         else if (uHistMaxHz)
         {
@@ -3170,7 +3193,7 @@ static DECLCALLBACK(void) gvmmR0SchedPeriodicPreemptionTimerCallback(PRTTIMER pT
             pCpu->Ppt.cChanges++;
             pCpu->Ppt.iTickHistorization    = 0;
             pCpu->Ppt.uTimerHz              = uHistMaxHz;
-            uint32_t const cNsInterval      = RT_NS_1SEC / uHistMaxHz;
+            uint32_t const cNsInterval      = RT_NS_1SEC / uHistMaxHz; // 计算新周期
             pCpu->Ppt.cNsInterval           = cNsInterval;
             if (cNsInterval < GVMMHOSTCPU_PPT_HIST_INTERVAL_NS)
                 pCpu->Ppt.cTicksHistoriziationInterval = (  GVMMHOSTCPU_PPT_HIST_INTERVAL_NS
@@ -3181,7 +3204,7 @@ static DECLCALLBACK(void) gvmmR0SchedPeriodicPreemptionTimerCallback(PRTTIMER pT
             RTSpinlockRelease(pCpu->Ppt.hSpinlock);
 
             /*SUPR0Printf("Cpu%u: change to %u Hz / %u ns\n", pCpu->idxCpuSet, uHistMaxHz, cNsInterval);*/
-            RTTimerChangeInterval(pTimer, cNsInterval);
+            RTTimerChangeInterval(pTimer, cNsInterval); // 动态调整硬件定时器
         }
         else
         {
@@ -3213,12 +3236,17 @@ static DECLCALLBACK(void) gvmmR0SchedPeriodicPreemptionTimerCallback(PRTTIMER pT
  * @param   idHostCpu   The current host CPU id.
  * @param   uHz         The desired frequency.
  */
+//动态调整 周期性抢占定时器（Periodic Preemption Timer, PPT）的频率（uHz），
+//用于实现虚拟机 CPU 时间片的精确调度。
+//关键场景：
+  //虚拟机监控程序（VMM）需要强制切换 VCPU 执行（如时间片到期）。
+  //响应动态负载变化（如 CPU 密集型任务需要更高调度精度
 GVMMR0DECL(void) GVMMR0SchedUpdatePeriodicPreemptionTimer(PGVM pGVM, RTCPUID idHostCpu, uint32_t uHz)
 {
     NOREF(pGVM);
 #ifdef GVMM_SCHED_WITH_PPT
-    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
-    Assert(RTTimerCanDoHighResolution());
+    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD)); // 确保处于非抢占状态
+    Assert(RTTimerCanDoHighResolution());            // 确认高精度定时器可用,PPT 需要纳秒级时间精度
 
     /*
      * Resolve the per CPU data.
@@ -3239,29 +3267,32 @@ GVMMR0DECL(void) GVMMR0SchedUpdatePeriodicPreemptionTimer(PGVM pGVM, RTCPUID idH
      * We have to be a little bit careful since we might be race the timer
      * callback here.
      */
-    if (uHz > 16384)
+    if (uHz > 16384)// 限制最大频率
         uHz = 16384;  /** @todo add a query method for this! */
-    if (RT_UNLIKELY(   uHz > ASMAtomicReadU32(&pCpu->Ppt.uDesiredHz)
+    if (RT_UNLIKELY(   uHz > ASMAtomicReadU32(&pCpu->Ppt.uDesiredHz)//无锁获取当前配置，避免竞态
                     && uHz >= pCpu->Ppt.uMinHz
                     && !pCpu->Ppt.fStarting /* solaris paranoia */))
     {
-        RTSpinlockAcquire(pCpu->Ppt.hSpinlock);
+        RTSpinlockAcquire(pCpu->Ppt.hSpinlock);// 加锁保护共享数据
 
         pCpu->Ppt.uDesiredHz = uHz;
         uint32_t cNsInterval = 0;
         if (!pCpu->Ppt.fStarted)
         {
-            pCpu->Ppt.cStarts++;
+            pCpu->Ppt.cStarts++;              // 统计启动次数
             pCpu->Ppt.fStarted              = true;
             pCpu->Ppt.fStarting             = true;
             pCpu->Ppt.iTickHistorization    = 0;
             pCpu->Ppt.uTimerHz              = uHz;
-            pCpu->Ppt.cNsInterval           = cNsInterval = RT_NS_1SEC / uHz;
+            pCpu->Ppt.cNsInterval           = cNsInterval = RT_NS_1SEC / uHz; // 计算时间间隔（纳秒）
+            // 配置历史记录间隔（用于负载分析）
+            // 高频场景：多个 tick 聚合为一个历史记录点
             if (cNsInterval < GVMMHOSTCPU_PPT_HIST_INTERVAL_NS)
                 pCpu->Ppt.cTicksHistoriziationInterval = (  GVMMHOSTCPU_PPT_HIST_INTERVAL_NS
                                                           + GVMMHOSTCPU_PPT_HIST_INTERVAL_NS / 2 - 1)
                                                        / cNsInterval;
             else
+                // 低频场景：每个 tick 独立记录
                 pCpu->Ppt.cTicksHistoriziationInterval = 1;
         }
 
@@ -3269,8 +3300,8 @@ GVMMR0DECL(void) GVMMR0SchedUpdatePeriodicPreemptionTimer(PGVM pGVM, RTCPUID idH
 
         if (cNsInterval)
         {
-            RTTimerChangeInterval(pCpu->Ppt.pTimer, cNsInterval);
-            int rc = RTTimerStart(pCpu->Ppt.pTimer, cNsInterval);
+            RTTimerChangeInterval(pCpu->Ppt.pTimer, cNsInterval);// 修改定时器周期
+            int rc = RTTimerStart(pCpu->Ppt.pTimer, cNsInterval);// 启动/重启定时器
             AssertRC(rc);
 
             RTSpinlockAcquire(pCpu->Ppt.hSpinlock);
@@ -3492,26 +3523,26 @@ GVMMR0DECL(int) GVMMR0ResetStatistics(PCGVMMSTATS pStats, PSUPDRVSESSION pSessio
      * Take the lock and get the VM statistics.
      */
     PGVMM pGVMM;
-    if (pGVM)
+    if (pGVM)// 若指定了目标VM
     {
         int rc = gvmmR0ByGVM(pGVM, &pGVMM, true /*fTakeUsedLock*/);
         if (RT_FAILURE(rc))
             return rc;
 #       define MAYBE_RESET_FIELD(field) \
             do { if (pStats->SchedVM. field ) { pGVM->gvmm.s.StatsSched. field = 0; } } while (0)
-        MAYBE_RESET_FIELD(cHaltCalls);
-        MAYBE_RESET_FIELD(cHaltBlocking);
-        MAYBE_RESET_FIELD(cHaltTimeouts);
-        MAYBE_RESET_FIELD(cHaltNotBlocking);
-        MAYBE_RESET_FIELD(cHaltWakeUps);
-        MAYBE_RESET_FIELD(cWakeUpCalls);
-        MAYBE_RESET_FIELD(cWakeUpNotHalted);
-        MAYBE_RESET_FIELD(cWakeUpWakeUps);
-        MAYBE_RESET_FIELD(cPokeCalls);
-        MAYBE_RESET_FIELD(cPokeNotBusy);
-        MAYBE_RESET_FIELD(cPollCalls);
-        MAYBE_RESET_FIELD(cPollHalts);
-        MAYBE_RESET_FIELD(cPollWakeUps);
+        MAYBE_RESET_FIELD(cHaltCalls);       //虚拟机发起暂停请求的总次数
+        MAYBE_RESET_FIELD(cHaltBlocking);    //线程因等待事件而进入阻塞式暂停的次数
+        MAYBE_RESET_FIELD(cHaltTimeouts);    //暂停操作因超时而终止的次数
+        MAYBE_RESET_FIELD(cHaltNotBlocking); //非阻塞式暂停（快速路径）的调用次数
+        MAYBE_RESET_FIELD(cHaltWakeUps);     //虚拟机唤醒调用次数
+        MAYBE_RESET_FIELD(cWakeUpCalls);     //主动唤醒虚拟机线程的调用次数
+        MAYBE_RESET_FIELD(cWakeUpNotHalted); //唤醒请求发出时目标线程未处于暂停状态的次数（无效唤醒）
+        MAYBE_RESET_FIELD(cWakeUpWakeUps);   //实际触发线程唤醒的有效操作次数
+        MAYBE_RESET_FIELD(cPokeCalls);       //通过轻量级信号（Poke）通知线程的次数
+        MAYBE_RESET_FIELD(cPokeNotBusy);     //Poke操作目标线程处于空闲状态的次数
+        MAYBE_RESET_FIELD(cPollCalls);       //轮询检查线程状态的请求次数
+        MAYBE_RESET_FIELD(cPollHalts);       //轮询导致线程进入暂停状态的次数
+        MAYBE_RESET_FIELD(cPollWakeUps);     //轮询过程中触发线程唤醒的次数
 #       undef MAYBE_RESET_FIELD
     }
     else
@@ -3527,6 +3558,7 @@ GVMMR0DECL(int) GVMMR0ResetStatistics(PCGVMMSTATS pStats, PSUPDRVSESSION pSessio
      */
     if (!ASMMemIsZero(&pStats->SchedSum, sizeof(pStats->SchedSum)))
     {
+        //通过链表（iUsedHead 和 iNext）遍历所有VM。
         for (unsigned i = pGVMM->iUsedHead;
              i != NIL_GVM_HANDLE && i < RT_ELEMENTS(pGVMM->aHandles);
              i = pGVMM->aHandles[i].iNext)

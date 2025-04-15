@@ -1862,17 +1862,29 @@ static int pgmShwGetNestedEPTPDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPhysNested, PEPTP
  * @param   enmShwPagingMode    The shadow paging mode (PGMMODE_EPT for VT-x,
  *                              host paging mode for AMD-V).
  */
+//用于在宿主机层面同步客户机页表状态。当客户机页表发生修改时，需要同步更新宿主机维护的嵌套页表。
 int pgmShwSyncNestedPageLocked(PVMCPUCC pVCpu, RTGCPHYS GCPhys, uint32_t cPages, PGMMODE enmShwPagingMode)
 {
     PGM_LOCK_ASSERT_OWNER(pVCpu->CTX_SUFF(pVM));
 
 /** @todo r=bird: Gotta love this nested paging hacking we're still carrying with us... (Split PGM_TYPE_NESTED.) */
     int rc;
+    //根据不同的客户机分页模式（32位/PAE/64位/EPT）选择处理方式
     switch (enmShwPagingMode)
     {
         case PGMMODE_32_BIT:
         {
+            //X86PDE PdeDummy = { X86_PDE_P | X86_PDE_US | X86_PDE_RW | X86_PDE_A };
+#if 0
+            创建虚拟页目录项(PDE)，设置基础标志：
+            P (Present): 页面存在
+            US (User/Supervisor): 用户态可访问
+            RW (Read/Write): 可写权限
+            A (Accessed): 访问标记
+#endif
             X86PDE PdeDummy = { X86_PDE_P | X86_PDE_US | X86_PDE_RW | X86_PDE_A };
+            //通过宏展开调用不同模式的具体同步函数
+            //示例：PGM_BTH_NAME_PAE_PROT(SyncPage) 会展开为 pgmBthPAEProtSyncPage
             rc = PGM_BTH_NAME_32BIT_PROT(SyncPage)(pVCpu, PdeDummy, GCPhys, cPages, ~0U /*uErr*/);
             break;
         }
@@ -1895,6 +1907,7 @@ int pgmShwSyncNestedPageLocked(PVMCPUCC pVCpu, RTGCPHYS GCPhys, uint32_t cPages,
 
         case PGMMODE_EPT:
         {
+            //代码中EPT模式仍使用传统页表标志（X86_PDE_*），但实际上Intel EPT使用完全独立的标志位（如EPT_PRESENT等）
             X86PDEPAE PdeDummy = { X86_PDE_P | X86_PDE_US | X86_PDE_RW | X86_PDE_A };
             rc = PGM_BTH_NAME_EPT_PROT(SyncPage)(pVCpu, PdeDummy, GCPhys, cPages, ~0U /*uErr*/);
             break;

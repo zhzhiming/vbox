@@ -567,7 +567,39 @@ RTDECL(uintptr_t) RTThreadGetNativeHandle(RTTHREAD hThread)
 }
 RT_EXPORT_SYMBOL(RTThreadGetNativeHandle);
 
+/*
+定时器回调函数（触发 poke）
+static void tmTimerCallback(PTMTIMER pTimer, void *pvUser)
+{
+    PVMCPU pVCpu = (PVMCPU)pvUser;
+    ASMAtomicWriteBool(&pVCpu->fPoke, true); // 设置标志
+    STAM_COUNTER_INC(&pVCpu->tm.s.StatPokeTimer);
+}
+效果：VCPU 主循环在下一次轮询时检测到 fPoke，退出 HALT 并处理定时器中断。
 
+// VirtualBox 源码片段（src/VBox/VMM/VMMR3/EM.cpp）
+void EMR3ExecuteVM(PVM pVM, PVMCPU pVCpu)
+{
+    for (;;) {
+        // ...（其他逻辑，如检查中断、异常等）
+
+        // 🔄 主循环轮询检查 `poke` 标志
+        if (ASMAtomicUoReadBool(&pVCpu->fPoke)) {
+            ASMAtomicWriteBool(&pVCpu->fPoke, false); // 清除标志
+            STAM_COUNTER_INC(&pVCpu->EM.s.CTX_SUFF(pStats)->StatPokeReceived);
+            break; // 退出 HALT 状态，继续执行
+        }
+
+        // 🛑 进入低功耗暂停状态（等待事件）
+        if (pVM->fGlobalForcedActions & VMCPU_FORCEDACTIONS_POKE) {
+            break; // 强制唤醒（如关机信号）
+        }
+        RTThreadSleep(1); // 短暂休眠（降低CPU占用）
+    }
+}
+*/
+
+//轻量级通知VCPU线程
 RTDECL(int) RTThreadPoke(RTTHREAD hThread)
 {
     AssertReturn(hThread != RTThreadSelf(), VERR_INVALID_PARAMETER);

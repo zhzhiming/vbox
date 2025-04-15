@@ -1373,6 +1373,8 @@ VMMR0DECL(VBOXSTRICTRC) PGMR0NestedTrap0eHandlerNestedPaging(PGVMCPU pGVCpu, PGM
  * @param   uErr                The error code, UINT32_MAX if not available
  *                              (VT-x).
  */
+//处理嵌套分页（Nested Paging）模式下页面错误（#PF, Page Fault）
+//特别针对MMIO（内存映射I/O）场景进行了优化
 VMMR0DECL(VBOXSTRICTRC) PGMR0Trap0eHandlerNPMisconfig(PGVM pGVM, PGVMCPU pGVCpu, PGMMODE enmShwPagingMode,
                                                       PCPUMCTX pCtx, RTGCPHYS GCPhysFault, uint32_t uErr)
 {
@@ -1385,12 +1387,14 @@ VMMR0DECL(VBOXSTRICTRC) PGMR0Trap0eHandlerNPMisconfig(PGVM pGVM, PGVMCPU pGVCpu,
      */
     PGM_LOCK_VOID(pGVM);
     PPGMPHYSHANDLER pHandler;
+    //通过故障地址GCPhysFault查找注册的物理内存处理程序（MMIO设备）。
+    //若找到处理程序（RT_SUCCESS(rc)），进入优化路径；否则同步嵌套页表（pgmShwSyncNestedPageLocked）。
     rc = pgmHandlerPhysicalLookup(pGVM, GCPhysFault, &pHandler);
     if (RT_SUCCESS(rc))
     {
         PCPGMPHYSHANDLERTYPEINT pHandlerType = PGMPHYSHANDLER_GET_TYPE_NO_NULL(pGVM, pHandler);
         if (RT_LIKELY(   pHandlerType->enmKind != PGMPHYSHANDLERKIND_WRITE
-                      && !pHandlerType->fNotInHm /*paranoia*/ ))
+                      && !pHandlerType->fNotInHm /*paranoia*/ ))//排除只写（WRITE）处理程序和非硬件加速（fNotInHm）场景。
         {
             /*
              * If the handle has aliases page or pages that have been temporarily
@@ -1399,7 +1403,8 @@ VMMR0DECL(VBOXSTRICTRC) PGMR0Trap0eHandlerNPMisconfig(PGVM pGVM, PGVMCPU pGVCpu,
              */
             PPGMPAGE pPage;
             if (   (   pHandler->cAliasedPages
-                    || pHandler->cTmpOffPages)
+                    || pHandler->cTmpOffPages)//若处理程序关联的页面存在别名（Aliased）或临时禁用（TmpOff），需重新同步嵌套页表
+                //通过pgmPhysGetPage获取页面状态，若为DISABLED则触发同步。
                 && (   (pPage = pgmPhysGetPage(pGVM, GCPhysFault)) == NULL
                     || PGM_PAGE_GET_HNDL_PHYS_STATE(pPage) == PGM_PAGE_HNDL_PHYS_STATE_DISABLED)
                )
@@ -1418,10 +1423,12 @@ VMMR0DECL(VBOXSTRICTRC) PGMR0Trap0eHandlerNPMisconfig(PGVM pGVM, PGVMCPU pGVCpu,
                     STAM_PROFILE_START(&pHandler->Stat, h);
                     PGM_UNLOCK(pGVM);
 
+                    //最终调用设备注册的页面错误处理函数（如MMIO设备的模拟逻辑）。
                     Log6(("PGMR0Trap0eHandlerNPMisconfig: calling %p(,%#x,,%RGp,%p)\n", pHandlerType->pfnPfHandler, uErr, GCPhysFault, uUser));
                     rc = pHandlerType->pfnPfHandler(pGVM, pGVCpu, uErr == UINT32_MAX ? RTGCPTR_MAX : uErr, pCtx,
                                                     GCPhysFault, GCPhysFault, uUser);
 
+                    //记录处理耗时。
                     STAM_PROFILE_STOP(&pHandler->Stat, h); /* no locking needed, entry is unlikely reused before we get here. */
                 }
                 else
