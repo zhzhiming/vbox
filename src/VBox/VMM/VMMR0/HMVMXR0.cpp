@@ -4632,12 +4632,21 @@ VMMR0DECL(int) VMXR0GetExitAuxInfo(PVMCPUCC pVCpu, PVMXEXITAUX pVmxExitAux, uint
  *
  * @remarks No-long-jmp zone!!!
  */
+/*
+ *关键设计总结
+    原子性保障：通过禁用抢占、断言检查确保操作不可分割。
+    状态一致性：强制同步Guest/Host状态，避免残留（如FPU、调试寄存器）。
+    性能优化：延迟恢复MSR、条件执行VMCS清理减少开销。
+    安全隔离：清除VMCS及嵌套状态，防止跨CPU或跨VM干扰。
+    可维护性：通过注释提示代码依赖（如VMXR0CallRing3Callback需同步修改）。
+*/
 static int hmR0VmxLeave(PVMCPUCC pVCpu, bool fImportState)
 {
-    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
-    Assert(!VMMRZCallRing3IsEnabled(pVCpu));
+    //防止在敏感操作中被抢占或切换到用户态，确保原子性。
+    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));// 确保线程抢占已禁用
+    Assert(!VMMRZCallRing3IsEnabled(pVCpu));// 禁止Ring3调用
 
-    RTCPUID const idCpu = RTMpCpuId();
+    RTCPUID const idCpu = RTMpCpuId();//获取当前物理CPU ID
     Log4Func(("HostCpuId=%u\n", idCpu));
 
     /*
@@ -4646,16 +4655,19 @@ static int hmR0VmxLeave(PVMCPUCC pVCpu, bool fImportState)
      */
 
     /* Save the guest state if necessary. */
+    //获取活动VMCS
     PVMXVMCSINFO pVmcsInfo = hmGetVmxActiveVmcsInfo(pVCpu);
     if (fImportState)
     {
+        //将VMCS中的Guest寄存器/状态同步到pVCpu->cpum.GstCtx
         int rc = vmxHCImportGuestStateEx(pVCpu, pVmcsInfo, HMVMX_CPUMCTX_EXTRN_ALL);
         AssertRCReturn(rc, rc);
     }
 
     /* Restore host FPU state if necessary. We will resync on next R0 reentry. */
+    //保存Guest FPU状态，恢复Host FPU。
     CPUMR0FpuStateMaybeSaveGuestAndRestoreHost(pVCpu);
-    Assert(!CPUMIsGuestFPUStateActive(pVCpu));
+    Assert(!CPUMIsGuestFPUStateActive(pVCpu));// 确认Guest FPU未激活
 
     /* Restore host debug registers if necessary. We will resync on next R0 reentry. */
 #ifdef VMX_WITH_MAYBE_ALWAYS_INTERCEPT_MOV_DRX
@@ -4665,8 +4677,10 @@ static int hmR0VmxLeave(PVMCPUCC pVCpu, bool fImportState)
 #else
     Assert(   (pVmcsInfo->u32ProcCtls & VMX_PROC_CTLS_MOV_DR_EXIT)
            ||  pVCpu->hmr0.s.vmx.fSwitchedToNstGstVmcs
-           || !CPUMIsHyperDebugStateActive(pVCpu));
+           || !CPUMIsHyperDebugStateActive(pVCpu)); // Guest调试状态已清除
 #endif
+    //保存Guest调试寄存器（如DR0-DR7），恢复Host值。
+	//安全：防止Guest通过调试寄存器干扰Host。
     CPUMR0DebugStateMaybeSaveGuestAndRestoreHost(pVCpu, true /* save DR6 */);
     Assert(!CPUMIsGuestDebugStateActive(pVCpu));
     Assert(!CPUMIsHyperDebugStateActive(pVCpu));
@@ -4675,20 +4689,24 @@ static int hmR0VmxLeave(PVMCPUCC pVCpu, bool fImportState)
     if (pVCpu->hmr0.s.vmx.fRestoreHostFlags > VMX_RESTORE_HOST_REQUIRED)
     {
         Log4Func(("Restoring Host State: fRestoreHostFlags=%#RX32 HostCpuId=%u\n", pVCpu->hmr0.s.vmx.fRestoreHostFlags, idCpu));
+        //场景：某些Host寄存器（如CR0/CR4）在VMX模式下可能被修改，需手动还原。
         VMXRestoreHostState(pVCpu->hmr0.s.vmx.fRestoreHostFlags, &pVCpu->hmr0.s.vmx.RestoreHost);
     }
-    pVCpu->hmr0.s.vmx.fRestoreHostFlags = 0;
+    pVCpu->hmr0.s.vmx.fRestoreHostFlags = 0;//CR4.VMXE位需关闭以退出VMX模式。
 
     /* Restore the lazy host MSRs as we're leaving VT-x context. */
+    //延迟加载（Lazy）‌：优化性能，仅在必要时处理MSR。
     if (pVCpu->hmr0.s.vmx.fLazyMsrs & VMX_LAZY_MSRS_LOADED_GUEST)
     {
         /* We shouldn't restore the host MSRs without saving the guest MSRs first. */
         if (!fImportState)
         {
+            // 确保导入Guest MSR后再恢复Host MSR
+			//关键MSR：如KERNEL_GS_BASE（x86-64系统调用相关）。
             int rc = vmxHCImportGuestStateEx(pVCpu, pVmcsInfo, CPUMCTX_EXTRN_KERNEL_GS_BASE | CPUMCTX_EXTRN_SYSCALL_MSRS);
             AssertRCReturn(rc, rc);
         }
-        hmR0VmxLazyRestoreHostMsrs(pVCpu);
+        hmR0VmxLazyRestoreHostMsrs(pVCpu);// 恢复Host MSR
         Assert(!pVCpu->hmr0.s.vmx.fLazyMsrs);
     }
     else
@@ -4708,6 +4726,7 @@ static int hmR0VmxLeave(PVMCPUCC pVCpu, bool fImportState)
     STAM_PROFILE_ADV_SET_STOPPED(&pVCpu->hm.s.StatExitVmentry);
     STAM_COUNTER_INC(&pVCpu->hm.s.StatSwitchLongJmpToR3);
 
+    //原子操作：从“硬件虚拟化中”切换到“执行中”，防止状态竞争。
     VMCPU_CMPXCHG_STATE(pVCpu, VMCPUSTATE_STARTED_HM, VMCPUSTATE_STARTED_EXEC);
 
     /** @todo This partially defeats the purpose of having preemption hooks.
@@ -4715,6 +4734,7 @@ static int hmR0VmxLeave(PVMCPUCC pVCpu, bool fImportState)
      *  lasts until the EMT is about to be destroyed not everytime while leaving HM
      *  context.
      */
+    // 执行VMCLEAR指令
     int rc = hmR0VmxClearVmcs(pVmcsInfo);
     AssertRCReturn(rc, rc);
 
@@ -4755,22 +4775,24 @@ static int hmR0VmxLeave(PVMCPUCC pVCpu, bool fImportState)
  *
  * @remarks No-long-jmp zone!!!
  */
+//这是一个静态函数，用于安全地退出VT-x虚拟化会话
+//在x86架构中，从Ring0（内核态）到Ring3（用户态）的切换需要长跳转（Far Jump）
 static int hmR0VmxLeaveSession(PVMCPUCC pVCpu)
 {
     HM_DISABLE_PREEMPT(pVCpu);
-    HMVMX_ASSERT_CPU_SAFE(pVCpu);
-    Assert(!VMMRZCallRing3IsEnabled(pVCpu));
-    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
+    HMVMX_ASSERT_CPU_SAFE(pVCpu);//验证当前CPU与虚拟CPU（vCPU）绑定，避免跨CPU操作导致状态不一致。
+    Assert(!VMMRZCallRing3IsEnabled(pVCpu));//确保未启用Ring3调用，防止在敏感路径中触发用户态代码。
+    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));//确认线程抢占已禁用，避免并发问题
 
     /* When thread-context hooks are used, we can avoid doing the leave again if we had been preempted before
        and done this from the VMXR0ThreadCtxCallback(). */
-    if (!pVCpu->hmr0.s.fLeaveDone)
+    if (!pVCpu->hmr0.s.fLeaveDone)//通过fLeaveDone标志避免重复退出操作
     {
-        int rc2 = hmR0VmxLeave(pVCpu, true /* fImportState */);
+        int rc2 = hmR0VmxLeave(pVCpu, true /* fImportState */);//调用hmR0VmxLeave()执行实际退出操作,并导入Guest状态
         AssertRCReturnStmt(rc2, HM_RESTORE_PREEMPT(), rc2);
         pVCpu->hmr0.s.fLeaveDone = true;
     }
-    Assert(!pVCpu->cpum.GstCtx.fExtrn);
+    Assert(!pVCpu->cpum.GstCtx.fExtrn);//确保Guest状态已完全导出，无残留外部状态。
 
     /*
      * !!! IMPORTANT !!!
@@ -4781,11 +4803,12 @@ static int hmR0VmxLeaveSession(PVMCPUCC pVCpu)
     /** @todo Deregistering here means we need to VMCLEAR always
      *        (longjmp/exit-to-r3) in VT-x which is not efficient, eliminate need
      *        for calling VMMR0ThreadCtxHookDisable here! */
-    VMMR0ThreadCtxHookDisable(pVCpu);
+	//当前设计导致每次退出必须执行VMCLEAR指令（清理VMCS），可能带来性能损耗，未来需优化以减少不必要的调用。
+    VMMR0ThreadCtxHookDisable(pVCpu);//：注销线程上下文切换钩子，避免后续无效回调。
 
     /* Leave HM context. This takes care of local init (term) and deregistering the longjmp-to-ring-3 callback. */
-    int rc = HMR0LeaveCpu(pVCpu);
-    HM_RESTORE_PREEMPT();
+    int rc = HMR0LeaveCpu(pVCpu);//执行CPU级别的清理工作，包括取消长跳转至Ring3的回调注册。
+    HM_RESTORE_PREEMPT();//恢复线程抢占，结束关键区。
     return rc;
 }
 

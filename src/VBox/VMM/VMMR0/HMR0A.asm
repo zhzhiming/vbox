@@ -85,11 +85,12 @@
 
 ;; @def PUSH_CALLEE_PRESERVED_REGISTERS
 ; Macro for pushing all GPRs we must preserve for the caller.
+;用于在x86-64架构下保存被调用者需要保护的寄存器
 %macro PUSH_CALLEE_PRESERVED_REGISTERS 0
-        push    r15
+        push    r15 ;push指令依次保存r15、r14、r13、r12、rbx寄存器
         SEH64_PUSH_GREG r15
-        %assign cbFrame         cbFrame + 8
-        %assign frm_saved_r15   -cbFrame
+        %assign cbFrame         cbFrame + 8 ;更新栈帧大小计数器cbFrame（增加8字节
+        %assign frm_saved_r15   -cbFrame    ;为每个保存的寄存器在栈帧中分配一个偏移量（frm_saved_*）
 
         push    r14
         SEH64_PUSH_GREG r14
@@ -111,7 +112,8 @@
         %assign cbFrame         cbFrame + 8
         %assign frm_saved_rbx   -cbFrame
 
- %ifdef ASM_CALL64_MSC
+		;这可能是为了兼容Microsoft x64调用约定
+ %ifdef ASM_CALL64_MSC ;在ASM_CALL64_MSC定义时，还会额外保存rsi和rdi寄存器
         push    rsi
         SEH64_PUSH_GREG rsi
         %assign cbFrame         cbFrame + 8
@@ -163,10 +165,14 @@
 ; @param 1  Full width register name.
 ; @param 2  16-bit register name for \a 1.
 ; @cobbers rax, rdx, rcx
+;在x86-64架构下保存相关的段寄存器状态。
 %macro PUSH_RELEVANT_SEGMENT_REGISTERS 2
+;控制是否跳过段寄存器保存逻辑，可能是为了调试或性能优化
  %ifndef VBOX_SKIP_RESTORE_SEG
   %error untested code. probably does not work any more!
+  ;若未定义 HM_64_BIT_USE_NULL_SEL，则保存 es 和 ds 寄存器
   %ifndef HM_64_BIT_USE_NULL_SEL
+  ;里通过 %1 和 %2 动态处理寄存器操作，可能是为了兼容不同调用约定或平台
         mov     %2, es
         push    %1
         mov     %2, ds
@@ -175,22 +181,24 @@
 
         ; Special case for FS; Windows and Linux either don't use it or restore it when leaving kernel mode,
         ; Solaris OTOH doesn't and we must save it.
-        mov     ecx, MSR_K8_FS_BASE
-        rdmsr
-        push    rdx
-        push    rax
+		;FS 寄存器在部分操作系统（如 Solaris）中需要显式保存，而 Windows/Linux 通常在内核退出时自动恢复
+        mov     ecx, MSR_K8_FS_BASE; 读取 FS 基地址的 MSR
+        rdmsr                      ; 将结果存入 edx:eax
+        push    rdx; 保存高32位
+        push    rax; 保存低32位
   %ifndef HM_64_BIT_USE_NULL_SEL
-        push    fs
+        push    fs; 保存段选择子
   %endif
 
    ; Special case for GS; OSes typically use swapgs to reset the hidden base register for GS on entry into the kernel.
    ; The same happens on exit.
-        mov     ecx, MSR_K8_GS_BASE
+   ;GS 寄存器通常通过 swapgs 指令在内核/用户模式切换时自动处理，但仍需保存其基地址
+        mov     ecx, MSR_K8_GS_BASE;读取 GS 基地址的 MSR
         rdmsr
-        push    rdx
-        push    rax
+        push    rdx              ; 保存高32位
+        push    rax              ; 保存低32位
   %ifndef HM_64_BIT_USE_NULL_SEL
-        push    gs
+        push    gs               ; 保存段选择子
   %endif
  %endif   ; !VBOX_SKIP_RESTORE_SEG
 %endmacro ; PUSH_RELEVANT_SEGMENT_REGISTERS
@@ -258,12 +266,13 @@ BEGINCODE
 ; @param   pRestoreHost   msc: rcx  gcc: rdi    Pointer to the RestoreHost struct.
 ; @param   fHaveFsGsBase  msc: dl   gcc: sil    Whether we can use rdfsbase or not.
 ;
+;用于在虚拟化环境（如VirtualBox的VMX模式）中保存宿主机的段寄存器状态。
 ALIGNCODE(64)
 BEGINPROC hmR0VmxExportHostSegmentRegsAsmHlp
 %ifdef ASM_CALL64_MSC
- %define pRestoreHost rcx
-%elifdef ASM_CALL64_GCC
- %define pRestoreHost rdi
+ %define pRestoreHost rcx  ; MSVC调用约定：第一个参数通过RCX传递
+%elifdef ASM_CALL64_GCC   
+ %define pRestoreHost rdi  ;System V AMD64调用约定：第一个参数通过RDI传递
 %else
  %error Unknown calling convension.
 %endif
@@ -271,64 +280,71 @@ BEGINPROC hmR0VmxExportHostSegmentRegsAsmHlp
 
         ; Start with the FS and GS base so we can trash DL/SIL.
 %ifdef ASM_CALL64_MSC
-        or      dl, dl
+        or      dl, dl; 检查DL是否为0
 %else
-        or      sil, sil
+        or      sil, sil ; 检查SIL是否为0
 %endif
-        jz      .use_rdmsr_for_fs_and_gs_base
-        rdfsbase rax
+        jz      .use_rdmsr_for_fs_and_gs_base; 若为0则跳转到RDMSR路径
+        ; 使用RDFSBASE/RDGSBASE指令（更高效的现代CPU路径）
+        ;避免慢速的rdmsr操作，但需检查CPU是否支持新指令（通过DL/SIL标志）
+        ;优先使用rdfsbase/rdgsbase指令（Intel Ivy Bridge+引入）直接读取FS/GS基地址
+        rdfsbase rax 
         mov     [pRestoreHost + VMXRESTOREHOST.uHostFSBase], rax
         rdgsbase rax
         mov     [pRestoreHost + VMXRESTOREHOST.uHostGSBase], rax
 .done_fs_and_gs_base:
 
         ; TR, GDTR and IDTR
-        str     [pRestoreHost + VMXRESTOREHOST.uHostSelTR]
-        sgdt    [pRestoreHost + VMXRESTOREHOST.HostGdtr]
-        sidt    [pRestoreHost + VMXRESTOREHOST.HostIdtr]
+        str     [pRestoreHost + VMXRESTOREHOST.uHostSelTR] ; 保存TR选择子
+        sgdt    [pRestoreHost + VMXRESTOREHOST.HostGdtr]; 保存GDTR（48位
+        sidt    [pRestoreHost + VMXRESTOREHOST.HostIdtr] ; 保存IDTR（48位）
 
         ; Segment registers.
+        ; 保存各段寄存器的选择子部分
+        ;选择子保存：仅保存16位段选择子（不包含基址/权限等隐藏部分），因为基址已通过FS/GS基址单独保存
         xor     eax, eax
         mov     eax, cs
-        mov     [pRestoreHost + VMXRESTOREHOST.uHostSelCS], ax
+        mov     [pRestoreHost + VMXRESTOREHOST.uHostSelCS], ax  ; CS
 
         mov     eax, ss
-        mov     [pRestoreHost + VMXRESTOREHOST.uHostSelSS], ax
+        mov     [pRestoreHost + VMXRESTOREHOST.uHostSelSS], ax ; SS
 
         mov     eax, gs
-        mov     [pRestoreHost + VMXRESTOREHOST.uHostSelGS], ax
+        mov     [pRestoreHost + VMXRESTOREHOST.uHostSelGS], ax ; GS
 
         mov     eax, fs
-        mov     [pRestoreHost + VMXRESTOREHOST.uHostSelFS], ax
+        mov     [pRestoreHost + VMXRESTOREHOST.uHostSelFS], ax  ; FS
 
         mov     eax, es
-        mov     [pRestoreHost + VMXRESTOREHOST.uHostSelES], ax
+        mov     [pRestoreHost + VMXRESTOREHOST.uHostSelES], ax; ES
 
         mov     eax, ds
-        mov     [pRestoreHost + VMXRESTOREHOST.uHostSelDS], ax
+        mov     [pRestoreHost + VMXRESTOREHOST.uHostSelDS], ax; DS
 
         ret
 
 ALIGNCODE(16)
 .use_rdmsr_for_fs_and_gs_base:
+;RDMSR回退路径（旧CPU兼容）
+;MSR_K8_FS_BASE（0xC0000100）和MSR_K8_GS_BASE（0xC0000101）是AMD定义的MSR
 %ifdef ASM_CALL64_MSC
-        mov     r8, pRestoreHost
+        mov     r8, pRestoreHost ;备份指针（避免破坏RCX）
 %endif
-
-        mov     ecx, MSR_K8_FS_BASE
-        rdmsr
+        ; 通过RDMSR读取FS基址（兼容旧CPU）
+        mov     ecx, MSR_K8_FS_BASE ; MSR编号：0xC0000100
+        rdmsr; 返回EDX:EAX = 64位基址
         shl     rdx, 32
-        or      rdx, rax
+        or      rdx, rax ; 合并为完整64位值
         mov     [r8 + VMXRESTOREHOST.uHostFSBase], rdx
 
-        mov     ecx, MSR_K8_GS_BASE
+        mov     ecx, MSR_K8_GS_BASE ; MSR编号：0xC0000101
         rdmsr
         shl     rdx, 32
         or      rdx, rax
         mov     [r8 + VMXRESTOREHOST.uHostGSBase], rdx
 
 %ifdef ASM_CALL64_MSC
-        mov     pRestoreHost, r8
+        mov     pRestoreHost, r8 ; 恢复指针
 %endif
         jmp     .done_fs_and_gs_base
 %undef pRestoreHost
@@ -343,33 +359,39 @@ ENDPROC hmR0VmxExportHostSegmentRegsAsmHlp
 ; @param   pRestoreHost     msc: rdx  gcc: rsi   Pointer to the RestoreHost struct.
 ;
 ALIGNCODE(64)
+;这段代码是 VMXRestoreHostState 函数的实现，用于在虚拟化环境（如 Intel VT-x）中恢复宿主机的状态。
 BEGINPROC VMXRestoreHostState
 %ifndef ASM_CALL64_GCC
+; 保存 RDI/RSI（GCC 调用约定），使用 R10/R11 暂存
+;MSVC：参数通过 rcx（pRestoreHost）和 rdx（fRestoreHost）传递
+;GCC：参数直接通过 rdi 和 rsi 传递（System V AMD64 调用约定）
         ; Use GCC's input registers since we'll be needing both rcx and rdx further
         ; down with the wrmsr instruction.  Use the R10 and R11 register for saving
         ; RDI and RSI since MSC preserve the two latter registers.
         mov     r10, rdi
         mov     r11, rsi
-        mov     rdi, rcx
-        mov     rsi, rdx
+        mov     rdi, rcx; MSC 调用约定：第一个参数通过 RCX 传递
+        mov     rsi, rdx; 第二个参数通过 RDX 传递
 %endif
         SEH64_END_PROLOGUE
 
 .restore_gdtr:
-        test    edi, VMX_RESTORE_HOST_GDTR
+        ;GDTR 结构：HostGdtr 包含 16 位限制和 64 位基地址
+        ;通过 fRestoreHost（edi）的标志位控制是否恢复 GDTR
+        test    edi, VMX_RESTORE_HOST_GDTR #检查是否需要恢复 GDTR
         jz      .restore_idtr
-        lgdt    [rsi + VMXRESTOREHOST.HostGdtr]
+        lgdt    [rsi + VMXRESTOREHOST.HostGdtr]; 加载 GDTR
 
 .restore_idtr:
         test    edi, VMX_RESTORE_HOST_IDTR
         jz      .restore_ds
-        lidt    [rsi + VMXRESTOREHOST.HostIdtr]
+        lidt    [rsi + VMXRESTOREHOST.HostIdtr] ; 加载 IDTR
 
 .restore_ds:
         test    edi, VMX_RESTORE_HOST_SEL_DS
         jz      .restore_es
         mov     ax, [rsi + VMXRESTOREHOST.uHostSelDS]
-        mov     ds, eax
+        mov     ds, eax; 恢复 DS 选择子, 直接写入段寄存器（仅低 16 位有效）‌7
 
 .restore_es:
         test    edi, VMX_RESTORE_HOST_SEL_ES
@@ -381,16 +403,23 @@ BEGINPROC VMXRestoreHostState
         test    edi, VMX_RESTORE_HOST_SEL_TR
         jz      .restore_fs
         ; When restoring the TR, we must first clear the busy flag or we'll end up faulting.
+        ;清除 TSS 描述符的 Busy 标志（避免 #GP 异常）
         mov     dx, [rsi + VMXRESTOREHOST.uHostSelTR]
         mov     ax, dx
+        ; 获取描述符偏移
         and     eax, X86_SEL_MASK_OFF_RPL                       ; mask away TI and RPL bits leaving only the descriptor offset
+        ;GDT 只读处理：若 GDT 只读（VMX_RESTORE_HOST_GDT_READ_ONLY），
+        ;需临时禁用 CR0.WP 位或切换到可写副本
         test    edi, VMX_RESTORE_HOST_GDT_READ_ONLY | VMX_RESTORE_HOST_GDT_NEED_WRITABLE
         jnz     .gdt_readonly_or_need_writable
+        ; 定位到 GDT 中的描述符
         add     rax, qword [rsi + VMXRESTOREHOST.HostGdtr + 2]  ; xAX <- descriptor offset + GDTR.pGdt.
+        ; 清除 Busy 位（bit 9
         and     dword [rax + 4], ~RT_BIT(9)                     ; clear the busy flag in TSS desc (bits 0-7=base, bit 9=busy bit)
-        ltr     dx
+        ltr     dx; 加载 TR
 
 .restore_fs:
+        ; 使用 WRFSBASE/WRGSBASE 指令（优化路径）
         ;
         ; When restoring the selector values for FS and GS, we'll temporarily trash
         ; the base address (at least the high 32-bit bits, but quite possibly the
@@ -403,7 +432,7 @@ BEGINPROC VMXRestoreHostState
         test    edi, VMX_RESTORE_HOST_SEL_FS | VMX_RESTORE_HOST_SEL_GS
         jz      .restore_success
         pushfq
-        cli                                   ; (see above)
+        cli                                   ; (see above) ; 禁用中断（避免基地址恢复期间的竞争条件）
 
         test    edi, VMX_RESTORE_HOST_CAN_USE_WRFSBASE_AND_WRGSBASE
         jz      .restore_fs_using_wrmsr
@@ -411,10 +440,10 @@ BEGINPROC VMXRestoreHostState
 .restore_fs_using_wrfsbase:
         test    edi, VMX_RESTORE_HOST_SEL_FS
         jz      .restore_gs_using_wrgsbase
-        mov     rax, qword [rsi + VMXRESTOREHOST.uHostFSBase]
-        mov     cx, word [rsi + VMXRESTOREHOST.uHostSelFS]
-        mov     fs, ecx
-        wrfsbase rax
+        mov     rax, qword [rsi + VMXRESTOREHOST.uHostFSBase] ; 64 位基地址
+        mov     cx, word [rsi + VMXRESTOREHOST.uHostSelFS]; 段选择子
+        mov     fs, ecx ; 先恢复选择子
+        wrfsbase rax   ; 再恢复基地址（现代 CPU 指令）
 
 .restore_gs_using_wrgsbase:
         test    edi, VMX_RESTORE_HOST_SEL_GS
@@ -428,10 +457,10 @@ BEGINPROC VMXRestoreHostState
         popfq
 
 .restore_success:
-        mov     eax, VINF_SUCCESS
+        mov     eax, VINF_SUCCESS ; 返回成功状态码
 %ifndef ASM_CALL64_GCC
         ; Restore RDI and RSI on MSC.
-        mov     rdi, r10
+        mov     rdi, r10; 恢复原始 RDI/RSI（MSVC 调用约定
         mov     rsi, r11
 %endif
         ret
@@ -461,15 +490,16 @@ ALIGNCODE(8)
         jmp     .restore_fs
 
 ALIGNCODE(8)
+;回退到 WRMSR（旧 CPU 兼容）
 .restore_fs_using_wrmsr:
         test    edi, VMX_RESTORE_HOST_SEL_FS
         jz      .restore_gs_using_wrmsr
-        mov     eax, dword [rsi + VMXRESTOREHOST.uHostFSBase]         ; uHostFSBase - Lo
-        mov     edx, dword [rsi + VMXRESTOREHOST.uHostFSBase + 4h]    ; uHostFSBase - Hi
+        mov     eax, dword [rsi + VMXRESTOREHOST.uHostFSBase]         ; uHostFSBase - Lo ; 基地址低 32 位
+        mov     edx, dword [rsi + VMXRESTOREHOST.uHostFSBase + 4h]    ; uHostFSBase - Hi; 高 32 位
         mov     cx, word [rsi + VMXRESTOREHOST.uHostSelFS]
         mov     fs, ecx
-        mov     ecx, MSR_K8_FS_BASE
-        wrmsr
+        mov     ecx, MSR_K8_FS_BASE ; MSR 编号 0xC0000100
+        wrmsr ; 写入 FS 基地址
 
 .restore_gs_using_wrmsr:
         test    edi, VMX_RESTORE_HOST_SEL_GS
