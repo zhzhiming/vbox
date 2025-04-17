@@ -1217,13 +1217,14 @@ VMMR0_INT_DECL(int) PGMR0PhysSetupIoMmu(PGVM pGVM)
  *
  * @returns VBox status code (appropriate for trap handling and GC return).
  * @param   pGVM                The global (ring-0) VM structure.
- * @param   pGVCpu              The global (ring-0) CPU structure of the calling
+ * @param   pGVCpu              The global (ring-0) CPU structure of the calling 当前虚拟CPU（vCPU） 的状态。
  *                              EMT.
  * @param   enmShwPagingMode    Paging mode for the nested page tables.
- * @param   uErr                The trap error code.
- * @param   pCtx                Pointer to the register context for the CPU.
- * @param   GCPhysFault         The fault address.
+ * @param   uErr                The trap error code.（包含 X86_TRAP_PF_* 标志位，如 US、RW、P 等）。
+ * @param   pCtx                Pointer to the register context for the CPU.CPU 上下文（如 RIP、CR3 等寄存器值）。
+ * @param   GCPhysFault         The fault address.触发异常的客户机物理地址。
  */
+//当 Guest OS（客户机） 访问内存触发 #PF 异常 时，该函数会被调用，负责解析错误原因并尝试修复。
 VMMR0DECL(int) PGMR0Trap0eHandlerNestedPaging(PGVM pGVM, PGVMCPU pGVCpu, PGMMODE enmShwPagingMode, RTGCUINT uErr,
                                               PCPUMCTX pCtx, RTGCPHYS GCPhysFault)
 {
@@ -1292,18 +1293,19 @@ VMMR0DECL(int) PGMR0Trap0eHandlerNestedPaging(PGVM pGVM, PGVMCPU pGVCpu, PGMMODE
     switch (enmShwPagingMode)
     {
         case PGMMODE_32_BIT:
-            rc = PGM_BTH_NAME_32BIT_PROT(Trap0eHandler)(pGVCpu, uErr, pCtx, GCPhysFault, &fLockTaken);
+            rc = PGM_BTH_NAME_32BIT_PROT(Trap0eHandler)(pGVCpu, uErr, pCtx, GCPhysFault, &fLockTaken);// 32-bit 分页模式
             break;
         case PGMMODE_PAE:
         case PGMMODE_PAE_NX:
-            rc = PGM_BTH_NAME_PAE_PROT(Trap0eHandler)(pGVCpu, uErr, pCtx, GCPhysFault, &fLockTaken);
+            rc = PGM_BTH_NAME_PAE_PROT(Trap0eHandler)(pGVCpu, uErr, pCtx, GCPhysFault, &fLockTaken); // PAE 分页模式
             break;
         case PGMMODE_AMD64:
         case PGMMODE_AMD64_NX:
-            rc = PGM_BTH_NAME_AMD64_PROT(Trap0eHandler)(pGVCpu, uErr, pCtx, GCPhysFault, &fLockTaken);
+            rc = PGM_BTH_NAME_AMD64_PROT(Trap0eHandler)(pGVCpu, uErr, pCtx, GCPhysFault, &fLockTaken);// AMD64 分页模式
             break;
         case PGMMODE_EPT:
-            rc = PGM_BTH_NAME_EPT_PROT(Trap0eHandler)(pGVCpu, uErr, pCtx, GCPhysFault, &fLockTaken);
+            //what connection? PGM_BTH_DECL(int, NestedTrap0eHandler)(PVMCPUCC pVCpu, RTGCUINT uErr, PCPUMCTX pCtx, RTGCPHYS GCPhysNestedFault,
+            rc = PGM_BTH_NAME_EPT_PROT(Trap0eHandler)(pGVCpu, uErr, pCtx, GCPhysFault, &fLockTaken); // Intel EPT 模式 PGMR0NestedTrap0eHandlerNestedPaging
             break;
         default:
             AssertFailed();
@@ -1358,6 +1360,9 @@ VMMR0DECL(int) PGMR0Trap0eHandlerNestedPaging(PGVM pGVM, PGVMCPU pGVCpu, PGMMODE
  *                              fault.
  * @param   pWalk               Where to store the SLAT walk result.
  */
+#if 0
+VirtualBox 7.0.6版本中曾存在该函数处理的嵌套页错误缺陷（如GCPhysNestedFault=0x7ffba8af），已在7.1.x版本修复
+#endif
 VMMR0DECL(VBOXSTRICTRC) PGMR0NestedTrap0eHandlerNestedPaging(PGVMCPU pGVCpu, PGMMODE enmShwPagingMode, RTGCUINT uErr,
                                                              PCPUMCTX pCtx, RTGCPHYS GCPhysNestedFault,
                                                              bool fIsLinearAddrValid, RTGCPTR GCPtrNestedFault, PPGMPTWALK pWalk)

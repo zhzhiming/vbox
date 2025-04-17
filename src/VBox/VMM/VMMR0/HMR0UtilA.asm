@@ -44,11 +44,17 @@ BEGINCODE
 ; @param   idxField   x86: [ebp + 08h]  msc: rcx  gcc: rdi   VMCS index.
 ; @param   u64Data    x86: [ebp + 0ch]  msc: rdx  gcc: rsi   VM field value.
 ;
+;向VMCS（Virtual Machine Control Structure）写入64位数据
+;vmwrite指令用于将数据（源操作数）写入VMCS的指定字段（目标操作数）
+;架构        参数传递方式                            关键代码段
+;x64 (GCC)	寄存器传参（rdi=字段索引，rsi=数据）	and edi, 0ffffffffh  vmwrite rdi, rsi
+;x64 (其他)	寄存器传参（rcx=字段索引，rdx=数据）	and ecx, 0ffffffffh  vmwrite rcx, rdx
+;x86	     栈传参（[esp+4]=字段索引）	           vmwrite ecx, [edx]（低32位）  vmwrite ecx, [edx + 4]（高32位）
 ALIGNCODE(16)
 BEGINPROC VMXWriteVmcs64
 %ifdef RT_ARCH_AMD64
  %ifdef ASM_CALL64_GCC
-    and         edi, 0ffffffffh
+    and         edi, 0ffffffffh ;确保32位索引值的高32位清零（x64架构）
     xor         rax, rax
     vmwrite     rdi, rsi
  %else
@@ -56,7 +62,7 @@ BEGINPROC VMXWriteVmcs64
     xor         rax, rax
     vmwrite     rcx, rdx
  %endif
-%else  ; RT_ARCH_X86
+%else  ; RT_ARCH_X86            ;：x86模式下分两次写入低/高32位，通过inc ecx递增字段索引
     mov         ecx, [esp + 4]          ; idxField
     lea         edx, [esp + 8]          ; &u64Data
     vmwrite     ecx, [edx]              ; low dword
@@ -67,6 +73,8 @@ BEGINPROC VMXWriteVmcs64
     vmwrite     ecx, [edx + 4]          ; high dword
 .done:
 %endif ; RT_ARCH_X86
+    ;通过检查CF（进位标志）和ZF（零标志）判断操作是否成功，
+    ;jnc和jnz分别检测CF和ZF，若CF=1表示VMCS指针无效，ZF=1表示字段无效
     jnc         .valid_vmcs
     mov         eax, VERR_VMX_INVALID_VMCS_PTR
     ret
@@ -91,7 +99,7 @@ BEGINPROC VMXReadVmcs64
 %ifdef RT_ARCH_AMD64
  %ifdef ASM_CALL64_GCC
     and         edi, 0ffffffffh
-    xor         rax, rax
+    xor         rax, rax   ;xor rax/eax, rax/eax用于清除返回值寄存器
     vmread      [rsi], rdi
  %else
     and         ecx, 0ffffffffh
@@ -104,7 +112,7 @@ BEGINPROC VMXReadVmcs64
     vmread      [edx], ecx              ; low dword
     jz          .done
     jc          .done
-    inc         ecx
+    inc         ecx                     ;x86模式下通过inc ecx递增字段索引，分两次读取64位数据
     xor         eax, eax
     vmread      [edx + 4], ecx          ; high dword
 .done:
@@ -128,16 +136,18 @@ ENDPROC VMXReadVmcs64
 ; @param   pu32Data        Where to store VM field value.
 ;
 ;DECLASM(int) VMXReadVmcs32(uint32_t idxField, uint32_t *pu32Data);
+;vmread指令从VMCS的指定字段（目标操作数）读取数据到目标地址（源操作数）
 ALIGNCODE(16)
 BEGINPROC VMXReadVmcs32
 %ifdef RT_ARCH_AMD64
+ ;GCC: ：edi（字段索引），rsi（数据存储地址）
  %ifdef ASM_CALL64_GCC
-    and     edi, 0ffffffffh
+    and     edi, 0ffffffffh ;and edi, 0ffffffffh确保索引为32位，vmread r10, rdi读取数据并存储到[rsi]
     xor     rax, rax
     vmread  r10, rdi
     mov     [rsi], r10d
  %else
-    and     ecx, 0ffffffffh
+    and     ecx, 0ffffffffh ;ecx（字段索引），rdx（数据存储地址）
     xor     rax, rax
     vmread  r10, rcx
     mov     [rdx], r10d
@@ -205,18 +215,19 @@ ENDPROC VMXWriteVmcs32
 ; @param   HCPhysVMXOn      Physical address of VMXON structure.
 ;
 ;DECLASM(int) VMXEnable(RTHCPHYS HCPhysVMXOn);
+;vmxon指令用于激活VMX操作模式，需要传入VMXON区域的物理地址作为参数
 BEGINPROC VMXEnable
 %ifdef RT_ARCH_AMD64
     xor     rax, rax
  %ifdef ASM_CALL64_GCC
-    push    rdi
+    push    rdi ;（rdi=VMXON区域地址）
  %else
-    push    rcx
+    push    rcx ;（rcx=VMXON区域地址）
  %endif
     vmxon   [rsp]
 %else  ; RT_ARCH_X86
     xor     eax, eax
-    vmxon   [esp + 4]
+    vmxon   [esp + 4]    ;（[esp+4]=VMXON区域地址）
 %endif ; RT_ARCH_X86
     jnc     .good
     mov     eax, VERR_VMX_INVALID_VMXON_PTR
@@ -342,13 +353,14 @@ ENDPROC VMXGetCurrentVmcs
 ; @param   pDescriptor  msc:edx  gcc:esi  x86:[esp+08]  Descriptor pointer.
 ;
 ;DECLASM(int) VMXR0InvEPT(VMXTLBFLUSHEPT enmTlbFlush, uint64_t *pDescriptor);
+;INVEPT指令用于使EPT缓存失效，需传入EPT指针和操作类型（单上下文或全局刷新
 BEGINPROC VMXR0InvEPT
 %ifdef RT_ARCH_AMD64
  %ifdef ASM_CALL64_GCC
     and         edi, 0ffffffffh
     xor         rax, rax
 ;    invept      rdi, qword [rsi]
-    DB          0x66, 0x0F, 0x38, 0x80, 0x3E
+    DB          0x66, 0x0F, 0x38, 0x80, 0x3E ;手动编码 31.3 VMX INSTRUCTIONS 0x3E:指定操作数类型，如[ESI]内存寻址
  %else
     and         ecx, 0ffffffffh
     xor         rax, rax
@@ -380,6 +392,7 @@ ENDPROC VMXR0InvEPT
 ; @param   pDescriptor  msc:edx  gcc:esi  x86:[esp+08]  Descriptor pointer
 ;
 ;DECLASM(int) VMXR0InvVPID(VMXTLBFLUSHVPID enmTlbFlush, uint64_t *pDescriptor);
+;用于刷新虚拟处理器标识符（VPID）相关的TLB条目
 BEGINPROC VMXR0InvVPID
 %ifdef RT_ARCH_AMD64
  %ifdef ASM_CALL64_GCC
@@ -419,6 +432,10 @@ ENDPROC VMXR0InvVPID
 ; @param   uASID    msc:rdx  gcc:rsi  x86:[esp+0C]  Tagged TLB id
 ;
 ;DECLASM(void) SVMR0InvlpgA(RTGCPTR pPageGC, uint32_t uASID);
+;是用于 AMD SVM（Secure Virtual Machine）架构的 TLB
+;（Translation Lookaside Buffer）管理指令封装，其核心功能为通过 
+;invlpga 指令刷新指定虚拟地址及 ASID（Address Space Identifier）
+;关联的 TLB 条目，确保虚拟化环境中内存隔离性
 BEGINPROC SVMR0InvlpgA
 %ifdef RT_ARCH_AMD64
  %ifdef ASM_CALL64_GCC
@@ -432,7 +449,7 @@ BEGINPROC SVMR0InvlpgA
     mov     eax, [esp + 4]
     mov     ecx, [esp + 0Ch]
 %endif
-    invlpga [xAX], ecx
+    invlpga [xAX], ecx  ;invlpga [address], ASID，其中： address：需刷新的虚拟地址（由 rax 提供）。 ASID：地址空间标识符（由 ecx 提供）
     ret
 ENDPROC SVMR0InvlpgA
 

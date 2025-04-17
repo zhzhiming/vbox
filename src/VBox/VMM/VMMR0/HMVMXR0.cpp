@@ -53,6 +53,11 @@
 #include "VMXInternal.h"
 #include "dtrace/VBoxVMM.h"
 
+/*
+    1. 实现VMX根模式（Root Mode）与非根模式（Non-Root Mode）的切换，管理虚拟机的运行状态
+    2. 处理VMExit事件（如I/O操作、外部中断等），将控制权交还VMM进行模拟或调度
+    3. 配置和维护VMCS（Virtual Machine Control Structure），存储虚拟化上下文信息（如寄存器状态、退出原因）
+*/
 
 /*********************************************************************************************************************************
 *   Defined Constants And Macros                                                                                                 *
@@ -4798,11 +4803,22 @@ static int hmR0VmxLeaveSession(PVMCPUCC pVCpu)
  * @param   rcExit  The reason for exiting to ring-3. Can be
  *                  VINF_VMM_UNKNOWN_RING3_CALL.
  */
+//在 VMX 非根模式（Non-Root Mode）下发生 VM-Exit后，需要 返回 Ring-3（宿主机用户态）时的处理逻辑。
+//核心目标是 安全退出 VMX 模式，并确保 客户机状态正确同步。
+/*
+    处理 VM-Exit 错误（如 VERR_VMX_INVALID_VMCS_PTR）。
+    转换未处理的 HM 事件为 TRPM 陷阱（供后续 Ring-3 处理）。
+    清理 VMCS 控制字段（如中断窗口、NMI 窗口）。
+    保存客户机状态并恢复宿主机状态（hmR0VmxLeaveSession）。
+    同步客户机 CPU 状态（如 MSR、段寄存器、TLB 等）。
+    更新退出原因（pVCpu->hm.s.rcLastExitToR3）。
+*/
 static int hmR0VmxExitToRing3(PVMCPUCC pVCpu, VBOXSTRICTRC rcExit)
 {
     HMVMX_ASSERT_PREEMPT_SAFE(pVCpu);
 
     PVMXVMCSINFO pVmcsInfo = hmGetVmxActiveVmcsInfo(pVCpu);
+    //如果 VM-Exit 是由于 VMCS 指针无效触发的，记录当前 VMCS 物理地址、版本号和 CPU ID，便于调试。
     if (RT_UNLIKELY(rcExit == VERR_VMX_INVALID_VMCS_PTR))
     {
         VMXGetCurrentVmcs(&pVCpu->hm.s.vmx.LastError.HCPhysCurrentVmcs);
@@ -4812,8 +4828,8 @@ static int hmR0VmxExitToRing3(PVMCPUCC pVCpu, VBOXSTRICTRC rcExit)
     }
 
     /* Please, no longjumps here (any logging shouldn't flush jump back to ring-3). NO LOGGING BEFORE THIS POINT! */
-    VMMRZCallRing3Disable(pVCpu);
-    Log4Func(("rcExit=%d\n", VBOXSTRICTRC_VAL(rcExit)));
+    VMMRZCallRing3Disable(pVCpu);// 防止跳转到 Ring-3
+    Log4Func(("rcExit=%d\n", VBOXSTRICTRC_VAL(rcExit))); // 记录退出原因
 
     /*
      * Convert any pending HM events back to TRPM due to premature exits to ring-3.
@@ -4824,10 +4840,12 @@ static int hmR0VmxExitToRing3(PVMCPUCC pVCpu, VBOXSTRICTRC rcExit)
      */
     if (pVCpu->hm.s.Event.fPending)
     {
-        vmxHCPendingEventToTrpmTrap(pVCpu);
+        //如果 HM 有未处理的事件（如外部中断、异常），将其转换为 TRPM（Trap Manager）陷阱，供 Ring-3 后续处理。
+        vmxHCPendingEventToTrpmTrap(pVCpu); // 转换为 TRPM 陷阱
         Assert(!pVCpu->hm.s.Event.fPending);
 
         /* Clear the events from the VMCS. */
+        //清理 VMCS 相关字段，避免重复注入。
         int rc = VMXWriteVmcs32(VMX_VMCS32_CTRL_ENTRY_INTERRUPTION_INFO, 0);    AssertRC(rc);
         rc     = VMXWriteVmcs32(VMX_VMCS_GUEST_PENDING_DEBUG_XCPTS, 0);         AssertRC(rc);
     }
@@ -4849,6 +4867,7 @@ static int hmR0VmxExitToRing3(PVMCPUCC pVCpu, VBOXSTRICTRC rcExit)
          * be left unmodified as the event would not have been injected to the guest. In
          * such cases, don't assert, we're not going to continue guest execution anyway.
          */
+        /* 检查是否意外清除了未处理的 HM 事件 */
         uint32_t uExitReason;
         uint32_t uEntryIntInfo;
         int rc = VMXReadVmcs32(VMX_VMCS32_RO_EXIT_REASON, &uExitReason);
@@ -4866,20 +4885,29 @@ static int hmR0VmxExitToRing3(PVMCPUCC pVCpu, VBOXSTRICTRC rcExit)
      */
     if (!CPUMIsGuestInVmxNonRootMode(&pVCpu->cpum.GstCtx))
     {
+        //中断窗口（Interrupt-Window）和 NMI 窗口（NMI-Window）是 VMCS 的控制字段，用于在特定时机触发 VM-Exit。
+        //在退出前 显式清除，避免影响后续 VM-Entry。
         Assert(!pVCpu->hmr0.s.vmx.fSwitchedToNstGstVmcs);
-        vmxHCClearIntWindowExitVmcs(pVCpu, pVmcsInfo);
-        vmxHCClearNmiWindowExitVmcs(pVCpu, pVmcsInfo);
+        vmxHCClearIntWindowExitVmcs(pVCpu, pVmcsInfo); // 清除中断窗口
+        vmxHCClearNmiWindowExitVmcs(pVCpu, pVmcsInfo); // 清除 NMI 窗口
     }
 
     /* If we're emulating an instruction, we shouldn't have any TRPM traps pending
        and if we're injecting an event we should have a TRPM trap pending. */
+    //如果退出原因是 注入 TRPM 事件（如中断/异常），则必须有 待处理的陷阱。
     AssertMsg(rcExit != VINF_EM_RAW_INJECT_TRPM_EVENT || TRPMHasTrap(pVCpu), ("%Rrc\n", VBOXSTRICTRC_VAL(rcExit)));
 #ifndef DEBUG_bird /* Triggered after firing an NMI against NT4SP1, possibly a triple fault in progress. */
+    //如果退出原因是 模拟指令，则 不能有未处理的陷阱。
     AssertMsg(rcExit != VINF_EM_RAW_EMULATE_INSTR || !TRPMHasTrap(pVCpu), ("%Rrc\n", VBOXSTRICTRC_VAL(rcExit)));
 #endif
 
     /* Save guest state and restore host state bits. */
-    int rc = hmR0VmxLeaveSession(pVCpu);
+    /*hmR0VmxLeaveSession:
+       保存客户机寄存器、MSR、FPU 状态。
+       恢复宿主机 FPU、调试寄存器。
+       清理 VMCS 并退出 VMX 模式。
+    */
+    int rc = hmR0VmxLeaveSession(pVCpu);// 保存客户机状态，恢复宿主机状态
     AssertRCReturn(rc, rc);
     STAM_COUNTER_DEC(&pVCpu->hm.s.StatSwitchLongJmpToR3);
 
@@ -4888,12 +4916,14 @@ static int hmR0VmxExitToRing3(PVMCPUCC pVCpu, VBOXSTRICTRC rcExit)
 
     /* Sync recompiler state. */
     VMCPU_FF_CLEAR(pVCpu, VMCPU_FF_TO_R3);
+    //标记客户机 CPU 状态已更改，确保后续操作（如内存访问）能正确同步。
     CPUMSetChangedFlags(pVCpu, CPUM_CHANGED_SYSENTER_MSR
                              | CPUM_CHANGED_LDTR
                              | CPUM_CHANGED_GDTR
                              | CPUM_CHANGED_IDTR
                              | CPUM_CHANGED_TR
                              | CPUM_CHANGED_HIDDEN_SEL_REGS);
+    //如果启用了 嵌套分页（Nested Paging, EPT/NPT），且客户机启用了分页，则 刷新全局 TLB。
     if (   pVCpu->CTX_SUFF(pVM)->hmr0.s.fNestedPaging
         && CPUMIsGuestPagingEnabledEx(&pVCpu->cpum.GstCtx))
         CPUMSetChangedFlags(pVCpu, CPUM_CHANGED_GLOBAL_TLB_FLUSH);
@@ -4901,6 +4931,7 @@ static int hmR0VmxExitToRing3(PVMCPUCC pVCpu, VBOXSTRICTRC rcExit)
     Assert(!pVCpu->hmr0.s.fClearTrapFlag);
 
     /* Update the exit-to-ring 3 reason. */
+    //记录 VM-Exit 原因，供 Ring-3 后续处理（如模拟 I/O 或调度决策）。
     pVCpu->hm.s.rcLastExitToR3 = VBOXSTRICTRC_VAL(rcExit);
 
     /* On our way back from ring-3 reload the guest state if there is a possibility of it being changed. */
@@ -4924,6 +4955,15 @@ static int hmR0VmxExitToRing3(PVMCPUCC pVCpu, VBOXSTRICTRC rcExit)
  * @returns VBox status code.
  * @param   pVCpu           The cross context virtual CPU structure.
  */
+//这段代码是 VirtualBox‌ 在 Intel VT-x
+//模式下处理 断言（Assertion）失败时的回调函数，
+//用于 紧急退出 VMX 模式，确保 主机状态恢复，
+//避免因断言失败导致系统崩溃或数据损坏。
+#if 0
+    快速退出 VMX 模式，避免触发更多断言（Assert）。
+    恢复主机状态（FPU、调试寄存器、MSR等），防止客户机状态污染宿主机。
+    清理 VMCS（Virtual Machine Control Structure），确保后续 VMX 操作能正确执行。
+#endif
 VMMR0DECL(int) VMXR0AssertionCallback(PVMCPUCC pVCpu)
 {
     /*
@@ -4931,31 +4971,38 @@ VMMR0DECL(int) VMXR0AssertionCallback(PVMCPUCC pVCpu)
      * If you modify code here, check whether hmR0VmxLeave() and hmR0VmxLeaveSession() needs to be updated too.
      * This is a stripped down version which gets out ASAP, trying to not trigger any further assertions.
      */
-    VMMR0AssertionRemoveNotification(pVCpu);
-    VMMRZCallRing3Disable(pVCpu);
-    HM_DISABLE_PREEMPT(pVCpu);
+    VMMR0AssertionRemoveNotification(pVCpu);//移除可能的通知机制，防止进一步触发断言。
+    VMMRZCallRing3Disable(pVCpu);//禁用 Ring-3 调用，避免陷入用户态。
+    HM_DISABLE_PREEMPT(pVCpu);//禁用抢占，确保当前线程不会被调度出去。
 
+    //获取当前活动的 VMCS（可能是普通 VMCS 或嵌套 VMCS）。
     PVMXVMCSINFO pVmcsInfo = hmGetVmxActiveVmcsInfo(pVCpu);
+    //强制导入 所有客户机状态（包括 GPRs、控制寄存器等），确保 VMCS 数据同步到内存。
     vmxHCImportGuestStateEx(pVCpu, pVmcsInfo, HMVMX_CPUMCTX_EXTRN_ALL);
+    //保存客户机 FPU 状态，恢复主机 FPU 状态。
     CPUMR0FpuStateMaybeSaveGuestAndRestoreHost(pVCpu);
+    //保存客户机调试寄存器（DR6），恢复主机调试状态。
     CPUMR0DebugStateMaybeSaveGuestAndRestoreHost(pVCpu, true /* save DR6 */);
 
     /* Restore host-state bits that VT-x only restores partially. */
+    //检查是否需要额外恢复主机状态（如 FS/GS 基址、Kernel GS 基址等）。
     if (pVCpu->hmr0.s.vmx.fRestoreHostFlags > VMX_RESTORE_HOST_REQUIRED)
         VMXRestoreHostState(pVCpu->hmr0.s.vmx.fRestoreHostFlags, &pVCpu->hmr0.s.vmx.RestoreHost);
     pVCpu->hmr0.s.vmx.fRestoreHostFlags = 0;
 
     /* Restore the lazy host MSRs as we're leaving VT-x context. */
+    //如果客户机 MSR 已加载，则恢复主机 MSR（如 SYSCALL 相关 MSR）。
     if (pVCpu->hmr0.s.vmx.fLazyMsrs & VMX_LAZY_MSRS_LOADED_GUEST)
         hmR0VmxLazyRestoreHostMsrs(pVCpu);
 
     /* Update auto-load/store host MSRs values when we re-enter VT-x (as we could be on a different CPU). */
+    //标记 主机 MSR 自动加载状态为无效（下次进入 VMX 时需要重新加载）。
     pVCpu->hmr0.s.vmx.fUpdatedHostAutoMsrs = false;
-    VMCPU_CMPXCHG_STATE(pVCpu, VMCPUSTATE_STARTED_HM, VMCPUSTATE_STARTED_EXEC);
+    VMCPU_CMPXCHG_STATE(pVCpu, VMCPUSTATE_STARTED_HM, VMCPUSTATE_STARTED_EXEC);//更新 CPU 状态，表示已退出 VMX 模式。
 
     /* Clear the current VMCS data back to memory (shadow VMCS if any would have been
        cleared as part of importing the guest state above. */
-    hmR0VmxClearVmcs(pVmcsInfo);
+    hmR0VmxClearVmcs(pVmcsInfo);//将 VMCS 数据写回内存（如果是 Shadow VMCS，则已通过 vmxHCImportGuestStateEx 清理）。
 
     /** @todo eliminate the need for calling VMMR0ThreadCtxHookDisable here!  */
     VMMR0ThreadCtxHookDisable(pVCpu);
@@ -4973,6 +5020,7 @@ VMMR0DECL(int) VMXR0AssertionCallback(PVMCPUCC pVCpu)
  * @returns VBox status code.
  * @param   pVCpu   The cross context virtual CPU structure.
  */
+//虚拟机进入函数VMXR0Enter的实现，主要负责在切换到VMX non-root模式（客户机模式）前的准备工作
 VMMR0DECL(int) VMXR0Enter(PVMCPUCC pVCpu)
 {
     AssertPtr(pVCpu);
@@ -4985,7 +5033,7 @@ VMMR0DECL(int) VMXR0Enter(PVMCPUCC pVCpu)
 
 #ifdef VBOX_STRICT
     /* At least verify VMX is enabled, since we can't check if we're in VMX root mode without #GP'ing. */
-    RTCCUINTREG uHostCr4 = ASMGetCR4();
+    RTCCUINTREG uHostCr4 = ASMGetCR4();//在严格模式（VBOX_STRICT）下检查CR4寄存器的VMXE位是否启用（Intel VT-x的必要条件）
     if (!(uHostCr4 & X86_CR4_VMXE))
     {
         LogRelFunc(("X86_CR4_VMXE bit in CR4 is not set!\n"));
@@ -5005,16 +5053,20 @@ VMMR0DECL(int) VMXR0Enter(PVMCPUCC pVCpu)
      * Load the appropriate VMCS as the current and active one.
      */
     PVMXVMCSINFO pVmcsInfo;
+    //嵌套虚拟化判断
     bool const fInNestedGuestMode = CPUMIsGuestInVmxNonRootMode(&pVCpu->cpum.GstCtx);
+    //选择VMCS
     if (!fInNestedGuestMode)
         pVmcsInfo = &pVCpu->hmr0.s.vmx.VmcsInfo;
     else
         pVmcsInfo = &pVCpu->hmr0.s.vmx.VmcsInfoNstGst;
+    //加载VMCS
     int rc = hmR0VmxLoadVmcs(pVmcsInfo);
     if (RT_SUCCESS(rc))
     {
         pVCpu->hmr0.s.vmx.fSwitchedToNstGstVmcs           = fInNestedGuestMode;
         pVCpu->hm.s.vmx.fSwitchedToNstGstVmcsCopyForRing3 = fInNestedGuestMode;
+        //通过fLeaveDone=false标记VMCS未退出状态，确保后续VMXR0Leave能正确处理状态恢复
         pVCpu->hmr0.s.fLeaveDone = false;
         Log4Func(("Loaded %s Vmcs. HostCpuId=%u\n", fInNestedGuestMode ? "nested-guest" : "guest", RTMpCpuId()));
     }
@@ -5034,6 +5086,10 @@ VMMR0DECL(int) VMXR0Enter(PVMCPUCC pVCpu)
  * @param   fGlobalInit     Whether global VT-x/AMD-V init. was used.
  * @thread  EMT(pVCpu)
  */
+//enmEvent：线程上下文事件类型（IN/OUT）
+//pVCpu：当前vCPU上下文指针
+//这个函数是VirtualBox中处理线程上下文切换回调的核心实现，
+//主要用于在硬件虚拟化（VT-x）环境下处理线程被抢占或恢复时的状态管理
 VMMR0DECL(void) VMXR0ThreadCtxCallback(RTTHREADCTXEVENT enmEvent, PVMCPUCC pVCpu, bool fGlobalInit)
 {
     AssertPtr(pVCpu);
@@ -5041,13 +5097,14 @@ VMMR0DECL(void) VMXR0ThreadCtxCallback(RTTHREADCTXEVENT enmEvent, PVMCPUCC pVCpu
 
     switch (enmEvent)
     {
+        //RTTHREADCTXEVENT_OUT因抢占触发，需优先恢复主机状态（避免死锁和状态污染）
         case RTTHREADCTXEVENT_OUT:
         {
             Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
-            VMCPU_ASSERT_EMT(pVCpu);
+            VMCPU_ASSERT_EMT(pVCpu);//确保在EMT（Emulation Thread）上下文中执行
 
             /* No longjmps (logger flushes, locks) in this fragile context. */
-            VMMRZCallRing3Disable(pVCpu);
+            VMMRZCallRing3Disable(pVCpu); // 禁用Ring3回调
             Log4Func(("Preempting: HostCpuId=%u\n", RTMpCpuId()));
 
             /* Restore host-state (FPU, debug etc.) */
@@ -5057,16 +5114,17 @@ VMMR0DECL(void) VMXR0ThreadCtxCallback(RTTHREADCTXEVENT enmEvent, PVMCPUCC pVCpu
                  * Do -not- import the guest-state here as we might already be in the middle of importing
                  * it, esp. bad if we're holding the PGM lock, see comment at the end of vmxHCImportGuestStateEx().
                  */
-                hmR0VmxLeave(pVCpu, false /* fImportState */);
+                // 退出VMX上下文（不导入客户机状态）,确保主机状态（FPU/调试寄存器等）正确恢复即可
+                hmR0VmxLeave(pVCpu, false /* fImportState */); 
                 pVCpu->hmr0.s.fLeaveDone = true;
             }
 
             /* Leave HM context, takes care of local init (term). */
-            int rc = HMR0LeaveCpu(pVCpu);
+            int rc = HMR0LeaveCpu(pVCpu);// 清理CPU本地状态
             AssertRC(rc);
 
             /* Restore longjmp state. */
-            VMMRZCallRing3Enable(pVCpu);
+            VMMRZCallRing3Enable(pVCpu); // 恢复Ring3回调
             STAM_REL_COUNTER_INC(&pVCpu->hm.s.StatSwitchPreempt);
             break;
         }
@@ -5077,23 +5135,26 @@ VMMR0DECL(void) VMXR0ThreadCtxCallback(RTTHREADCTXEVENT enmEvent, PVMCPUCC pVCpu
             VMCPU_ASSERT_EMT(pVCpu);
 
             /* Do the EMT scheduled L1D and MDS flush here if needed. */
+            //根据需要执行L1D和MDS缓存清除(安全相关)
             if (pVCpu->hmr0.s.fWorldSwitcher & HM_WSF_L1D_SCHED)
                 ASMWrMsr(MSR_IA32_FLUSH_CMD, MSR_IA32_FLUSH_CMD_F_L1D);
             else if (pVCpu->hmr0.s.fWorldSwitcher & HM_WSF_MDS_SCHED)
                 hmR0MdsClear();
 
             /* No longjmps here, as we don't want to trigger preemption (& its hook) while resuming. */
-            VMMRZCallRing3Disable(pVCpu);
+            VMMRZCallRing3Disable(pVCpu);//禁用Ring3回调
             Log4Func(("Resumed: HostCpuId=%u\n", RTMpCpuId()));
 
             /* Initialize the bare minimum state required for HM. This takes care of
                initializing VT-x if necessary (onlined CPUs, local init etc.) */
+            //初始化HM(Hardware Virtualization)所需的最小状态
             int rc = hmR0EnterCpu(pVCpu);
             AssertRC(rc);
             Assert(   (pVCpu->hm.s.fCtxChanged & (HM_CHANGED_HOST_CONTEXT | HM_CHANGED_VMX_HOST_GUEST_SHARED_STATE))
                                               == (HM_CHANGED_HOST_CONTEXT | HM_CHANGED_VMX_HOST_GUEST_SHARED_STATE));
 
             /* Load the active VMCS as the current one. */
+            //加载活动的VMCS(虚拟机控制结构)
             PVMXVMCSINFO pVmcsInfo = hmGetVmxActiveVmcsInfo(pVCpu);
             rc = hmR0VmxLoadVmcs(pVmcsInfo);
             AssertRC(rc);
@@ -5101,6 +5162,7 @@ VMMR0DECL(void) VMXR0ThreadCtxCallback(RTTHREADCTXEVENT enmEvent, PVMCPUCC pVCpu
             pVCpu->hmr0.s.fLeaveDone = false;
 
             /* Restore longjmp state. */
+            //重新启用Ring3回调
             VMMRZCallRing3Enable(pVCpu);
             break;
         }
@@ -5122,21 +5184,27 @@ VMMR0DECL(void) VMXR0ThreadCtxCallback(RTTHREADCTXEVENT enmEvent, PVMCPUCC pVCpu
  *
  * @remarks No-long-jump zone!!!
  */
-static int hmR0VmxExportHostState(PVMCPUCC pVCpu)
+//VM-exit时同步宿主机状态到VMCS
+/*
+  VMCS字段映射
+    CR4导出对应VMCS_HOST_CR4字段（0x6C14）
+    段寄存器基址写入VMCS_HOST_ES_BASE等字段（0x6C00~0x6C0E）
+*/
+static int hmr0vmxexporthoststate(pvmcpucc pvcpu)
 {
-    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
+    assert(!rtthreadpreemptisenabled(nil_rtthread));
 
-    int rc = VINF_SUCCESS;
-    if (pVCpu->hm.s.fCtxChanged & HM_CHANGED_HOST_CONTEXT)
+    int rc = vinf_success;
+    if (pvcpu->hm.s.fctxchanged & hm_changed_host_context)
     {
-        uint64_t uHostCr4 = hmR0VmxExportHostControlRegs();
+        uint64_t uhostcr4 = hmr0vmxexporthostcontrolregs();// 控制寄存器(CR4)
 
-        rc = hmR0VmxExportHostSegmentRegs(pVCpu, uHostCr4);
-        AssertLogRelMsgRCReturn(rc, ("rc=%Rrc\n", rc), rc);
+        rc = hmr0vmxexporthostsegmentregs(pvcpu, uhostcr4);// 段寄存器
+        assertlogrelmsgrcreturn(rc, ("rc=%rrc\n", rc), rc);
 
-        hmR0VmxExportHostMsrs(pVCpu);
+        hmr0vmxexporthostmsrs(pvcpu);// MSR寄存器
 
-        pVCpu->hm.s.fCtxChanged &= ~HM_CHANGED_HOST_CONTEXT;
+        pvcpu->hm.s.fctxchanged &= ~hm_changed_host_context;
     }
     return rc;
 }
@@ -5150,10 +5218,17 @@ static int hmR0VmxExportHostState(PVMCPUCC pVCpu)
  *
  * @remarks No-long-jump zone!!!
  */
+/*
+graph TB
+  A[VM-entry] --> B[导出客户机状态]
+  C[VM-exit] --> D[导出主机状态]
+  D --> E[恢复Host上下文]
+*/
+//该函数实现图中D阶段操作
 VMMR0DECL(int) VMXR0ExportHostState(PVMCPUCC pVCpu)
 {
     AssertPtr(pVCpu);
-    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
+    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));//确保处于非抢占上下文, 线程调度禁止
 
     /*
      * Export the host state here while entering HM context.
@@ -5199,11 +5274,12 @@ static VBOXSTRICTRC hmR0VmxExportGuestState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTr
      */
     PVMXVMCSINFOSHARED pVmcsInfoShared = pVmxTransient->pVmcsInfo->pShared;
     if (    pVCpu->CTX_SUFF(pVM)->hmr0.s.vmx.fUnrestrictedGuest
-        || !CPUMIsGuestInRealModeEx(&pVCpu->cpum.GstCtx))
+        || !CPUMIsGuestInRealModeEx(&pVCpu->cpum.GstCtx)) //根据 fUnrestrictedGuest 能力和客户机模式,设置 RealMode.fRealOnV86Active 标志
         pVmcsInfoShared->RealMode.fRealOnV86Active = false;
     else
     {
         Assert(!pVmxTransient->fIsNestedGuest);
+        //影响后续段寄存器和 CR0 的导出方式（如虚拟 8086 模式处理）
         pVmcsInfoShared->RealMode.fRealOnV86Active = true;
     }
 
@@ -5214,9 +5290,11 @@ static VBOXSTRICTRC hmR0VmxExportGuestState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTr
     int rc = vmxHCExportGuestEntryExitCtls(pVCpu, pVmxTransient);
     AssertLogRelMsgRCReturn(rc, ("rc=%Rrc\n", rc), rc);
 
+    //控制寄存器组 CR0
     rc = vmxHCExportGuestCR0(pVCpu, pVmxTransient);
     AssertLogRelMsgRCReturn(rc, ("rc=%Rrc\n", rc), rc);
 
+    //控制寄存器组 CR3 CR4
     VBOXSTRICTRC rcStrict = vmxHCExportGuestCR3AndCR4(pVCpu, pVmxTransient);
     if (rcStrict == VINF_SUCCESS)
     { /* likely */ }
@@ -5226,18 +5304,23 @@ static VBOXSTRICTRC hmR0VmxExportGuestState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTr
         return rcStrict;
     }
 
+    //内存管理单元, （含 GDTR/IDTR)
     rc = vmxHCExportGuestSegRegsXdtr(pVCpu, pVmxTransient);
     AssertLogRelMsgRCReturn(rc, ("rc=%Rrc\n", rc), rc);
 
+    //扩展状态
     rc = hmR0VmxExportGuestMsrs(pVCpu, pVmxTransient);
     AssertLogRelMsgRCReturn(rc, ("rc=%Rrc\n", rc), rc);
 
     vmxHCExportGuestApicTpr(pVCpu, pVmxTransient);
     vmxHCExportGuestXcptIntercepts(pVCpu, pVmxTransient);
+
+    //执行上下文：RIP/RSP/RFLAGS 的最终同步
     vmxHCExportGuestRip(pVCpu);
     hmR0VmxExportGuestRsp(pVCpu);
     vmxHCExportGuestRflags(pVCpu, pVmxTransient);
 
+    //处理嵌套虚拟化相关状态（如 VMCS 链接指针）
     rc = hmR0VmxExportGuestHwvirtState(pVCpu, pVmxTransient);
     AssertLogRelMsgRCReturn(rc, ("rc=%Rrc\n", rc), rc);
 
@@ -5268,6 +5351,7 @@ static VBOXSTRICTRC hmR0VmxExportGuestState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTr
  *
  * @remarks No-long-jump zone!!!
  */
+//处理 VMX 模式下共享状态导出的核心函数，主要用于在 VM-exit 时同步 Guest 与 Host 的共享硬件状态
 static void hmR0VmxExportSharedState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient)
 {
     Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
@@ -5275,7 +5359,7 @@ static void hmR0VmxExportSharedState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient
 
     if (pVCpu->hm.s.fCtxChanged & HM_CHANGED_GUEST_DR_MASK)
     {
-        int rc = hmR0VmxExportSharedDebugState(pVCpu, pVmxTransient);
+        int rc = hmR0VmxExportSharedDebugState(pVCpu, pVmxTransient); //通过 hmR0VmxExportSharedDebugState 同步 DRx 寄存器，并可能触发 RFLAGS.TF 位更新
         AssertRC(rc);
         pVCpu->hm.s.fCtxChanged &= ~HM_CHANGED_GUEST_DR_MASK;
 
@@ -5286,7 +5370,7 @@ static void hmR0VmxExportSharedState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient
 
     if (pVCpu->hm.s.fCtxChanged & HM_CHANGED_VMX_GUEST_LAZY_MSRS)
     {
-        hmR0VmxLazyLoadGuestMsrs(pVCpu);
+        hmR0VmxLazyLoadGuestMsrs(pVCpu); //调用 hmR0VmxLazyLoadGuestMsrs 延迟加载客户机模型特定寄存器
         pVCpu->hm.s.fCtxChanged &= ~HM_CHANGED_VMX_GUEST_LAZY_MSRS;
     }
 
@@ -5308,6 +5392,11 @@ static void hmR0VmxExportSharedState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient
  *
  * @remarks No-long-jump zone!!!
  */
+/*
+ 函数目的：
+    根据CPU状态变化情况，选择最优方式导出客户机状态到VMCS(虚拟机控制结构)
+    尽可能减少不必要的状态导出以提高性能
+*/
 static VBOXSTRICTRC hmR0VmxExportGuestStateOptimal(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient)
 {
     HMVMX_ASSERT_PREEMPT_SAFE(pVCpu);
@@ -5327,19 +5416,22 @@ static VBOXSTRICTRC hmR0VmxExportGuestStateOptimal(PVMCPUCC pVCpu, PVMXTRANSIENT
     uint64_t const fCtxChanged  = ASMAtomicUoReadU64(&pVCpu->hm.s.fCtxChanged);
 
     /* If only RIP/RSP/RFLAGS/HWVIRT changed, export only those (quicker, happens more often).*/
+    //定义了几种状态掩码：
+      //fCtxMask - 所有需要导出的状态位，排除主机/客户机共享状态
+      //fMinimalMask - 仅包含RIP/RSP/RFLAGS/HWVIRT这些最常变化的状态
     if (    (fCtxChanged & fMinimalMask)
         && !(fCtxChanged & (fCtxMask & ~fMinimalMask)))
     {
-        vmxHCExportGuestRip(pVCpu);
+        vmxHCExportGuestRip(pVCpu);//仅导出这些寄存器(vmxHCExportGuestRip等函数)
         hmR0VmxExportGuestRsp(pVCpu);
         vmxHCExportGuestRflags(pVCpu, pVmxTransient);
         rcStrict = hmR0VmxExportGuestHwvirtState(pVCpu, pVmxTransient);
-        STAM_COUNTER_INC(&pVCpu->hm.s.StatExportMinimal);
+        STAM_COUNTER_INC(&pVCpu->hm.s.StatExportMinimal); //增加最小导出计数器
     }
     /* If anything else also changed, go through the full export routine and export as required. */
     else if (fCtxChanged & fCtxMask)
     {
-        rcStrict = hmR0VmxExportGuestState(pVCpu, pVmxTransient);
+        rcStrict = hmR0VmxExportGuestState(pVCpu, pVmxTransient);//执行完整状态导出(hmR0VmxExportGuestState)
         if (RT_LIKELY(rcStrict == VINF_SUCCESS))
         { /* likely */}
         else
@@ -5349,7 +5441,7 @@ static VBOXSTRICTRC hmR0VmxExportGuestStateOptimal(PVMCPUCC pVCpu, PVMXTRANSIENT
             Assert(!VMMRZCallRing3IsEnabled(pVCpu));
             return rcStrict;
         }
-        STAM_COUNTER_INC(&pVCpu->hm.s.StatExportFull);
+        STAM_COUNTER_INC(&pVCpu->hm.s.StatExportFull);//增加完整导出计数器
     }
     /* Nothing changed, nothing to load here. */
     else
@@ -5357,7 +5449,7 @@ static VBOXSTRICTRC hmR0VmxExportGuestStateOptimal(PVMCPUCC pVCpu, PVMXTRANSIENT
 
 #ifdef VBOX_STRICT
     /* All the guest state bits should be loaded except maybe the host context and/or the shared host/guest bits. */
-    uint64_t const fCtxChangedCur = ASMAtomicUoReadU64(&pVCpu->hm.s.fCtxChanged);
+    uint64_t const fCtxChangedCur = ASMAtomicUoReadU64(&pVCpu->hm.s.fCtxChanged);//在严格检查模式下(VBOX_STRICT)会验证所有状态位是否已正确导出
     AssertMsg(!(fCtxChangedCur & fCtxMask), ("fCtxChangedCur=%#RX64\n", fCtxChangedCur));
 #endif
     return rcStrict;
@@ -5374,6 +5466,8 @@ static VBOXSTRICTRC hmR0VmxExportGuestStateOptimal(PVMCPUCC pVCpu, PVMXTRANSIENT
  * @param   pVCpu           The cross context virtual CPU structure.
  * @param   GCPhysApicBase  The guest-physical address of the APIC access page.
  */
+//将客户机物理地址 GCPhysApicBase 映射到主机预分配的 APIC-access page 物理页
+//（pVM->hmr0.s.vmx.HCPhysApicAccess），实现虚拟 APIC 访问的硬件加速
 static int hmR0VmxMapHCApicAccessPage(PVMCPUCC pVCpu, RTGCPHYS GCPhysApicBase)
 {
     PVMCC pVM = pVCpu->CTX_SUFF(pVM);
@@ -5382,11 +5476,14 @@ static int hmR0VmxMapHCApicAccessPage(PVMCPUCC pVCpu, RTGCPHYS GCPhysApicBase)
     LogFunc(("Mapping HC APIC-access page at %#RGp\n", GCPhysApicBase));
 
     /* Unalias the existing mapping. */
-    int rc = PGMHandlerPhysicalReset(pVM, GCPhysApicBase);
+    int rc = PGMHandlerPhysicalReset(pVM, GCPhysApicBase); //解除原有MMIO映射
     AssertRCReturn(rc, rc);
 
     /* Map the HC APIC-access page in place of the MMIO page, also updates the shadow page tables if necessary. */
     Assert(pVM->hmr0.s.vmx.HCPhysApicAccess != NIL_RTHCPHYS);
+    //建立新物理页映射
+    //X86_PTE_RW | X86_PTE_P：设置页表项为可读写且存在
+    //HCPhysApicAccess 是预先通过 SUPR0ContAlloc 分配的连续物理内存
     rc = IOMR0MmioMapMmioHCPage(pVM, pVCpu, GCPhysApicBase, pVM->hmr0.s.vmx.HCPhysApicAccess, X86_PTE_RW | X86_PTE_P);
     AssertRCReturn(rc, rc);
 
@@ -5418,6 +5515,11 @@ static DECLCALLBACK(void) hmR0DispatchHostNmi(RTCPUID idCpu, void *pvUser1, void
  *                      executing when receiving the host NMI in VMX non-root
  *                      operation.
  */
+/*
+当虚拟机因 NMI 触发 VM-exit 时，需将 NMI 正确传递到主机物理 CPU。该函数处理两种场景：
+  当前 CPU 就是目标 CPU：直接处理
+  目标 CPU 是其他核心：通过 IPI（处理器间中断）跨核传递
+*/
 static int hmR0VmxExitHostNmi(PVMCPUCC pVCpu, PCVMXVMCSINFO pVmcsInfo)
 {
     RTCPUID const idCpu = pVmcsInfo->idHostCpuExec;
@@ -5460,6 +5562,7 @@ static int hmR0VmxExitHostNmi(PVMCPUCC pVCpu, PCVMXVMCSINFO pVmcsInfo)
      * (to the target CPU) without dispatching the host NMI above.
      */
     STAM_REL_COUNTER_INC(&pVCpu->hm.s.StatExitHostNmiInGCIpi);
+    //IPI 机制, 使用 RTMpOnSpecific() 向目标 CPU 发送请求：
     return RTMpOnSpecific(idCpu, &hmR0DispatchHostNmi, NULL /* pvUser1 */,  NULL /* pvUser2 */);
 }
 
@@ -5842,11 +5945,35 @@ static int hmR0VmxMergeVmcsNested(PVMCPUCC pVCpu)
  *                          for returning to ring-3, and return VINF_EM_DBG_STEPPED
  *                          if event dispatching took place.
  */
+/*
+ hmR0VmxPreRunGuest 负责在进入 VMX non-root 模式运行客户机代码之前，完成必要的准备工作。主要处理：
+    嵌套虚拟化检查
+    强制标志(force flags)处理
+    APIC 虚拟化设置
+    待处理事件注入
+    控制寄存器状态同步
+*/
+
+/*
+关键机制与技术
+1. 中断虚拟化优化
+  虚拟 APIC：通过 VMX_PROC_CTLS2_VIRT_APIC_ACCESS 将 APIC 访问重定向到内存页，减少 VM-exit。
+  中断窗口：在 VMCS 中设置 Interrupt Window，允许客户机在合适时机接收中断。
+2. 嵌套虚拟化支持
+  VMCS 合并：将嵌套客户机的控制字段与当前 VMCS 结合，确保二级 Hypervisor 的正确行为。
+  VMX 指令模拟：捕获 VMLAUNCH/VMRESUME 等指令，由 Hypervisor 模拟执行。
+3. 事件优先级管理
+  事件优先级：评估中断、NMI、异常的执行顺序，确保符合 CPU 行为。
+  注入冲突处理：检测无效注入（如注入 #PF 时 CR2 未更新），触发三重故障。
+4. 状态同步策略
+  按需导出：仅同步被修改的客户机状态（通过 fCtxChanged 标志）。
+  惰性加载：推迟 FPU/调试寄存器的保存/恢复，直到首次使用。
+*/
 static VBOXSTRICTRC hmR0VmxPreRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient, bool fStepping)
 {
-    Assert(VMMRZCallRing3IsEnabled(pVCpu));
+    Assert(VMMRZCallRing3IsEnabled(pVCpu));// 确保处于可调用 Ring3 的上下文
 
-    Log4Func(("fIsNested=%RTbool fStepping=%RTbool\n", pVmxTransient->fIsNestedGuest, fStepping));
+    Log4Func(("fIsNested=%RTbool fStepping=%RTbool\n", pVmxTransient->fIsNestedGuest, fStepping));// 调试日志
 
 #ifdef VBOX_WITH_NESTED_HWVIRT_ONLY_IN_IEM
     if (pVmxTransient->fIsNestedGuest)
@@ -5860,6 +5987,13 @@ static VBOXSTRICTRC hmR0VmxPreRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransie
     /*
      * Check and process force flag actions, some of which might require us to go back to ring-3.
      */
+    //处理可能要求返回到 ring-3 的特殊情况（如需要模拟某些指令）
+    /*
+       处理场景：
+         VM 重置请求（VM_FF_RESET）。
+         定时器同步（VM_FF_TM_VIRTUAL_SYNC）。
+         调试事件（单步执行 fStepping）。
+    */
     VBOXSTRICTRC rcStrict = vmxHCCheckForceFlags(pVCpu, pVmxTransient->fIsNestedGuest, fStepping);
     if (rcStrict == VINF_SUCCESS)
     {
@@ -5879,20 +6013,21 @@ static VBOXSTRICTRC hmR0VmxPreRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransie
     /*
      * Virtualize memory-mapped accesses to the physical APIC (may take locks).
      */
+    //通过硬件虚拟化支持（VMX_PROC_CTLS2_VIRT_APIC_ACCESS）减少 APIC 访问的 VM-exit
     PVMCC pVM = pVCpu->CTX_SUFF(pVM);
     if (   !pVCpu->hm.s.vmx.u64GstMsrApicBase
         && (g_HmMsrs.u.vmx.ProcCtls2.n.allowed1 & VMX_PROC_CTLS2_VIRT_APIC_ACCESS)
         && PDMHasApic(pVM))
     {
         /* Get the APIC base MSR from the virtual APIC device. */
-        uint64_t const uApicBaseMsr = APICGetBaseMsrNoCheck(pVCpu);
+        uint64_t const uApicBaseMsr = APICGetBaseMsrNoCheck(pVCpu);// 获取虚拟 APIC 基址
 
         /* Map the APIC access page. */
-        int rc = hmR0VmxMapHCApicAccessPage(pVCpu, uApicBaseMsr & ~(RTGCPHYS)GUEST_PAGE_OFFSET_MASK);
+        int rc = hmR0VmxMapHCApicAccessPage(pVCpu, uApicBaseMsr & ~(RTGCPHYS)GUEST_PAGE_OFFSET_MASK); // 映射 APIC 访问页
         AssertRCReturn(rc, rc);
 
         /* Update the per-VCPU cache of the APIC base MSR corresponding to the mapped APIC access page. */
-        pVCpu->hm.s.vmx.u64GstMsrApicBase = uApicBaseMsr;
+        pVCpu->hm.s.vmx.u64GstMsrApicBase = uApicBaseMsr; // 缓存基址
     }
 
 #ifdef VBOX_WITH_NESTED_HWVIRT_VMX
@@ -5919,13 +6054,20 @@ static VBOXSTRICTRC hmR0VmxPreRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransie
      * If any new events (interrupts/NMI) are pending currently, we try to set up the
      * guest to cause a VM-exit the next time they are ready to receive the event.
      */
+    /*
+     事件类型：
+          硬件中断：通过 APIC 传递的外部中断。
+          软件异常：如 #PF 页面错误。
+          调试异常：单步执行时的 #DB。
+     注入逻辑：通过 VMCS 的 VMX_ENTRY_INT_INFO 字段注入事件，若失败触发三重故障（VINF_EM_RESET）。
+    */
     if (TRPMHasTrap(pVCpu))
-        vmxHCTrpmTrapToPendingEvent(pVCpu);
+        vmxHCTrpmTrapToPendingEvent(pVCpu);// 转换陷阱为待处理事件
 
     uint32_t fIntrState;
 #ifdef VBOX_WITH_NESTED_HWVIRT_VMX
     if (!pVmxTransient->fIsNestedGuest)
-        rcStrict = vmxHCEvaluatePendingEvent(pVCpu, pVmxTransient->pVmcsInfo, &fIntrState);
+        rcStrict = vmxHCEvaluatePendingEvent(pVCpu, pVmxTransient->pVmcsInfo, &fIntrState);  // 评估事件优先级
     else
         rcStrict = vmxHCEvaluatePendingEventNested(pVCpu, pVmxTransient->pVmcsInfo, &fIntrState);
 
@@ -5954,7 +6096,7 @@ static VBOXSTRICTRC hmR0VmxPreRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransie
      * With nested-guests, the above does not apply since unrestricted guest execution is a
      * requirement. Regardless, we do this here to avoid duplicating code elsewhere.
      */
-    rcStrict = vmxHCInjectPendingEvent(pVCpu, pVmxTransient->pVmcsInfo, pVmxTransient->fIsNestedGuest, fIntrState, fStepping);
+    rcStrict = vmxHCInjectPendingEvent(pVCpu, pVmxTransient->pVmcsInfo, pVmxTransient->fIsNestedGuest, fIntrState, fStepping); // 注入事件
     if (RT_LIKELY(rcStrict == VINF_SUCCESS))
     { /* likely */ }
     else
@@ -5970,10 +6112,16 @@ static VBOXSTRICTRC hmR0VmxPreRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransie
      * hmR0VmxInjectPendingEvent() call may lazily import guest-CPU state on demand causing
      * the below force flags to be set.
      */
+    /*
+       关键状态：
+         CR3：确保客户机页表正确加载。
+         RFLAGS/CS:RIP：指令指针与标志寄存器。
+         段寄存器：CS/DS/ES 等保护模式配置。
+    */
     if (VMCPU_FF_IS_SET(pVCpu, VMCPU_FF_HM_UPDATE_CR3))
     {
         Assert(!(ASMAtomicUoReadU64(&pVCpu->cpum.GstCtx.fExtrn) & CPUMCTX_EXTRN_CR3));
-        int rc2 = PGMUpdateCR3(pVCpu, CPUMGetGuestCR3(pVCpu));
+        int rc2 = PGMUpdateCR3(pVCpu, CPUMGetGuestCR3(pVCpu)); // 更新分页结构
         AssertMsgReturn(rc2 == VINF_SUCCESS || rc2 == VINF_PGM_SYNC_CR3,
                         ("%Rrc\n", rc2), RT_FAILURE_NP(rc2) ? rc2 : VERR_IPE_UNEXPECTED_INFO_STATUS);
         Assert(!VMCPU_FF_IS_SET(pVCpu, VMCPU_FF_HM_UPDATE_CR3));
@@ -5989,7 +6137,9 @@ static VBOXSTRICTRC hmR0VmxPreRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransie
      * Asserts() will still longjmp to ring-3 (but won't return), which is intentional, better than a kernel panic.
      * This also disables flushing of the R0-logger instance (if any).
      */
-    VMMRZCallRing3Disable(pVCpu);
+    //执行环境加固
+    //原子性保障：在 VMLAUNCH/VMRESUME 前确保无抢占或中断干扰。
+    VMMRZCallRing3Disable(pVCpu); // 禁止 Ring3 长跳转
 
     /*
      * Export the guest state bits.
@@ -6001,7 +6151,7 @@ static VBOXSTRICTRC hmR0VmxPreRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransie
      * If we are injecting events to a real-on-v86 mode guest, we would have updated RIP and some segment
      * registers. Hence, exporting of the guest state needs to be done -after- injection of events.
      */
-    rcStrict = hmR0VmxExportGuestStateOptimal(pVCpu, pVmxTransient);
+    rcStrict = hmR0VmxExportGuestStateOptimal(pVCpu, pVmxTransient); // 导出寄存器到 VMCS
     if (RT_LIKELY(rcStrict == VINF_SUCCESS))
     { /* likely */ }
     else
@@ -6024,7 +6174,7 @@ static VBOXSTRICTRC hmR0VmxPreRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransie
      * We also check a couple of other force-flags as a last opportunity to get the EMT back
      * to ring-3 before executing guest code.
      */
-    pVmxTransient->fEFlags = ASMIntDisableFlags();
+    pVmxTransient->fEFlags = ASMIntDisableFlags(); // 禁用中断
 
     if (   (   !VM_FF_IS_ANY_SET(pVM, VM_FF_EMT_RENDEZVOUS | VM_FF_TM_VIRTUAL_SYNC)
             && !VMCPU_FF_IS_ANY_SET(pVCpu, VMCPU_FF_HM_TO_R3_MASK))
@@ -6050,7 +6200,7 @@ static VBOXSTRICTRC hmR0VmxPreRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransie
              *       returns from this function, so do -not- enable them here.
              */
             pVCpu->hm.s.Event.fPending = false;
-            return VINF_SUCCESS;
+            return VINF_SUCCESS; // 安全进入客户机执行
         }
 
         STAM_COUNTER_INC(&pVCpu->hm.s.StatSwitchPendingHostIrq);
@@ -6062,10 +6212,10 @@ static VBOXSTRICTRC hmR0VmxPreRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransie
         rcStrict = VINF_EM_RAW_TO_R3;
     }
 
-    ASMSetFlags(pVmxTransient->fEFlags);
-    VMMRZCallRing3Enable(pVCpu);
+    ASMSetFlags(pVmxTransient->fEFlags); // 恢复中断标志
+    VMMRZCallRing3Enable(pVCpu); // 允许 Ring3 调用
 
-    return rcStrict;
+    return rcStrict;    // VINF_EM_RAW_INTERRUPT 或 VINF_EM_RAW_TO_R3
 }
 
 
@@ -6083,28 +6233,50 @@ static VBOXSTRICTRC hmR0VmxPreRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransie
  * @remarks Called with preemption disabled.
  * @remarks No-long-jump zone!!!
  */
+/*
+hmR0VmxPreRunGuestCommitted 是 VirtualBox 在 VT-x 模式下执行客户机代码前的 
+最终准备阶段，确保所有硬件状态、控制字段及上下文均已正确配置，为 VMLAUNCH/VMRESUME 指令的执行铺平道路。其核心任务包括：
+    状态验证与切换：确保 CPU 处于非抢占、非 Ring3 调用的安全状态。
+    FPU 状态加载：按需激活客户机 FPU 上下文，避免宿主 FPU 污染。
+    宿主/客户机共享状态同步：更新 VMCS 中的主机控制字段及共享寄存器。
+    性能优化配置：动态调整 TSC 拦截策略、预emption 定时器及 TLB 管理。
+    关键资源预加载：处理 MSR 自动加载、APIC TPR 缓存等。
+*/
+/*
+    性能影响点
+    操作	            潜在开销	                优化策略
+    VMCS 字段更新	    频繁 VMREAD/VMWRITE 指令	批量处理、条件更新
+    TLB 刷新	        全局刷新导致缓存失效	    VPID 标签化局部刷新
+    FPU 切换	        保存/恢复大寄存器集	        惰性加载、避免冗余切换
+    MSR 自动加载区配置	多 MSR 操作延迟	            缓存配置、按需更新
+    RDTSC/P 拦截	    频繁 VM-exit	            TSC 偏移 + preemption 定时器动态决策
+
+ * */
 static void hmR0VmxPreRunGuestCommitted(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient)
 {
-    Assert(!VMMRZCallRing3IsEnabled(pVCpu));
-    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
-    Assert(!pVCpu->hm.s.Event.fPending);
+    //确保代码在 原子化环境 中执行，避免并发干扰。
+    Assert(!VMMRZCallRing3IsEnabled(pVCpu)); // 确保不在 Ring3 调用上下文中
+    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));// 确认抢占已禁用
+    Assert(!pVCpu->hm.s.Event.fPending);  // 无挂起事件待处理
 
     /*
      * Indicate start of guest execution and where poking EMT out of guest-context is recognized.
      */
     VMCPU_ASSERT_STATE(pVCpu, VMCPUSTATE_STARTED_HM);
-    VMCPU_SET_STATE(pVCpu, VMCPUSTATE_STARTED_EXEC);
+    //从 STARTED_HM（硬件虚拟化管理就绪）转为 STARTED_EXEC（正式执行客户机代码）。
+    VMCPU_SET_STATE(pVCpu, VMCPUSTATE_STARTED_EXEC);// 标记为“开始执行”状态
 
     PVMCC         pVM          = pVCpu->CTX_SUFF(pVM);
     PVMXVMCSINFO  pVmcsInfo    = pVmxTransient->pVmcsInfo;
     PHMPHYSCPU    pHostCpu     = hmR0GetCurrentCpu();
     RTCPUID const idCurrentCpu = pHostCpu->idCpu;
 
+    //惰性加载：仅在客户机 FPU 未激活时切换，减少不必要的上下文保存/恢复。
     if (!CPUMIsGuestFPUStateActive(pVCpu))
     {
         STAM_PROFILE_ADV_START(&pVCpu->hm.s.StatLoadGuestFpuState, x);
-        if (CPUMR0LoadGuestFPU(pVM, pVCpu) == VINF_CPUM_HOST_CR0_MODIFIED)
-            pVCpu->hm.s.fCtxChanged |= HM_CHANGED_HOST_CONTEXT;
+        if (CPUMR0LoadGuestFPU(pVM, pVCpu) == VINF_CPUM_HOST_CR0_MODIFIED)// 加载客户机 FPU 状态. FPU 加载可能修改宿主 CR0，需触发后续主机状态重导出。
+            pVCpu->hm.s.fCtxChanged |= HM_CHANGED_HOST_CONTEXT; // 若 CR0 被修改则标记
         STAM_PROFILE_ADV_STOP(&pVCpu->hm.s.StatLoadGuestFpuState, x);
         STAM_COUNTER_INC(&pVCpu->hm.s.StatLoadGuestFpu);
     }
@@ -6121,9 +6293,18 @@ static void hmR0VmxPreRunGuestCommitted(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransi
      * This may also happen when switching to/from a nested-guest VMCS without leaving
      * ring-0.
      */
+    //宿主状态重导出
+    /*
+      跨 CPU 迁移：若虚拟 CPU 被调度到不同物理核，需重新配置 VMCS 主机状态。
+      FPU 加载副作用：如 CR0.TS（任务切换）位被修改。
+    */
     if (pVCpu->hm.s.fCtxChanged & HM_CHANGED_HOST_CONTEXT)
     {
-        hmR0VmxExportHostState(pVCpu);
+        /*
+          导出包括 CR0/CR3/CR4、RSP、GDTR/IDTR 等关键寄存器。
+          处理 64-on-32 切换器差异，确保 VMCS 中保存正确的宿主架构状态。
+        */
+        hmR0VmxExportHostState(pVCpu); // 更新 VMCS 中的主机状态字段
         STAM_COUNTER_INC(&pVCpu->hm.s.StatExportHostState);
     }
     Assert(!(pVCpu->hm.s.fCtxChanged & HM_CHANGED_HOST_CONTEXT));
@@ -6131,8 +6312,14 @@ static void hmR0VmxPreRunGuestCommitted(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransi
     /*
      * Export the state shared between host and guest (FPU, debug, lazy MSRs).
      */
+    //共享状态同步
+    /*
+      同步对象：
+         调试寄存器（DR7）：若客户机/宿主调试状态变更。
+         Lazy MSR：部分 MSR 的惰性加载策略，减少 VMREAD/VMWRITE 开销。
+    */
     if (pVCpu->hm.s.fCtxChanged & HM_CHANGED_VMX_HOST_GUEST_SHARED_STATE)
-        hmR0VmxExportSharedState(pVCpu, pVmxTransient);
+        hmR0VmxExportSharedState(pVCpu, pVmxTransient); // 导出调试、FPU 等共享状态
     AssertMsg(!pVCpu->hm.s.fCtxChanged, ("fCtxChanged=%#RX64\n", pVCpu->hm.s.fCtxChanged));
 
     /*
@@ -6146,16 +6333,22 @@ static void hmR0VmxPreRunGuestCommitted(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransi
      * more than one conditional check. The post-run side of our code shall determine
      * if it needs to sync. the virtual APIC TPR with the TPR-shadow.
      */
+    //优化目的：避免每次访问虚拟 APIC 页面，通过缓存提升性能。
+    //后续同步：在 hmR0VmxPostRunGuest 中对比并更新实际 TPR 值。
     if (pVmcsInfo->pbVirtApic)
-        pVmxTransient->u8GuestTpr = pVmcsInfo->pbVirtApic[XAPIC_OFF_TPR];
+        pVmxTransient->u8GuestTpr = pVmcsInfo->pbVirtApic[XAPIC_OFF_TPR];  // 缓存虚拟 APIC 的 TPR
 
     /*
      * Update the host MSRs values in the VM-exit MSR-load area.
      */
+    /*
+       作用：确保 VM-exit 后宿主 MSR（如 FSBASE、KERNEL_GSBASE）正确恢复。
+       触发条件：首次执行或检测到 CPU 迁移。
+    */
     if (!pVCpu->hmr0.s.vmx.fUpdatedHostAutoMsrs)
     {
         if (pVmcsInfo->cExitMsrLoad > 0)
-            hmR0VmxUpdateAutoLoadHostMsrs(pVCpu, pVmcsInfo);
+            hmR0VmxUpdateAutoLoadHostMsrs(pVCpu, pVmcsInfo); // 刷新 VM-exit 时加载的宿主 MSR 值
         pVCpu->hmr0.s.vmx.fUpdatedHostAutoMsrs = true;
     }
 
@@ -6163,9 +6356,16 @@ static void hmR0VmxPreRunGuestCommitted(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransi
      * Evaluate if we need to intercept guest RDTSC/P accesses. Set up the
      * VMX-preemption timer based on the next virtual sync clock deadline.
      */
+    //TSC 拦截策略与preemption 定时器
     if (   !pVmxTransient->fUpdatedTscOffsettingAndPreemptTimer
         || idCurrentCpu != pVCpu->hmr0.s.idLastCpu)
     {
+        /*
+          动态决策：
+             TSC 偏移：通过计算 TSC = Host_TSC + Offset 避免拦截 RDTSC/P。
+             拦截 RDTSC/P：当无法通过偏移满足时间同步需求时（如高频率时钟）。
+          preemption 定时器：设置倒计时值（基于虚拟同步时钟），触发 VM-exit 实现时间片轮转。
+        */
         hmR0VmxUpdateTscOffsettingAndPreemptTimer(pVCpu, pVmxTransient, idCurrentCpu);
         pVmxTransient->fUpdatedTscOffsettingAndPreemptTimer = true;
     }
@@ -6178,7 +6378,13 @@ static void hmR0VmxPreRunGuestCommitted(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransi
         STAM_COUNTER_INC(&pVCpu->hm.s.StatTscIntercept);
 
     ASMAtomicUoWriteBool(&pVCpu->hm.s.fCheckedTLBFlush, true);  /* Used for TLB flushing, set this across the world switch. */
-    hmR0VmxFlushTaggedTlb(pHostCpu, pVCpu, pVmcsInfo);          /* Invalidate the appropriate guest entries from the TLB. */
+    /*
+     策略选择：
+       VPID（Virtual Processor ID）：若支持，仅刷新当前 VPID 关联的 TLB 条目。
+       Full Invalidation：无 VPID 时执行完整 TLB 刷新。
+     触发条件：客户机 CR3 变更或强制刷新标记（如跨 CPU 迁移后）。
+    */
+    hmR0VmxFlushTaggedTlb(pHostCpu, pVCpu, pVmcsInfo);          /* Invalidate the appropriate guest entries from the TLB. */ // 按需刷新 TLB
     Assert(idCurrentCpu == pVCpu->hmr0.s.idLastCpu);
     pVCpu->hm.s.vmx.LastError.idCurrentCpu = idCurrentCpu;      /* Record the error reporting info. with the current host CPU. */
     pVmcsInfo->idHostCpuState = idCurrentCpu;                   /* Record the CPU for which the host-state has been exported. */
@@ -6203,16 +6409,26 @@ static void hmR0VmxPreRunGuestCommitted(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransi
 
         /* NB: Because we call hmR0VmxAddAutoLoadStoreMsr with fUpdateHostMsr=true,
            it's safe even after hmR0VmxUpdateAutoLoadHostMsrs has already been done. */
+        /*
+           条件：启用 RDTSCP 且未拦截 RDTSC/P。
+           目的：允许客户机直接读取正确的 TSC_AUX 值，无需 Hypervisor 介入。
+        */
         int rc = hmR0VmxAddAutoLoadStoreMsr(pVCpu, pVmxTransient, MSR_K8_TSC_AUX, CPUMGetGuestTscAux(pVCpu),
-                                            true /* fSetReadWrite */, true /* fUpdateHostMsr */);
+                                            true /* fSetReadWrite */, true /* fUpdateHostMsr */);// 动态添加 TSC_AUX 到自动加载区
         AssertRC(rc);
         Assert(!pVmxTransient->fRemoveTscAuxMsr);
         pVmxTransient->fRemoveTscAuxMsr = true;
     }
 
+    /*
+     在调试版本中捕获以下问题：
+        无效的客户机控制寄存器配置。
+        MSR 自动加载区未正确初始化。
+        宿主 EFER MSR 被意外修改。
+    */
 #ifdef VBOX_STRICT
     Assert(pVCpu->hmr0.s.vmx.fUpdatedHostAutoMsrs);
-    hmR0VmxCheckAutoLoadStoreMsrs(pVCpu, pVmcsInfo, pVmxTransient->fIsNestedGuest);
+    hmR0VmxCheckAutoLoadStoreMsrs(pVCpu, pVmcsInfo, pVmxTransient->fIsNestedGuest);// 检查自动加载 MSR 配置
     hmR0VmxCheckHostEferMsr(pVmcsInfo);
     AssertRC(vmxHCCheckCachedVmcsCtls(pVCpu, pVmcsInfo, pVmxTransient->fIsNestedGuest));
 #endif
@@ -6221,7 +6437,7 @@ static void hmR0VmxPreRunGuestCommitted(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransi
     /** @todo r=ramshankar: We can now probably use iemVmxVmentryCheckGuestState here.
      *        Add a PVMXMSRS parameter to it, so that IEM can look at the host MSRs,
      *        see @bugref{9180#c54}. */
-    uint32_t const uInvalidReason = hmR0VmxCheckGuestState(pVCpu, pVmcsInfo);
+    uint32_t const uInvalidReason = hmR0VmxCheckGuestState(pVCpu, pVmcsInfo);// 验证客户机状态合法性
     if (uInvalidReason != VMX_IGS_REASON_NOT_FOUND)
         Log4(("hmR0VmxCheckGuestState returned %#x\n", uInvalidReason));
 #endif
@@ -6240,16 +6456,26 @@ static void hmR0VmxPreRunGuestCommitted(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransi
  * @remarks No-long-jump zone!!! This function will however re-enable longjmps
  *          unconditionally when it is safe to do so.
  */
+/*
+hmR0VmxPostRunGuest 负责处理客户机代码通过 VMLAUNCH/VMRESUME 执行后的 VM-exit 场景，主要完成以下任务：
+  状态清理：重置全局标记、恢复主机状态。
+  性能统计：记录 Guest 执行时间。
+  VM-exit 处理：分析退出原因并记录日志。
+  上下文同步：同步 Guest 寄存器状态（如 RFLAGS、APIC TPR）。
+  错误处理：检测 VM-entry 失败等异常情况。
+*/
 static void hmR0VmxPostRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient, int rcVMRun)
 {
-    ASMAtomicUoWriteBool(&pVCpu->hm.s.fCheckedTLBFlush, false); /* See HMInvalidatePageOnAllVCpus(): used for TLB flushing. */
-    ASMAtomicIncU32(&pVCpu->hmr0.s.cWorldSwitchExits);          /* Initialized in vmR3CreateUVM(): used for EMT poking. */
-    pVCpu->hm.s.fCtxChanged            = 0;                     /* Exits/longjmps to ring-3 requires saving the guest state. */
-    pVmxTransient->fVmcsFieldsRead     = 0;                     /* Transient fields need to be read from the VMCS. */
+    //为下一次 VM-entry 做准备，确保状态一致性。
+    ASMAtomicUoWriteBool(&pVCpu->hm.s.fCheckedTLBFlush, false); /* See HMInvalidatePageOnAllVCpus(): used for TLB flushing. */ // 清除 TLB 刷新标记
+    ASMAtomicIncU32(&pVCpu->hmr0.s.cWorldSwitchExits);          /* Initialized in vmR3CreateUVM(): used for EMT poking. */// 增加世界切换计数器
+    pVCpu->hm.s.fCtxChanged            = 0;                     /* Exits/longjmps to ring-3 requires saving the guest state. */// 清除上下文变更标记
+    pVmxTransient->fVmcsFieldsRead     = 0;                     /* Transient fields need to be read from the VMCS. */// 标记 VMCS 字段需重新读取
     pVmxTransient->fVectoringPF        = false;                 /* Vectoring page-fault needs to be determined later. */
     pVmxTransient->fVectoringDoublePF  = false;                 /* Vectoring double page-fault needs to be determined later. */
 
     PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+    //当未拦截 RDTSC 指令时，需手动计算 Guest 的 TSC 值（基于主机 TSC + 偏移量）。
     if (!(pVmcsInfo->u32ProcCtls & VMX_PROC_CTLS_RDTSC_EXIT))
     {
         uint64_t uGstTsc;
@@ -6257,23 +6483,26 @@ static void hmR0VmxPostRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient, int
             uGstTsc = pVCpu->hmr0.s.uTscExit + pVmcsInfo->u64TscOffset;
         else
         {
+            //若为嵌套 Guest（Nested Guest），需额外移除嵌套层的 TSC 偏移。
             uint64_t const uNstGstTsc = pVCpu->hmr0.s.uTscExit + pVmcsInfo->u64TscOffset;
             uGstTsc = CPUMRemoveNestedGuestTscOffset(pVCpu, uNstGstTsc);
         }
         TMCpuTickSetLastSeen(pVCpu, uGstTsc);                           /* Update TM with the guest TSC. */
     }
 
+    //StatInGC: 记录 Guest 执行时间。
+    //StatPreExit：开始统计退出处理时间。
     STAM_PROFILE_ADV_STOP_START(&pVCpu->hm.s.StatInGC, &pVCpu->hm.s.StatPreExit, x);
     TMNotifyEndOfExecution(pVCpu->CTX_SUFF(pVM), pVCpu, pVCpu->hmr0.s.uTscExit); /* Notify TM that the guest is no longer running. */
     VMCPU_SET_STATE(pVCpu, VMCPUSTATE_STARTED_HM);
 
-    pVCpu->hmr0.s.vmx.fRestoreHostFlags |= VMX_RESTORE_HOST_REQUIRED;   /* Some host state messed up by VMX needs restoring. */
-    pVmcsInfo->fVmcsState = VMX_V_VMCS_LAUNCH_STATE_LAUNCHED;           /* Use VMRESUME instead of VMLAUNCH in the next run. */
+    pVCpu->hmr0.s.vmx.fRestoreHostFlags |= VMX_RESTORE_HOST_REQUIRED;   /* Some host state messed up by VMX needs restoring. *///标记需恢复主机状态（如调试寄存器）。
+    pVmcsInfo->fVmcsState = VMX_V_VMCS_LAUNCH_STATE_LAUNCHED;           /* Use VMRESUME instead of VMLAUNCH in the next run. */  // 下次使用 VMRESUME
 #ifdef VBOX_STRICT
     hmR0VmxCheckHostEferMsr(pVmcsInfo);                                 /* Verify that the host EFER MSR wasn't modified. */
 #endif
     Assert(!ASMIntAreEnabled());
-    ASMSetFlags(pVmxTransient->fEFlags);                                /* Enable interrupts. */
+    ASMSetFlags(pVmxTransient->fEFlags);                                /* Enable interrupts. */   // 恢复中断状态
     Assert(!VMMRZCallRing3IsEnabled(pVCpu));
 
 #ifdef HMVMX_ALWAYS_CLEAN_TRANSIENT
@@ -6300,21 +6529,24 @@ static void hmR0VmxPostRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient, int
      * See Intel spec. 24.9.1 "Basic VM-exit Information".
      */
     uint32_t uExitReason;
+    //从 VMCS 中获取退出原因（如外部中断、EPT 违规等）。
     int rc = VMXReadVmcs32(VMX_VMCS32_RO_EXIT_REASON, &uExitReason);
     AssertRC(rc);
     pVmxTransient->uExitReason    = VMX_EXIT_REASON_BASIC(uExitReason);
+    //若 fVMEntryFailed 为真，表示 VM-entry 因无效状态或 MSR 加载失败。
     pVmxTransient->fVMEntryFailed = VMX_EXIT_REASON_HAS_ENTRY_FAILED(uExitReason);
 
     /*
      * Log the VM-exit before logging anything else as otherwise it might be a
      * tad confusing what happens before and after the world-switch.
      */
-    HMVMX_LOG_EXIT(pVCpu, uExitReason);
+    HMVMX_LOG_EXIT(pVCpu, uExitReason);// 记录退出日志
 
     /*
      * Remove the TSC_AUX MSR from the auto-load/store MSR area and reset any MSR
      * bitmap permissions, if it was added before VM-entry.
      */
+    //若之前为调试临时添加了 TSC_AUX MSR，现在需移除，避免影响非调试执行
     if (pVmxTransient->fRemoveTscAuxMsr)
     {
         hmR0VmxRemoveAutoLoadStoreMsr(pVCpu, pVmxTransient, MSR_K8_TSC_AUX);
@@ -6372,10 +6604,13 @@ static void hmR0VmxPostRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient, int
              * explicitly in the exit handlers and injection function.  That way we have
              * fewer clusters of vmread spread around the code, because the EM history
              * executor won't execute very many non-exiting instructions before stopping. */
+            //Guest 状态同步
+            //中断/NMI 屏蔽状态：确保后续事件注入正确。
             rc = vmxHCImportGuestState<  CPUMCTX_EXTRN_INHIBIT_INT
                                        | CPUMCTX_EXTRN_INHIBIT_NMI
 #if defined(HMVMX_ALWAYS_SYNC_FULL_GUEST_STATE) || defined(HMVMX_ALWAYS_SAVE_FULL_GUEST_STATE)
                                        | HMVMX_CPUMCTX_EXTRN_ALL
+                                       //RFLAGS：部分配置下强制同步（如 HMVMX_ALWAYS_SAVE_GUEST_RFLAGS）。
 #elif defined(HMVMX_ALWAYS_SAVE_GUEST_RFLAGS)
                                        | CPUMCTX_EXTRN_RFLAGS
 #endif
@@ -6385,13 +6620,15 @@ static void hmR0VmxPostRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient, int
             /*
              * Sync the TPR shadow with our APIC state.
              */
+            // APIC TPR 同步
             if (   !pVmxTransient->fIsNestedGuest
                 && (pVmcsInfo->u32ProcCtls & VMX_PROC_CTLS_USE_TPR_SHADOW))
             {
                 Assert(pVmcsInfo->pbVirtApic);
                 if (pVmxTransient->u8GuestTpr != pVmcsInfo->pbVirtApic[XAPIC_OFF_TPR])
                 {
-                    rc = APICSetTpr(pVCpu, pVmcsInfo->pbVirtApic[XAPIC_OFF_TPR]);
+                    //当使用 TPR 影子机制时，需确保 Guest 的 TPR（任务优先级）与虚拟 APIC 一致。
+                    rc = APICSetTpr(pVCpu, pVmcsInfo->pbVirtApic[XAPIC_OFF_TPR]);// 同步虚拟 APIC 的 TPR
                     AssertRC(rc);
                     ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_APIC_TPR);
                 }
@@ -6421,6 +6658,11 @@ static void hmR0VmxPostRunGuest(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient, int
  * @param   pVCpu       The cross context virtual CPU structure.
  * @param   pcLoops     Pointer to the number of executed loops.
  */
+/*
+  非嵌套虚拟化场景下的Guest OS代码执行
+  完整的VMEntry/VMExit生命周期管理
+  性能关键路径优化（通过Normal后缀区别于调试路径）
+*/
 static VBOXSTRICTRC hmR0VmxRunGuestCodeNormal(PVMCPUCC pVCpu, uint32_t *pcLoops)
 {
     uint32_t const cMaxResumeLoops = pVCpu->CTX_SUFF(pVM)->hmr0.s.cMaxResumeLoops;
@@ -6449,17 +6691,22 @@ static VBOXSTRICTRC hmR0VmxRunGuestCodeNormal(PVMCPUCC pVCpu, uint32_t *pcLoops)
 
     VMXTRANSIENT VmxTransient;
     RT_ZERO(VmxTransient);
+    //获取当前VMCS
     VmxTransient.pVmcsInfo = hmGetVmxActiveVmcsInfo(pVCpu);
+    //嵌套虚拟化切换检查
     Assert(!pVCpu->hmr0.s.vmx.fSwitchedToNstGstVmcs);
 
     /* Paranoia. */
+    //断言确保VMCS一致性：
     Assert(VmxTransient.pVmcsInfo == &pVCpu->hmr0.s.vmx.VmcsInfo);
 
     VBOXSTRICTRC rcStrict = VERR_INTERNAL_ERROR_5;
     for (;;)
     {
         Assert(!HMR0SuspendPending());
+        //保证CPU处于安全状态
         HMVMX_ASSERT_CPU_SAFE(pVCpu);
+        //整体执行耗时
         STAM_PROFILE_ADV_START(&pVCpu->hm.s.StatEntry, x);
 
         /*
@@ -6468,23 +6715,27 @@ static VBOXSTRICTRC hmR0VmxRunGuestCodeNormal(PVMCPUCC pVCpu, uint32_t *pcLoops)
          *
          * Warning! This bugger disables interrupts on VINF_SUCCESS!
          */
+        //  准备阶段
         rcStrict = hmR0VmxPreRunGuest(pVCpu, &VmxTransient, false /* fStepping */);
         if (rcStrict != VINF_SUCCESS)
             break;
 
+        //  关键执行区（中断禁用）
         /* Interrupts are disabled at this point! */
         hmR0VmxPreRunGuestCommitted(pVCpu, &VmxTransient);
-        int rcRun = hmR0VmxRunGuest(pVCpu, &VmxTransient);
+        int rcRun = hmR0VmxRunGuest(pVCpu, &VmxTransient); // 实际执行VMLAUNCH/VMRESUME
         hmR0VmxPostRunGuest(pVCpu, &VmxTransient, rcRun);
         /* Interrupts are re-enabled at this point! */
 
         /*
          * Check for errors with running the VM (VMLAUNCH/VMRESUME).
          */
+        // 错误处理
         if (RT_SUCCESS(rcRun))
         { /* very likely */ }
         else
         {
+            //VMExit前处理时间
             STAM_PROFILE_ADV_STOP(&pVCpu->hm.s.StatPreExit, x);
             hmR0VmxReportWorldSwitchError(pVCpu, rcRun, &VmxTransient);
             return rcRun;
@@ -6495,7 +6746,9 @@ static VBOXSTRICTRC hmR0VmxRunGuestCodeNormal(PVMCPUCC pVCpu, uint32_t *pcLoops)
          */
         AssertMsg(VmxTransient.uExitReason <= VMX_EXIT_MAX, ("%#x\n", VmxTransient.uExitReason));
         STAM_COUNTER_INC(&pVCpu->hm.s.StatExitAll);
+        //各Exit原因出现次数
         STAM_COUNTER_INC(&pVCpu->hm.s.aStatExitReason[VmxTransient.uExitReason & MASK_EXITREASON_STAT]);
+        //Exit原因处理时间
         STAM_PROFILE_ADV_STOP_START(&pVCpu->hm.s.StatPreExit, &pVCpu->hm.s.StatExitHandling, x);
         HMVMX_START_EXIT_DISPATCH_PROF();
 
@@ -6504,14 +6757,18 @@ static VBOXSTRICTRC hmR0VmxRunGuestCodeNormal(PVMCPUCC pVCpu, uint32_t *pcLoops)
         /*
          * Handle the VM-exit.
          */
+        // 通过函数表或统一处理
 #ifdef HMVMX_USE_FUNCTION_TABLE
         rcStrict = g_aVMExitHandlers[VmxTransient.uExitReason].pfn(pVCpu, &VmxTransient);
 #else
+        //  VMExit处理
         rcStrict = hmR0VmxHandleExit(pVCpu, &VmxTransient);
 #endif
+        // 性能统计
         STAM_PROFILE_ADV_STOP(&pVCpu->hm.s.StatExitHandling, x);
         if (rcStrict == VINF_SUCCESS)
         {
+            //  循环控制
             if (++(*pcLoops) <= cMaxResumeLoops)
                 continue;
             STAM_COUNTER_INC(&pVCpu->hm.s.StatSwitchMaxResumeLoops);
@@ -6680,6 +6937,20 @@ static VBOXSTRICTRC hmR0VmxRunGuestCodeNested(PVMCPUCC pVCpu, uint32_t *pcLoops)
  *
  * @note    Mostly the same as hmR0VmxRunGuestCodeNormal().
  */
+/*
+  1.单步调试支持（Single-stepping）
+  2.调试相关 VM-exit 处理
+  3.控制循环执行（防止无限循环）
+  4.状态保存与恢复（确保调试不影响正常执行流）
+*/
+/*
+Trap Flag（TF）
+  通过设置 EFLAGS.TF 使 CPU 在执行一条指令后触发 #DB 异常（实现单步）。
+VMCS 控制字段
+  动态调整 VMCS 中的 Exception Bitmap 和 Debug Controls 以捕获调试事件。
+DTrace 集成
+  通过 VBOXVMM_GET_SETTINGS_SEQ_NO 检测动态跟踪配置变更。
+*/
 static VBOXSTRICTRC hmR0VmxRunGuestCodeDebug(PVMCPUCC pVCpu, uint32_t *pcLoops)
 {
     uint32_t const cMaxResumeLoops = pVCpu->CTX_SUFF(pVM)->hmr0.s.cMaxResumeLoops;
@@ -6688,12 +6959,15 @@ static VBOXSTRICTRC hmR0VmxRunGuestCodeDebug(PVMCPUCC pVCpu, uint32_t *pcLoops)
 
     VMXTRANSIENT VmxTransient;
     RT_ZERO(VmxTransient);
+    //临时存储 VMX 执行状态的上下文结构体（如 VMCS 指针、退出原因等）
     VmxTransient.pVmcsInfo = hmGetVmxActiveVmcsInfo(pVCpu);
 
     /* Set HMCPU indicators.  */
+    //fSingleInstruction标记是否启用单步执行（通过调试器或内部标志触发）。
     bool const fSavedSingleInstruction = pVCpu->hm.s.fSingleInstruction;
     pVCpu->hm.s.fSingleInstruction     = pVCpu->hm.s.fSingleInstruction || DBGFIsStepping(pVCpu);
     pVCpu->hmr0.s.fDebugWantRdTscExit    = false;
+    //fUsingDebugLoop：进入调试专用循环模式。
     pVCpu->hmr0.s.fUsingDebugLoop        = true;
 
     /* State we keep to help modify and later restore the VMCS fields we alter, and for detecting steps.  */
@@ -6707,11 +6981,14 @@ static VBOXSTRICTRC hmR0VmxRunGuestCodeDebug(PVMCPUCC pVCpu, uint32_t *pcLoops)
     VBOXSTRICTRC rcStrict  = VERR_INTERNAL_ERROR_5;
     for (;;)
     {
+        // 检查中断挂起、确保 CPU 安全状态
         Assert(!HMR0SuspendPending());
         HMVMX_ASSERT_CPU_SAFE(pVCpu);
+
         STAM_PROFILE_ADV_START(&pVCpu->hm.s.StatEntry, x);
         bool fStepping = pVCpu->hm.s.fSingleInstruction;
 
+        // 应用调试相关的 VMCS 控制字段
         /* Set up VM-execution controls the next two can respond to. */
         vmxHCPreRunGuestDebugStateApply(pVCpu, &VmxTransient, &DbgState);
 
@@ -6721,6 +6998,7 @@ static VBOXSTRICTRC hmR0VmxRunGuestCodeDebug(PVMCPUCC pVCpu, uint32_t *pcLoops)
          *
          * Warning! This bugger disables interrupts on VINF_SUCCESS!
          */
+        // 准备执行客户机代码（可能触发环3切换）
         rcStrict = hmR0VmxPreRunGuest(pVCpu, &VmxTransient, fStepping);
         if (rcStrict != VINF_SUCCESS)
             break;
@@ -6734,6 +7012,8 @@ static VBOXSTRICTRC hmR0VmxRunGuestCodeDebug(PVMCPUCC pVCpu, uint32_t *pcLoops)
         /*
          * Finally execute the guest.
          */
+        // 提交状态并执行客户机（VMLAUNCH/VMRESUME）
+        // 通过 VT-x 指令（如 VMRESUME）实际运行客户机代码。
         int rcRun = hmR0VmxRunGuest(pVCpu, &VmxTransient);
 
         hmR0VmxPostRunGuest(pVCpu, &VmxTransient, rcRun);
@@ -6761,10 +7041,13 @@ static VBOXSTRICTRC hmR0VmxRunGuestCodeDebug(PVMCPUCC pVCpu, uint32_t *pcLoops)
         /*
          * Handle the VM-exit - we quit earlier on certain VM-exits, see hmR0VmxHandleExitDebug().
          */
+        // 处理 VM-exit
         rcStrict = vmxHCRunDebugHandleExit(pVCpu, &VmxTransient, &DbgState);
         STAM_PROFILE_ADV_STOP(&pVCpu->hm.s.StatExitHandling, x);
         if (rcStrict != VINF_SUCCESS)
             break;
+        // 防止无限循环
+        //cMaxResumeLoops 最大循环次数限制，避免因频繁 VM-exit 导致死循环。
         if (++(*pcLoops) > cMaxResumeLoops)
         {
             STAM_COUNTER_INC(&pVCpu->hm.s.StatSwitchMaxResumeLoops);
@@ -6780,6 +7063,7 @@ static VBOXSTRICTRC hmR0VmxRunGuestCodeDebug(PVMCPUCC pVCpu, uint32_t *pcLoops)
         {
             int rc = vmxHCImportGuestStateEx(pVCpu, VmxTransient.pVmcsInfo, CPUMCTX_EXTRN_CS | CPUMCTX_EXTRN_RIP);
             AssertRC(rc);
+            //比较 RIP/CS 寄存器是否变化，若变化则判定为单步完成。
             if (   pVCpu->cpum.GstCtx.rip    != DbgState.uRipStart
                 || pVCpu->cpum.GstCtx.cs.Sel != DbgState.uCsStart)
             {
@@ -6803,6 +7087,7 @@ static VBOXSTRICTRC hmR0VmxRunGuestCodeDebug(PVMCPUCC pVCpu, uint32_t *pcLoops)
     /*
      * Clear the X86_EFL_TF if necessary.
      */
+    //恢复 CPU 标志位（如 TF）并重置调试状态。
     if (pVCpu->hmr0.s.fClearTrapFlag)
     {
         int rc = vmxHCImportGuestStateEx(pVCpu, VmxTransient.pVmcsInfo, CPUMCTX_EXTRN_RFLAGS);
@@ -6835,6 +7120,42 @@ static VBOXSTRICTRC hmR0VmxRunGuestCodeDebug(PVMCPUCC pVCpu, uint32_t *pcLoops)
  *
  * @returns true if we should use debug loop, false if not.
  */
+//该函数用于快速检测是否启用了任何昂贵的 VMX 探针（probes），
+//这些探针会影响虚拟机的性能。如果启用了任何探针，VirtualBox 可能需要切换到调试模式
+//（hmR0VmxRunGuestCodeDebug）而不是快速路径模式（hmR0VmxRunGuestCodeNormal）。
+//避免逐个条件判断：
+//  直接对多个探针标志进行位或（OR）运算，而不是逐个检查，以减少分支预测开销。
+//缓存友好性：
+//  由于探针标志存储在相邻的内存位置（数组或结构体），一次性读取多个标志可以减少缓存行（cache line）访问次数。
+/*
+ *. VMExit事件分类‌
+这些事件可分为以下几类：
+
+特权指令执行
+  指令	           作用
+  LTR	           加载任务寄存器
+  GETSEC	       进入安全模式（Intel TXT）
+  RSM	           从系统管理模式（SMM）返回
+  RDRAND/RDSEED	   读取硬件随机数
+  XSAVES/XRSTORS   保存/恢复扩展处理器状态（用于AVX等指令集）
+
+  VMX相关操作
+  指令	             作用
+  VMCLEAR	         初始化VMCS区域
+  VMLAUNCH/VMRESUME	 启动/恢复虚拟机
+  VMPTRLD/VMPTRST	 加载/存储VMCS指针
+  VMREAD/VMWRITE	 读写VMCS字段
+  VMXOFF/VMXON	     关闭/开启VMX模式
+  VMFUNC	         VMX功能调用（用于嵌套虚拟化）
+
+  内存虚拟化事件
+  事件	            触发条件
+  INVEPT	        扩展页表（EPT）失效操作
+  INVVPID/INVPCID	虚拟处理器ID/TLB失效操作
+  EPT_VIOLATION	    EPT页访问违规（如权限不足）
+  EPT_MISCONFIG	    EPT配置错误
+  VAPIC_ACCESS/VAPIC_WRITE	虚拟APIC（高级可编程中断控制器）访问/写
+ * */
 static bool hmR0VmxAnyExpensiveProbesEnabled(void)
 {
     /* It's probably faster to OR the raw 32-bit counter variables together.
@@ -6842,89 +7163,91 @@ static bool hmR0VmxAnyExpensiveProbesEnabled(void)
        another (more or less), we have good locality.  So, better read
        eight-nine cache lines ever time and only have one conditional, than
        128+ conditionals, right? */
-    return (  VBOXVMM_R0_HMVMX_VMEXIT_ENABLED_RAW() /* expensive too due to context */
-            | VBOXVMM_XCPT_DE_ENABLED_RAW()
-            | VBOXVMM_XCPT_DB_ENABLED_RAW()
-            | VBOXVMM_XCPT_BP_ENABLED_RAW()
-            | VBOXVMM_XCPT_OF_ENABLED_RAW()
+    return (  VBOXVMM_R0_HMVMX_VMEXIT_ENABLED_RAW() /* expensive too due to context */// VMExit 事件
+            | VBOXVMM_XCPT_DE_ENABLED_RAW()// #DE（除零异常）
+            | VBOXVMM_XCPT_DB_ENABLED_RAW()// #DB（调试异常）
+            | VBOXVMM_XCPT_BP_ENABLED_RAW()// #BP（断点异常）
+            | VBOXVMM_XCPT_OF_ENABLED_RAW()// #OF（溢出异常）
             | VBOXVMM_XCPT_BR_ENABLED_RAW()
-            | VBOXVMM_XCPT_UD_ENABLED_RAW()
-            | VBOXVMM_XCPT_NM_ENABLED_RAW()
-            | VBOXVMM_XCPT_DF_ENABLED_RAW()
-            | VBOXVMM_XCPT_TS_ENABLED_RAW()
-            | VBOXVMM_XCPT_NP_ENABLED_RAW()
-            | VBOXVMM_XCPT_SS_ENABLED_RAW()
-            | VBOXVMM_XCPT_GP_ENABLED_RAW()
-            | VBOXVMM_XCPT_PF_ENABLED_RAW()
-            | VBOXVMM_XCPT_MF_ENABLED_RAW()
-            | VBOXVMM_XCPT_AC_ENABLED_RAW()
-            | VBOXVMM_XCPT_XF_ENABLED_RAW()
-            | VBOXVMM_XCPT_VE_ENABLED_RAW()
-            | VBOXVMM_XCPT_SX_ENABLED_RAW()
+            | VBOXVMM_XCPT_UD_ENABLED_RAW()//#UD（无效指令）
+            | VBOXVMM_XCPT_NM_ENABLED_RAW()//#NM（设备不可用）
+            | VBOXVMM_XCPT_DF_ENABLED_RAW()// #DF（双重错误）
+            | VBOXVMM_XCPT_TS_ENABLED_RAW()// #TS（无效 TSS）
+            | VBOXVMM_XCPT_NP_ENABLED_RAW()// #NP（段不存在）
+            | VBOXVMM_XCPT_SS_ENABLED_RAW()// #SS（栈错误）
+            | VBOXVMM_XCPT_GP_ENABLED_RAW() // #GP（一般保护错误）
+            | VBOXVMM_XCPT_PF_ENABLED_RAW()// #PF（页错误）
+            | VBOXVMM_XCPT_MF_ENABLED_RAW()// #MF（浮点错误）
+            | VBOXVMM_XCPT_AC_ENABLED_RAW()// #AC（对齐检查）
+            | VBOXVMM_XCPT_XF_ENABLED_RAW()// #XF（SIMD 浮点异常）
+            | VBOXVMM_XCPT_VE_ENABLED_RAW() // #VE（虚拟化异常）
+            | VBOXVMM_XCPT_SX_ENABLED_RAW() // #SX（安全异常）
             | VBOXVMM_INT_SOFTWARE_ENABLED_RAW()
             | VBOXVMM_INT_HARDWARE_ENABLED_RAW()
            ) != 0
-        || (  VBOXVMM_INSTR_HALT_ENABLED_RAW()
-            | VBOXVMM_INSTR_MWAIT_ENABLED_RAW()
-            | VBOXVMM_INSTR_MONITOR_ENABLED_RAW()
-            | VBOXVMM_INSTR_CPUID_ENABLED_RAW()
-            | VBOXVMM_INSTR_INVD_ENABLED_RAW()
-            | VBOXVMM_INSTR_WBINVD_ENABLED_RAW()
-            | VBOXVMM_INSTR_INVLPG_ENABLED_RAW()
-            | VBOXVMM_INSTR_RDTSC_ENABLED_RAW()
-            | VBOXVMM_INSTR_RDTSCP_ENABLED_RAW()
-            | VBOXVMM_INSTR_RDPMC_ENABLED_RAW()
-            | VBOXVMM_INSTR_RDMSR_ENABLED_RAW()
-            | VBOXVMM_INSTR_WRMSR_ENABLED_RAW()
-            | VBOXVMM_INSTR_CRX_READ_ENABLED_RAW()
-            | VBOXVMM_INSTR_CRX_WRITE_ENABLED_RAW()
-            | VBOXVMM_INSTR_DRX_READ_ENABLED_RAW()
-            | VBOXVMM_INSTR_DRX_WRITE_ENABLED_RAW()
-            | VBOXVMM_INSTR_PAUSE_ENABLED_RAW()
-            | VBOXVMM_INSTR_XSETBV_ENABLED_RAW()
-            | VBOXVMM_INSTR_SIDT_ENABLED_RAW()
-            | VBOXVMM_INSTR_LIDT_ENABLED_RAW()
-            | VBOXVMM_INSTR_SGDT_ENABLED_RAW()
-            | VBOXVMM_INSTR_LGDT_ENABLED_RAW()
-            | VBOXVMM_INSTR_SLDT_ENABLED_RAW()
-            | VBOXVMM_INSTR_LLDT_ENABLED_RAW()
-            | VBOXVMM_INSTR_STR_ENABLED_RAW()
-            | VBOXVMM_INSTR_LTR_ENABLED_RAW()
-            | VBOXVMM_INSTR_GETSEC_ENABLED_RAW()
-            | VBOXVMM_INSTR_RSM_ENABLED_RAW()
-            | VBOXVMM_INSTR_RDRAND_ENABLED_RAW()
-            | VBOXVMM_INSTR_RDSEED_ENABLED_RAW()
-            | VBOXVMM_INSTR_XSAVES_ENABLED_RAW()
-            | VBOXVMM_INSTR_XRSTORS_ENABLED_RAW()
-            | VBOXVMM_INSTR_VMM_CALL_ENABLED_RAW()
-            | VBOXVMM_INSTR_VMX_VMCLEAR_ENABLED_RAW()
-            | VBOXVMM_INSTR_VMX_VMLAUNCH_ENABLED_RAW()
-            | VBOXVMM_INSTR_VMX_VMPTRLD_ENABLED_RAW()
-            | VBOXVMM_INSTR_VMX_VMPTRST_ENABLED_RAW()
-            | VBOXVMM_INSTR_VMX_VMREAD_ENABLED_RAW()
-            | VBOXVMM_INSTR_VMX_VMRESUME_ENABLED_RAW()
-            | VBOXVMM_INSTR_VMX_VMWRITE_ENABLED_RAW()
-            | VBOXVMM_INSTR_VMX_VMXOFF_ENABLED_RAW()
-            | VBOXVMM_INSTR_VMX_VMXON_ENABLED_RAW()
-            | VBOXVMM_INSTR_VMX_VMFUNC_ENABLED_RAW()
-            | VBOXVMM_INSTR_VMX_INVEPT_ENABLED_RAW()
-            | VBOXVMM_INSTR_VMX_INVVPID_ENABLED_RAW()
-            | VBOXVMM_INSTR_VMX_INVPCID_ENABLED_RAW()
+           //特权指令
+        || (  VBOXVMM_INSTR_HALT_ENABLED_RAW() // HLT（停机指令）
+            | VBOXVMM_INSTR_MWAIT_ENABLED_RAW()// MWAIT（等待指令）
+            | VBOXVMM_INSTR_MONITOR_ENABLED_RAW() // MONITOR（监控指令）
+            | VBOXVMM_INSTR_CPUID_ENABLED_RAW() // CPUID（获取 CPU 信息）
+            | VBOXVMM_INSTR_INVD_ENABLED_RAW()// INVD（缓存失效）
+            | VBOXVMM_INSTR_WBINVD_ENABLED_RAW()// WBINVD（写回缓存失效）
+            | VBOXVMM_INSTR_INVLPG_ENABLED_RAW()// INVLPG（TLB 失效）
+            | VBOXVMM_INSTR_RDTSC_ENABLED_RAW()// RDTSC（读取时间戳）
+            | VBOXVMM_INSTR_RDTSCP_ENABLED_RAW() // RDTSCP（带处理器 ID 的时间戳）
+            | VBOXVMM_INSTR_RDPMC_ENABLED_RAW()// RDPMC（读取性能计数器）
+            | VBOXVMM_INSTR_RDMSR_ENABLED_RAW()// RDMSR（读取 MSR）
+            | VBOXVMM_INSTR_WRMSR_ENABLED_RAW() // WRMSR（写入 MSR）
+            | VBOXVMM_INSTR_CRX_READ_ENABLED_RAW()// 读取控制寄存器（CR0-CR4）
+            | VBOXVMM_INSTR_CRX_WRITE_ENABLED_RAW() // 写入控制寄存器
+            | VBOXVMM_INSTR_DRX_READ_ENABLED_RAW()// 读取调试寄存器（DR0-DR7）
+            | VBOXVMM_INSTR_DRX_WRITE_ENABLED_RAW()// 写入调试寄存器
+            | VBOXVMM_INSTR_PAUSE_ENABLED_RAW()// PAUSE（暂停指令）
+            | VBOXVMM_INSTR_XSETBV_ENABLED_RAW()// XSETBV（设置扩展控制寄存器）
+            | VBOXVMM_INSTR_SIDT_ENABLED_RAW()// SIDT（存储 IDT）
+            | VBOXVMM_INSTR_LIDT_ENABLED_RAW()// LIDT（加载 IDT）
+            | VBOXVMM_INSTR_SGDT_ENABLED_RAW() // SGDT（存储 GDT）
+            | VBOXVMM_INSTR_LGDT_ENABLED_RAW() // LGDT（加载 GDT）
+            | VBOXVMM_INSTR_SLDT_ENABLED_RAW() // SLDT（存储 LDT）
+            | VBOXVMM_INSTR_LLDT_ENABLED_RAW()// LLDT（加载 LDT）
+            | VBOXVMM_INSTR_STR_ENABLED_RAW() // STR（存储任务寄存器）
+            | VBOXVMM_INSTR_LTR_ENABLED_RAW()  // LTR（加载任务寄存器）
+            | VBOXVMM_INSTR_GETSEC_ENABLED_RAW() // GETSEC（安全指令）
+            | VBOXVMM_INSTR_RSM_ENABLED_RAW()// RSM（恢复系统管理模式）
+            | VBOXVMM_INSTR_RDRAND_ENABLED_RAW() // RDRAND（随机数指令）
+            | VBOXVMM_INSTR_RDSEED_ENABLED_RAW() // RDSEED（种子随机数指令）
+            | VBOXVMM_INSTR_XSAVES_ENABLED_RAW() // XSAVES（保存扩展状态）
+            | VBOXVMM_INSTR_XRSTORS_ENABLED_RAW()// XRSTORS（恢复扩展状态）
+            | VBOXVMM_INSTR_VMM_CALL_ENABLED_RAW() // VMMCALL（虚拟机管理调用）
+            | VBOXVMM_INSTR_VMX_VMCLEAR_ENABLED_RAW()// VMCLEAR（VMX 清理）
+            | VBOXVMM_INSTR_VMX_VMLAUNCH_ENABLED_RAW() // VMLAUNCH（VMX 启动）
+            | VBOXVMM_INSTR_VMX_VMPTRLD_ENABLED_RAW() // VMPTRLD（加载 VMCS 指针）
+            | VBOXVMM_INSTR_VMX_VMPTRST_ENABLED_RAW()// VMPTRST（存储 VMCS 指针）
+            | VBOXVMM_INSTR_VMX_VMREAD_ENABLED_RAW()  // VMREAD（读取 VMCS 字段）
+            | VBOXVMM_INSTR_VMX_VMRESUME_ENABLED_RAW() // VMRESUME（恢复 VMX 状态）
+            | VBOXVMM_INSTR_VMX_VMWRITE_ENABLED_RAW()// VMWRITE（写入 VMCS 字段）
+            | VBOXVMM_INSTR_VMX_VMXOFF_ENABLED_RAW() // VMXOFF（关闭 VMX）
+            | VBOXVMM_INSTR_VMX_VMXON_ENABLED_RAW()// VMXON（开启 VMX）
+            | VBOXVMM_INSTR_VMX_VMFUNC_ENABLED_RAW() // VMFUNC（VMX 功能调用）
+            | VBOXVMM_INSTR_VMX_INVEPT_ENABLED_RAW() // INVEPT（EPT 失效）
+            | VBOXVMM_INSTR_VMX_INVVPID_ENABLED_RAW()// INVVPID（VPID 失效）
+            | VBOXVMM_INSTR_VMX_INVPCID_ENABLED_RAW()// INVPCID（PCID 失效）
            ) != 0
-        || (  VBOXVMM_EXIT_TASK_SWITCH_ENABLED_RAW()
-            | VBOXVMM_EXIT_HALT_ENABLED_RAW()
-            | VBOXVMM_EXIT_MWAIT_ENABLED_RAW()
-            | VBOXVMM_EXIT_MONITOR_ENABLED_RAW()
-            | VBOXVMM_EXIT_CPUID_ENABLED_RAW()
-            | VBOXVMM_EXIT_INVD_ENABLED_RAW()
-            | VBOXVMM_EXIT_WBINVD_ENABLED_RAW()
-            | VBOXVMM_EXIT_INVLPG_ENABLED_RAW()
-            | VBOXVMM_EXIT_RDTSC_ENABLED_RAW()
-            | VBOXVMM_EXIT_RDTSCP_ENABLED_RAW()
+           //VMExit 事件（VM Exits）
+        || (  VBOXVMM_EXIT_TASK_SWITCH_ENABLED_RAW() // 任务切换
+            | VBOXVMM_EXIT_HALT_ENABLED_RAW()// HLT 退出
+            | VBOXVMM_EXIT_MWAIT_ENABLED_RAW()// MWAIT 退出
+            | VBOXVMM_EXIT_MONITOR_ENABLED_RAW()  // MONITOR 退出
+            | VBOXVMM_EXIT_CPUID_ENABLED_RAW() // CPUID 退出
+            | VBOXVMM_EXIT_INVD_ENABLED_RAW()// INVD 退出
+            | VBOXVMM_EXIT_WBINVD_ENABLED_RAW()// WBINVD 退出
+            | VBOXVMM_EXIT_INVLPG_ENABLED_RAW() // INVLPG 退出
+            | VBOXVMM_EXIT_RDTSC_ENABLED_RAW() // RDTSC 退出
+            | VBOXVMM_EXIT_RDTSCP_ENABLED_RAW() // RDTSCP 退出
             | VBOXVMM_EXIT_RDPMC_ENABLED_RAW()
             | VBOXVMM_EXIT_RDMSR_ENABLED_RAW()
             | VBOXVMM_EXIT_WRMSR_ENABLED_RAW()
-            | VBOXVMM_EXIT_CRX_READ_ENABLED_RAW()
+            | VBOXVMM_EXIT_CRX_READ_ENABLED_RAW()// CR 读取退出
             | VBOXVMM_EXIT_CRX_WRITE_ENABLED_RAW()
             | VBOXVMM_EXIT_DRX_READ_ENABLED_RAW()
             | VBOXVMM_EXIT_DRX_WRITE_ENABLED_RAW()
@@ -6972,6 +7295,13 @@ static bool hmR0VmxAnyExpensiveProbesEnabled(void)
  * @returns Strict VBox status code (i.e. informational status codes too).
  * @param   pVCpu   The cross context virtual CPU structure.
  */
+/*
+这是VirtualBox中Intel VMX硬件虚拟化的核心执行循环，负责：
+  在非根模式（Non-Root Mode）下运行Guest OS代码
+  处理VMExit事件
+  支持嵌套虚拟化（Nested Virtualization）
+  实现调试/性能优化分支
+*/
 VMMR0DECL(VBOXSTRICTRC) VMXR0RunGuestCode(PVMCPUCC pVCpu)
 {
     AssertPtr(pVCpu);
@@ -6990,26 +7320,26 @@ VMMR0DECL(VBOXSTRICTRC) VMXR0RunGuestCode(PVMCPUCC pVCpu)
         NOREF(pCtx);
         bool const fInNestedGuestMode = false;
 #endif
-        if (!fInNestedGuestMode)
+        if (!fInNestedGuestMode)//!嵌套模式
         {
             if (   !pVCpu->hm.s.fUseDebugLoop
                 && (!VBOXVMM_ANY_PROBES_ENABLED() || !hmR0VmxAnyExpensiveProbesEnabled())
                 && !DBGFIsStepping(pVCpu)
-                && !pVCpu->CTX_SUFF(pVM)->dbgf.ro.cEnabledInt3Breakpoints)
-                rcStrict = hmR0VmxRunGuestCodeNormal(pVCpu, &cLoops);
+                && !pVCpu->CTX_SUFF(pVM)->dbgf.ro.cEnabledInt3Breakpoints)//无需调试
+                rcStrict = hmR0VmxRunGuestCodeNormal(pVCpu, &cLoops);// 快速路径
             else
-                rcStrict = hmR0VmxRunGuestCodeDebug(pVCpu, &cLoops);
+                rcStrict = hmR0VmxRunGuestCodeDebug(pVCpu, &cLoops);// 调试路径
         }
 #ifdef VBOX_WITH_NESTED_HWVIRT_VMX
         else
-            rcStrict = hmR0VmxRunGuestCodeNested(pVCpu, &cLoops);
+            rcStrict = hmR0VmxRunGuestCodeNested(pVCpu, &cLoops);// 嵌套虚拟化路径
 
-        if (rcStrict == VINF_VMX_VMLAUNCH_VMRESUME)
+        if (rcStrict == VINF_VMX_VMLAUNCH_VMRESUME)//需要重新进入嵌套Guest
         {
             Assert(CPUMIsGuestInVmxNonRootMode(pCtx));
             continue;
         }
-        if (rcStrict == VINF_VMX_VMEXIT)
+        if (rcStrict == VINF_VMX_VMEXIT) //需要退出嵌套Guest
         {
             Assert(!CPUMIsGuestInVmxNonRootMode(pCtx));
             continue;
@@ -7025,7 +7355,7 @@ VMMR0DECL(VBOXSTRICTRC) VMXR0RunGuestCode(PVMCPUCC pVCpu)
         case VINF_EM_RESET:         rcStrict = VINF_EM_TRIPLE_FAULT;        break;
     }
 
-    int rc2 = hmR0VmxExitToRing3(pVCpu, rcStrict);
+    int rc2 = hmR0VmxExitToRing3(pVCpu, rcStrict);//处理需要返回到Ring3的情况
     if (RT_FAILURE(rc2))
     {
         pVCpu->hm.s.u32HMError = (uint32_t)VBOXSTRICTRC_VAL(rcStrict);

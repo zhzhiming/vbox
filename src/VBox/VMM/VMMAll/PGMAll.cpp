@@ -4175,9 +4175,7 @@ static bool pgmHandlePageZeroingMatchOpcodes(PVMCPUCC pVCpu, PCPUMCTX pCtx, uint
  * @param   pVCpu   The cross context virtual CPU structure of the calling EMT.
  * @param   pCtx    The guest register context.
  */
-static bool pgmHandlePageZeroingCode(PVMCPUCC pVCpu, PCPUMCTX pCtx)
-{
-    CPUMCTX_ASSERT_NOT_EXTRN(pCtx, CPUMCTX_EXTRN_CR0 | CPUMCTX_EXTRN_CR3 | CPUMCTX_EXTRN_CR4 | CPUMCTX_EXTRN_EFER);
+static bool pgmHandlePageZeroingCode(PVMCPUCC pVCpu, PCPUMCTX pCtx) { CPUMCTX_ASSERT_NOT_EXTRN(pCtx, CPUMCTX_EXTRN_CR0 | CPUMCTX_EXTRN_CR3 | CPUMCTX_EXTRN_CR4 | CPUMCTX_EXTRN_EFER);
 
     /*
      * Sort by mode first.
