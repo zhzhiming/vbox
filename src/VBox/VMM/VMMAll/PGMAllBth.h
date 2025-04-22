@@ -190,6 +190,9 @@ PGM_BTH_DECL(int, Enter)(PVMCPUCC pVCpu, RTGCPHYS GCPhysCR3)
  * @param   pWalk           The guest page table walk result.
  * @param   uErr            The error code.
  */
+//pgmR0BthEPTProtNestedTrap0eHandler
+//hmR0VmxPreRunGuest()处理VMExit后转入异常分发逻辑
+
 PGM_BTH_DECL(VBOXSTRICTRC, Trap0eHandlerGuestFault)(PVMCPUCC pVCpu, PPGMPTWALK pWalk, RTGCUINT uErr)
 {
     /*
@@ -1149,6 +1152,17 @@ static VBOXSTRICTRC PGM_BTH_NAME(NestedTrap0eHandlerDoAccessHandlers)(PVMCPUCC p
  * @param   pfLockTaken         Where to store whether the PGM lock is still held
  *                              when this function completes.
  */
+/*
+VMExit触发阶段
+  客户机触发EPT violation导致VMExit
+  hmR0VmxPreRunGuest()捕获异常并转入异常分发逻辑2
+  hmR0VmxExitHandler()根据退出原因(EXIT_REASON_EPT_VIOLATION)路由处理3
+
+嵌套分页处理阶段
+  hmR0VmxExitHandler()
+    ├─ hmR0VmxHandleExitNestedPaging()  [EPT/NPT异常处理入口]
+    │   └─ pgmR0BthEPTProtNestedTrap0eHandler()  [嵌套分页专用处理]
+*/
 PGM_BTH_DECL(int, NestedTrap0eHandler)(PVMCPUCC pVCpu, RTGCUINT uErr, PCPUMCTX pCtx, RTGCPHYS GCPhysNestedFault,
                                        bool fIsLinearAddrValid, RTGCPTR GCPtrNestedFault, PPGMPTWALK pWalk, bool *pfLockTaken)
 {
