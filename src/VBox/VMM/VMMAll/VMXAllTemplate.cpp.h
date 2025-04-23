@@ -9589,6 +9589,16 @@ HMVMX_EXIT_DECL vmxHCExitEptMisconfig(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransien
  * VM-exit handler for EPT violation (VMX_EXIT_EPT_VIOLATION). Conditional
  * VM-exit.
  */
+/*
+ * hmR0VmxRunGuestCode (VMX 入口)
+  → vmxHandleExit (分发 VM-exit)
+    → vmxHCExitEptViolation (EPT 处理)
+      → vmxHCCheckExitDueToEventDelivery (事件检查)
+      → PGMR0Trap0eHandlerNestedPaging (缺页处理)
+        → 若 MMIO: IEMExecOne (模拟设备访问)
+      → vmxHCResumeGuest (恢复客户机)
+*/
+
 HMVMX_EXIT_DECL vmxHCExitEptViolation(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient)
 {
     HMVMX_VALIDATE_EXIT_HANDLER_PARAMS(pVCpu, pVmxTransient);

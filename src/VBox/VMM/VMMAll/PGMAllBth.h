@@ -236,6 +236,36 @@ PGM_BTH_DECL(VBOXSTRICTRC, Trap0eHandlerGuestFault)(PVMCPUCC pVCpu, PPGMPTWALK p
  * @param   pfLockTaken     PGM lock taken here or not (out).  This is true
  *                          when we're called.
  */
+/*
+ *
+ * VM-exit 处理入口（由硬件触发）
+ * vmxVmxRunGuest()                  // VMX 非根模式执行客户机代码
+  -> VMExit_EPT_VIOLATION()        // 发生 EPT 违例（缺页/权限错误）
+    -> hmHandleExit()              // 处理 VM-exit
+      -> hmHandleExitNestedPaging()// 嵌套分页相关处理
+
+
+  进入页错误处理逻辑  
+  PGMTrap0eHandler()                // 页错误（#PF）主处理函数
+    -> pgmShwHandlePageFault()       // 影子/嵌套分页处理
+      -> PGM_BTH_NAME(Trap0eHandlerDoAccessHandlers)  // 你的目标函数
+                                                      //
+
+  PGMR0Trap0eHandlerEPT()          // EPT 异常入口
+   → PGM_BTH_NAME(Trap0eHandler)()  // 宏展开的模板函数
+     → PGM_BTH_NAME(Trap0eHandlerDoAccessHandlers)()  // 实际处理逻辑
+
+*/
+
+/*
+  物理内存访问处理：检查是否有注册的物理页处理程序（如MMIO设备、写保护内存）。
+  页表同步：在EPT/NPT或影子页表模式下同步页表状态。
+  指令模拟：若无匹配处理程序，回退到指令解释器。
+*/
+
+//pvFault	客户机虚拟地址（GVA），用于定位页表冲突或 MMIO 区域
+//pPage	    关联的 EPT/NPT 页表条目（PTE），存储物理页权限和状态
+//pfLockTaken	锁状态标记，避免重复加锁导致死锁（如 MMIO 处理时跳过锁）
 static VBOXSTRICTRC PGM_BTH_NAME(Trap0eHandlerDoAccessHandlers)(PVMCPUCC pVCpu, RTGCUINT uErr, PCPUMCTX pCtx,
                                                                 RTGCPTR pvFault, PPGMPAGE pPage, bool *pfLockTaken
 # if PGM_WITH_PAGING(PGM_GST_TYPE, PGM_SHW_TYPE) || defined(DOXYGEN_RUNNING)
@@ -250,20 +280,25 @@ static VBOXSTRICTRC PGM_BTH_NAME(Trap0eHandlerDoAccessHandlers)(PVMCPUCC pVCpu, 
     PVMCC           pVM         = pVCpu->CTX_SUFF(pVM);
     VBOXSTRICTRC    rcStrict;
 
+    //查页面是否有物理处理程序（如MMIO或写保护）。
     if (PGM_PAGE_HAS_ANY_PHYSICAL_HANDLERS(pPage))
     {
         /*
          * Physical page access handler.
          */
 # if PGM_WITH_PAGING(PGM_GST_TYPE, PGM_SHW_TYPE)
+        // EPT/NPT 模式下的处理逻辑
         const RTGCPHYS  GCPhysFault = pWalk->GCPhys;
 # else
+        // 普通分页模式（影子页表）下的处理逻辑
         const RTGCPHYS  GCPhysFault = PGM_A20_APPLY(pVCpu, (RTGCPHYS)pvFault);
 # endif
         PPGMPHYSHANDLER pCur;
+        //根据物理地址查找匹配的处理程序。
         rcStrict = pgmHandlerPhysicalLookup(pVM, GCPhysFault, &pCur);
         if (RT_SUCCESS(rcStrict))
         {
+            //获取处理程序类型（如PGMPHYSHANDLERKIND_WRITE）。
             PCPGMPHYSHANDLERTYPEINT const pCurType = PGMPHYSHANDLER_GET_TYPE(pVM, pCur);
 
 #  ifdef PGM_SYNC_N_PAGES
@@ -274,16 +309,18 @@ static VBOXSTRICTRC PGM_BTH_NAME(Trap0eHandlerDoAccessHandlers)(PVMCPUCC pVCpu, 
              *
              * ASSUMES that there is only one handler per page or that they have similar write properties.
              */
+            // 页面不存在（!X86_TRAP_PF_P）且处理程序为写保护类型。
             if (   !(uErr & X86_TRAP_PF_P)
                 &&  pCurType->enmKind == PGMPHYSHANDLERKIND_WRITE)
             {
+                //同步EPT/NPT或影子页表，确保权限一致（如提升写权限）。
 #   if PGM_WITH_PAGING(PGM_GST_TYPE, PGM_SHW_TYPE)
                 rcStrict = PGM_BTH_NAME(SyncPage)(pVCpu, pGstWalk->Pde, pvFault, PGM_SYNC_NR_PAGES, uErr);
 #   else
                 rcStrict = PGM_BTH_NAME(SyncPage)(pVCpu, PdeSrcDummy, pvFault, PGM_SYNC_NR_PAGES, uErr);
 #   endif
                 if (    RT_FAILURE(rcStrict)
-                    || !(uErr & X86_TRAP_PF_RW)
+                    || !(uErr & X86_TRAP_PF_RW)//仅写操作继续处理，读操作重启指令。
                     || rcStrict == VINF_PGM_SYNCPAGE_MODIFIED_PDE)
                 {
                     AssertMsgRC(rcStrict, ("%Rrc\n", VBOXSTRICTRC_VAL(rcStrict)));
@@ -293,10 +330,13 @@ static VBOXSTRICTRC PGM_BTH_NAME(Trap0eHandlerDoAccessHandlers)(PVMCPUCC pVCpu, 
                 }
             }
 #  endif
+            //MMIO优化处理
 #  ifdef PGM_WITH_MMIO_OPTIMIZATIONS
             /*
              * If the access was not thru a #PF(RSVD|...) resync the page.
              */
+            //MMIO访问：通常通过X86_TRAP_PF_RSVD（保留位错误）触发VM-exit。
+            //优化目的：若非RSVD错误但命中MMIO处理程序，强制同步页表以正确捕获后续访问。
             if (   !(uErr & X86_TRAP_PF_RSVD)
                 && pCurType->enmKind != PGMPHYSHANDLERKIND_WRITE
 #   if PGM_WITH_PAGING(PGM_GST_TYPE, PGM_SHW_TYPE)
@@ -337,11 +377,12 @@ static VBOXSTRICTRC PGM_BTH_NAME(Trap0eHandlerDoAccessHandlers)(PVMCPUCC pVCpu, 
             {
                 STAM_PROFILE_START(&pCur->Stat, h);
 
+                //根据fKeepPgmLock决定是否保持PGM锁，避免死锁
                 if (pCurType->fKeepPgmLock)
                 {
                     rcStrict = pCurType->pfnPfHandler(pVM, pVCpu, uErr, pCtx, pvFault, GCPhysFault,
                                                       !pCurType->fRing0DevInsIdx ? pCur->uUser
-                                                      : (uintptr_t)PDMDeviceRing0IdxToInstance(pVM, pCur->uUser));
+                                                      : (uintptr_t)PDMDeviceRing0IdxToInstance(pVM, pCur->uUser)); // 保持锁调用
 
                     STAM_PROFILE_STOP(&pCur->Stat, h); /* no locking needed, entry is unlikely reused before we get here. */
                 }
@@ -352,13 +393,13 @@ static VBOXSTRICTRC PGM_BTH_NAME(Trap0eHandlerDoAccessHandlers)(PVMCPUCC pVCpu, 
                     PGM_UNLOCK(pVM);
                     *pfLockTaken = false;
 
-                    rcStrict = pCurType->pfnPfHandler(pVM, pVCpu, uErr, pCtx, pvFault, GCPhysFault, uUser);
+                    rcStrict = pCurType->pfnPfHandler(pVM, pVCpu, uErr, pCtx, pvFault, GCPhysFault, uUser);// 释放锁调用
 
                     STAM_PROFILE_STOP(&pCur->Stat, h); /* no locking needed, entry is unlikely reused before we get here. */
                 }
             }
             else
-                rcStrict = VINF_EM_RAW_EMULATE_INSTR;
+                rcStrict = VINF_EM_RAW_EMULATE_INSTR;// 无处理程序则模拟指令
 
             STAM_STATS({ pVCpu->pgmr0.s.pStatTrap0eAttributionR0 = &pVCpu->pgm.s.Stats.StatRZTrap0eTime2HndPhys; });
             return rcStrict;
@@ -379,6 +420,7 @@ static VBOXSTRICTRC PGM_BTH_NAME(Trap0eHandlerDoAccessHandlers)(PVMCPUCC pVCpu, 
     if (    !PGM_PAGE_HAS_ACTIVE_ALL_HANDLERS(pPage)
         &&  !(uErr & X86_TRAP_PF_P))
     {
+        // 尝试同步页表
 #  if PGM_WITH_PAGING(PGM_GST_TYPE, PGM_SHW_TYPE)
         rcStrict = PGM_BTH_NAME(SyncPage)(pVCpu, pGstWalk->Pde, pvFault, PGM_SYNC_NR_PAGES, uErr);
 #  else
@@ -398,7 +440,9 @@ static VBOXSTRICTRC PGM_BTH_NAME(Trap0eHandlerDoAccessHandlers)(PVMCPUCC pVCpu, 
     /** @todo This particular case can cause quite a lot of overhead. E.g. early stage of kernel booting in Ubuntu 6.06
      *        It's writing to an unhandled part of the LDT page several million times.
      */
-    rcStrict = PGMInterpretInstruction(pVCpu, pvFault);
+    //适用场景：页面无活跃处理程序或非Present错误。
+    //指令模拟：最终通过PGMInterpretInstruction模拟客户机指令。
+    rcStrict = PGMInterpretInstruction(pVCpu, pvFault);// 解释执行指令
     LogFlow(("PGM: PGMInterpretInstruction -> rcStrict=%d pPage=%R[pgmpage]\n", VBOXSTRICTRC_VAL(rcStrict), pPage));
     STAM_STATS({ pVCpu->pgmr0.s.pStatTrap0eAttributionR0 = &pVCpu->pgm.s.Stats.StatRZTrap0eTime2HndUnhandled; });
     return rcStrict;
@@ -5303,16 +5347,28 @@ PGM_BTH_DECL(int, MapCR3)(PVMCPUCC pVCpu, RTGCPHYS GCPhysCR3)
  * @returns VBox status, no specials.
  * @param   pVCpu       The cross context virtual CPU structure.
  */
+//处理客户机 CR3 寄存器取消映射
+//函数直接处理客户机 CR3 寄存器的映射状态，涉及物理地址（GCPhysPaeCR3）和影子页表（pShwPageCR3），
+//这些操作必须通过 Ring 0 权限执行
+/*
+  清除与客户机页表相关的各种指针和状态
+  处理不同分页模式（32位、PAE、AMD64）的清理工作
+  更新影子分页信息
+  释放相关的内存资源
+*/
 PGM_BTH_DECL(int, UnmapCR3)(PVMCPUCC pVCpu)
 {
     LogFlow(("UnmapCR3\n"));
 
     int   rc  = VINF_SUCCESS;
+    //虚拟机控制块指针，通过 CTX_SUFF 宏适配不同上下文（R0/R3）
     PVMCC pVM = pVCpu->CTX_SUFF(pVM); NOREF(pVM);
 
     /*
      * Update guest paging info.
      */
+    //首先根据客户机分页类型（PGM_GST_TYPE）清除对应的页表指针
+    //intel ept: PGM_TYPE_EPT
 #if PGM_GST_TYPE == PGM_TYPE_32BIT
     pVCpu->pgm.s.pGst32BitPdR3 = 0;
     pVCpu->pgm.s.pGst32BitPdR0 = 0;
@@ -5327,7 +5383,7 @@ PGM_BTH_DECL(int, UnmapCR3)(PVMCPUCC pVCpu)
         pVCpu->pgm.s.aGCPhysGstPaePDs[i] = NIL_RTGCPHYS;
     }
 
-#elif PGM_GST_TYPE == PGM_TYPE_AMD64
+#elif PGM_GST_TYPE == PGM_TYPE_AMD64//AMD-V 环境的 NPT 实现
     pVCpu->pgm.s.pGstAmd64Pml4R3 = 0;
     pVCpu->pgm.s.pGstAmd64Pml4R0 = 0;
 
@@ -5339,8 +5395,10 @@ PGM_BTH_DECL(int, UnmapCR3)(PVMCPUCC pVCpu)
      * PAE PDPEs (and CR3) might have been mapped via PGMGstMapPaePdpesAtCr3()
      * prior to switching to PAE in pfnMapCr3(), so we need to clear them here.
      */
+    //标记 PAE PDPE 和 CR3 的映射状态为未映射。
     pVCpu->pgm.s.fPaePdpesAndCr3MappedR3 = false;
     pVCpu->pgm.s.fPaePdpesAndCr3MappedR0 = false;
+    //重置客户机 CR3 寄存器的物理地址为无效。
     pVCpu->pgm.s.GCPhysPaeCR3            = NIL_RTGCPHYS;
 
     /*
@@ -5352,20 +5410,23 @@ PGM_BTH_DECL(int, UnmapCR3)(PVMCPUCC pVCpu)
 # if PGM_GST_TYPE != PGM_TYPE_REAL
     Assert(!pVM->pgm.s.fNestedPaging);
 # endif
-    PGM_LOCK_VOID(pVM);
+    PGM_LOCK_VOID(pVM);//获取页管理模块的自旋锁，防止并发冲突。
 
-    if (pVCpu->pgm.s.CTX_SUFF(pShwPageCR3))
+    if (pVCpu->pgm.s.CTX_SUFF(pShwPageCR3))//检查影子页表是否存在：若存在（pShwPageCR3 非空），获取页池（pPool）指针。
     {
         PPGMPOOL pPool = pVM->pgm.s.CTX_SUFF(pPool);
 
+        //如果启用了脏页跟踪（PGMPOOL_WITH_OPTIMIZED_DIRTY_PT），重置脏页计数
 # ifdef PGMPOOL_WITH_OPTIMIZED_DIRTY_PT
         if (pPool->cDirtyPages)
             pgmPoolResetDirtyPages(pVM);
 # endif
 
         /* Mark the page as unlocked; allow flushing again. */
+        //解除页的锁定状态，允许后续回收。
         pgmPoolUnlockPage(pPool, pVCpu->pgm.s.CTX_SUFF(pShwPageCR3));
 
+        //将页归还到页池，参数 NIL_PGMPOOL_IDX 表示无关联索引，UINT32_MAX 表示强制释放。
         pgmPoolFreeByPage(pPool, pVCpu->pgm.s.CTX_SUFF(pShwPageCR3), NIL_PGMPOOL_IDX, UINT32_MAX);
         pVCpu->pgm.s.pShwPageCR3R3 = 0;
         pVCpu->pgm.s.pShwPageCR3R0 = 0;

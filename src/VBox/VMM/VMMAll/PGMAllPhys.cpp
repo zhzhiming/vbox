@@ -2682,6 +2682,14 @@ int pgmPhysPageMapByPageID(PVMCC pVM, uint32_t idPage, RTHCPHYS HCPhys, void **p
  *
  * @remarks Called from within the PGM critical section.
  */
+//负责将客户机物理页（GPA）映射到主机虚拟地址（HVA），支持多种内存类型（如普通 RAM、MMIO2、零页等）
+/*
+  pVM：虚拟机控制块（VM Control Block）。
+  pPage：客户机物理页描述符（PPGMPAGE）。
+  GCPhys：客户机物理地址（GPA）。
+  ppMap：返回映射结构（可选）。
+  ppv：返回主机虚拟地址（HVA）。
+ * */
 static int pgmPhysPageMapCommon(PVMCC pVM, PPGMPAGE pPage, RTGCPHYS GCPhys, PPPGMPAGEMAP ppMap, void **ppv)
 {
     PGM_LOCK_ASSERT_OWNER(pVM);
@@ -2690,14 +2698,20 @@ static int pgmPhysPageMapCommon(PVMCC pVM, PPGMPAGE pPage, RTGCPHYS GCPhys, PPPG
     /*
      * Special cases: MMIO2 and specially aliased MMIO pages.
      */
+    /*
+       MMIO2 页：用于设备模拟（如 GPU 显存），由 VirtualBox 管理的特殊内存区域。
+       MMIO2_ALIAS_MMIO 页：MMIO2 的别名页，用于设备寄存器访问。
+    */
     if (   PGM_PAGE_GET_TYPE(pPage) == PGMPAGETYPE_MMIO2
         || PGM_PAGE_GET_TYPE(pPage) == PGMPAGETYPE_MMIO2_ALIAS_MMIO)
     {
         *ppMap = NULL;
 
         /* Decode the page id to a page in a MMIO2 ram range. */
+        //从 pPage 提取 idMmio2 和 iPage（页索引）。
         uint8_t const  idMmio2 = PGM_MMIO2_PAGEID_GET_MMIO2_ID(PGM_PAGE_GET_PAGEID(pPage));
         uint32_t const iPage   = PGM_MMIO2_PAGEID_GET_IDX(PGM_PAGE_GET_PAGEID(pPage));
+        //检查 idMmio2 是否有效，并获取对应的 PPGMREGMMIO2RANGE 结构。
         AssertLogRelMsgReturn((uint8_t)(idMmio2 - 1U) < RT_ELEMENTS(pVM->pgm.s.aMmio2Ranges),
                               ("idMmio2=%u size=%u type=%u GCPHys=%#RGp Id=%u State=%u", idMmio2,
                                RT_ELEMENTS(pVM->pgm.s.aMmio2Ranges), PGM_PAGE_GET_TYPE(pPage), GCPhys,
@@ -2712,21 +2726,27 @@ static int pgmPhysPageMapCommon(PVMCC pVM, PPGMPAGE pPage, RTGCPHYS GCPhys, PPPG
         PPGMRAMRANGE const      pRamRange   = pVM->CTX_EXPR(pgm, pgmr0, pgm).s.apRamRanges[idRamRange];
         AssertLogRelReturn(pRamRange, VERR_PGM_PHYS_PAGE_MAP_MMIO2_IPE);
         AssertLogRelReturn(iPage < (pRamRange->cb >> GUEST_PAGE_SHIFT), VERR_PGM_PHYS_PAGE_MAP_MMIO2_IPE);
+        //直接计算主机虚拟地址（pbR3 + iPage << GUEST_PAGE_SHIFT）。
         *ppv = pMmio2Range->pbR3 + ((uintptr_t)iPage << GUEST_PAGE_SHIFT);
         return VINF_SUCCESS;
 
 #else /* IN_RING0 */
         AssertLogRelReturn(iPage < pVM->pgmr0.s.acMmio2RangePages[idMmio2 - 1], VERR_PGM_PHYS_PAGE_MAP_MMIO2_IPE);
-# ifdef VBOX_WITH_LINEAR_HOST_PHYS_MEM
+# ifdef VBOX_WITH_LINEAR_HOST_PHYS_MEM //用于优化 主机物理内存到虚拟机的直接映射,启用该宏后，VirtualBox 会尝试将 主机物理内存（HPA）线性映射到内核虚拟地址空间（HVA）
+        //使用 SUPR0HCPhysToVirt 转换物理地址
         return SUPR0HCPhysToVirt(PGM_PAGE_GET_HCPHYS(pPage), ppv);
 # else
         AssertPtr(pVM->pgmr0.s.apbMmio2Backing[idMmio2 - 1]);
+        //否则，从 apbMmio2Backing 获取预分配的映射。
         *ppv = pVM->pgmr0.s.apbMmio2Backing[idMmio2 - 1] + ((uintptr_t)iPage << GUEST_PAGE_SHIFT);
         return VINF_SUCCESS;
 # endif
 #endif
     }
 
+//Native Execution Manager
+//NEM 模式：在 Windows Hyper-V 或 macOS Hypervisor.framework 上运行时，
+//VirtualBox 使用宿主机的内存管理机制。
 #ifdef VBOX_WITH_PGM_NEM_MODE
     if (pVM->pgm.s.fNemMode)
     {
@@ -2737,12 +2757,14 @@ static int pgmPhysPageMapCommon(PVMCC pVM, PPGMPAGE pPage, RTGCPHYS GCPhys, PPPG
         /** @todo Use the page ID for some kind of indexing as we do with MMIO2 above. */
         PPGMRAMRANGE const pRam = pgmPhysGetRange(pVM, GCPhys);
         AssertLogRelMsgReturn(pRam, ("%RTGp\n", GCPhys), VERR_INTERNAL_ERROR_3);
+        //查找对应的 PPGMRAMRANGE，计算主机虚拟地址
         size_t const idxPage = (GCPhys - pRam->GCPhys) >> GUEST_PAGE_SHIFT;
         Assert(pPage == &pRam->aPages[idxPage]);
         *ppMap = NULL;
         *ppv   = (uint8_t *)pRam->pbR3 + (idxPage << GUEST_PAGE_SHIFT);
         return VINF_SUCCESS;
 # else
+        //Ring-0：不支持
         AssertFailedReturn(VERR_INTERNAL_ERROR_2);
 # endif
     }
@@ -2755,13 +2777,15 @@ static int pgmPhysPageMapCommon(PVMCC pVM, PPGMPAGE pPage, RTGCPHYS GCPhys, PPPG
                         VERR_PGM_PHYS_PAGE_MAP_IPE_1);
         if (!PGM_PAGE_IS_SPECIAL_ALIAS_MMIO(pPage))
         {
+            //检查 PGM_PAGE_IS_ZERO，返回 abZeroPg（全局零页）
             AssertMsgReturn(PGM_PAGE_IS_ZERO(pPage), ("pPage=%R[pgmpage]\n", pPage),
                             VERR_PGM_PHYS_PAGE_MAP_IPE_3);
             AssertMsgReturn(PGM_PAGE_GET_HCPHYS(pPage)== pVM->pgm.s.HCPhysZeroPg, ("pPage=%R[pgmpage]\n", pPage),
                             VERR_PGM_PHYS_PAGE_MAP_IPE_4);
-            *ppv = pVM->pgm.s.abZeroPg;
+            *ppv = pVM->pgm.s.abZeroPg; //// 返回预分配的零页
         }
         else
+            //同样返回 abZeroPg，但可能用于设备模拟。
             *ppv = pVM->pgm.s.abZeroPg;
         *ppMap = NULL;
         return VINF_SUCCESS;
@@ -2772,6 +2796,7 @@ static int pgmPhysPageMapCommon(PVMCC pVM, PPGMPAGE pPage, RTGCPHYS GCPhys, PPPG
      * Just use the physical address.
      */
     *ppMap = NULL;
+    //直接使用 SUPR0HCPhysToVirt 将主机物理地址（HPA）转换为 HVA。
     return SUPR0HCPhysToVirt(PGM_PAGE_GET_HCPHYS(pPage), ppv);
 
 # elif defined(IN_RING0)
@@ -2779,9 +2804,10 @@ static int pgmPhysPageMapCommon(PVMCC pVM, PPGMPAGE pPage, RTGCPHYS GCPhys, PPPG
      * Go by page ID thru GMMR0.
      */
     *ppMap = NULL;
+    //通过 GMM（Global Memory Manager）查找映射。
     return GMMR0PageIdToVirt(pVM, PGM_PAGE_GET_PAGEID(pPage), ppv);
 
-# else
+# else //Ring-3 模式（用户态）
     /*
      * Find/make Chunk TLB entry for the mapping chunk.
      */
@@ -2789,6 +2815,7 @@ static int pgmPhysPageMapCommon(PVMCC pVM, PPGMPAGE pPage, RTGCPHYS GCPhys, PPPG
     PPGMCHUNKR3MAPTLBE pTlbe = &pVM->pgm.s.ChunkR3Map.Tlb.aEntries[PGM_CHUNKR3MAPTLB_IDX(idChunk)];
     if (pTlbe->idChunk == idChunk)
     {
+        // TLB 命中，直接返回缓存映射
         STAM_COUNTER_INC(&pVM->pgm.s.Stats.CTX_MID_Z(Stat,ChunkR3MapTlbHits));
         pMap = pTlbe->pChunk;
         AssertPtr(pMap->pv);
@@ -2800,6 +2827,7 @@ static int pgmPhysPageMapCommon(PVMCC pVM, PPGMPAGE pPage, RTGCPHYS GCPhys, PPPG
         /*
          * Find the chunk, map it if necessary.
          */
+        // TLB 未命中，查找或映射新 chunk
         pMap = (PPGMCHUNKR3MAP)RTAvlU32Get(&pVM->pgm.s.ChunkR3Map.pTree, idChunk);
         if (pMap)
         {
@@ -5156,27 +5184,33 @@ pgmPhyIemGCphys2PtrNoLockReturnReadOnly(PVMCC pVM, PVMCPUCC pVCpu, uint64_t uTlb
 
 
 /** Helper for PGMPhysIemGCPhys2PtrNoLock. */
+//其核心特点是绕过全局锁, GCPhys->*ppb
 DECL_FORCE_INLINE(int)
 pgmPhyIemGCphys2PtrNoLockReturnReadWrite(PVMCC pVM, PVMCPUCC pVCpu, uint64_t uTlbPhysRev, RTGCPHYS GCPhys, PCPGMPAGE pPageCopy,
                                          PPGMRAMRANGE pRam, PPGMPAGE pPage, R3R0PTRTYPE(uint8_t *) *ppb, uint64_t *pfTlb)
 {
-    Assert(!PGM_PAGE_IS_CODE_PAGE(pPageCopy));
+    Assert(!PGM_PAGE_IS_CODE_PAGE(pPageCopy));//确保目标页不是代码页（代码页通常需额外保护）。防止模拟器意外修改客户机指令流。
     RT_NOREF(pPageCopy);
-    *pfTlb |= uTlbPhysRev;
+    //通过原子操作（如 TLB 版本标记）替代全局锁，减少线程竞争开销。
+    *pfTlb |= uTlbPhysRev;//更新 TLB 版本标识，用于后续一致性验证。
 
+    //用户态直接计算地址，避免陷入内核（仅在 NEM 模式或 TLB 未命中时需查询）。
 #ifdef IN_RING3
+    //NEM
     if (PGM_IS_IN_NEM_MODE(pVM))
-        *ppb = &pRam->pbR3[(RTGCPHYS)(uintptr_t)(pPage - &pRam->aPages[0]) << GUEST_PAGE_SHIFT];
+        *ppb = &pRam->pbR3[(RTGCPHYS)(uintptr_t)(pPage - &pRam->aPages[0]) << GUEST_PAGE_SHIFT]; //直接通过 RAM 范围偏移计算主机地址
     else
 #endif
     {
 #ifdef IN_RING3
         PPGMPAGEMAPTLBE pTlbe;
+        //从 无锁 TLB查询映射条目，返回主机虚拟地址 pTlbe->pv。
         int rc = pgmPhysPageQueryLocklessTlbeWithPage(pVCpu, pPage, GCPhys, &pTlbe);
         AssertLogRelRCReturn(rc, rc);
         *ppb = (uint8_t *)pTlbe->pv;
         RT_NOREF(pVM);
 #else /** @todo a safe lockless page TLB in ring-0 needs the to ensure it gets the right invalidations. later. */
+        //由于 Ring-0 无锁 TLB 实现尚未完善（注释 @todo），需短暂获取全局锁 PGM_LOCK，通过 pgmPhysPageQueryTlbeWithPage 查询 TLB 条目后立即释放锁。
         PGM_LOCK(pVM);
         PPGMPAGEMAPTLBE pTlbe;
         int rc = pgmPhysPageQueryTlbeWithPage(pVM, pPage, GCPhys, &pTlbe);
@@ -5214,6 +5248,15 @@ pgmPhyIemGCphys2PtrNoLockReturnReadWrite(PVMCC pVM, PVMCPUCC pVCpu, uint64_t uTl
  *
  * @thread  EMT(pVCpu).
  */
+//该函数用于 无锁（Lockless）地将客户机物理地址（GCPhys）转换为主机虚拟地址指针（ppb），
+//主要用于 IEM（Interpreted Execution Manager） 模块的指令模
+/*
+  地址转换：根据客户机物理地址查找对应的主机虚拟地址。
+  状态检查：验证页面的物理状态（如可写性、MMIO状态等）。
+  TLB（Translation Lookaside Buffer）优化：通过版本号（puTlbPhysRev）检测并发修改，避免锁竞争。
+*/
+//puTlbPhysRev	uint64_t const volatile*	TLB版本号指针，用于检测页面状态变更。
+//ring0
 VMM_INT_DECL(int) PGMPhysIemGCPhys2PtrNoLock(PVMCC pVM, PVMCPUCC pVCpu, RTGCPHYS GCPhys, uint64_t const volatile *puTlbPhysRev,
                                              R3R0PTRTYPE(uint8_t *) *ppb, uint64_t *pfTlb)
 {
@@ -5222,6 +5265,7 @@ VMM_INT_DECL(int) PGMPhysIemGCPhys2PtrNoLock(PVMCC pVM, PVMCPUCC pVCpu, RTGCPHYS
 
     PGMRAMRANGE volatile *pRam;
     PGMPAGE volatile     *pPage;
+    //无锁查找客户机物理地址对应的PGMPAGE和PGMRAMRANGE
     int rc = pgmPhysGetPageAndRangeExLockless(pVM, pVCpu, GCPhys, &pPage, &pRam);
     if (RT_SUCCESS(rc))
     {
@@ -5240,14 +5284,14 @@ VMM_INT_DECL(int) PGMPhysIemGCPhys2PtrNoLock(PVMCC pVM, PVMCPUCC pVCpu, RTGCPHYS
          * updates by adding a u1UpdateInProgress field (or revision).
          * This would be especially important when updating the page ID...  */
         uint64_t uTlbPhysRev = *puTlbPhysRev;
-        PGMPAGE  PageCopy    = { { pPage->au64[0], pPage->au64[1] } };
+        PGMPAGE  PageCopy    = { { pPage->au64[0], pPage->au64[1] } };// 原子拷贝页面状态,PGMPAGE的au64数组允许原子读取64位值
         if (   uTlbPhysRev      == *puTlbPhysRev
             && PageCopy.au64[0] == pPage->au64[0]
-            && PageCopy.au64[1] == pPage->au64[1])
-            ASMCompilerBarrier(); /* likely */
+            && PageCopy.au64[1] == pPage->au64[1])//通过比较TLB版本号和页面状态，检测是否有并发修改。若检测到变化，则加锁重新采样。
+            ASMCompilerBarrier(); /* likely */ // 编译器屏障（避免指令重排）
         else
         {
-            PGM_LOCK_VOID(pVM);
+            PGM_LOCK_VOID(pVM);// 版本不一致时加锁重新采样
             uTlbPhysRev = *puTlbPhysRev;
             PageCopy.au64[0] = pPage->au64[0];
             PageCopy.au64[1] = pPage->au64[1];
@@ -5257,9 +5301,11 @@ VMM_INT_DECL(int) PGMPhysIemGCPhys2PtrNoLock(PVMCC pVM, PVMCPUCC pVCpu, RTGCPHYS
         /*
          * Try optimize for the regular case first: Writable RAM.
          */
+        //根据页面的物理处理状态（PGM_PAGE_HNDL_PHYS_STATE）和常规状态（PGM_PAGE_STATE_NA），调用不同的子函数：
         switch (PGM_PAGE_GET_HNDL_PHYS_STATE(&PageCopy))
         {
             case PGM_PAGE_HNDL_PHYS_STATE_DISABLED:
+                // 处理无物理处理程序的页面
                 if (!PGM_PAGE_IS_SPECIAL_ALIAS_MMIO(&PageCopy))
                 { /* likely */ }
                 else
@@ -5271,13 +5317,18 @@ VMM_INT_DECL(int) PGMPhysIemGCPhys2PtrNoLock(PVMCC pVM, PVMCPUCC pVCpu, RTGCPHYS
                 {
                     case PGM_PAGE_STATE_ALLOCATED:
                         return pgmPhyIemGCphys2PtrNoLockReturnReadWrite(pVM, pVCpu, uTlbPhysRev, GCPhys, &PageCopy,
-                                                                       (PPGMRAMRANGE)pRam, (PPGMPAGE)pPage, ppb, pfTlb);
+                                                                       (PPGMRAMRANGE)pRam, (PPGMPAGE)pPage, ppb, pfTlb); // 可读写内存
 
                     case PGM_PAGE_STATE_ZERO:
+                    /*
+                     当客户机尝试写入该页时：
+                       硬件加速路径：若启用 VT-x/AMD-V，EPT/NPT 缺页异常触发 VM-Exit，Hypervisor 检测到该页状态为 WRITE_MONITORED，执行 写时复制（CoW）
+                       软件路径（IEM）：直接调用 pgmPhysPageMakeWritable，复制该页并更新映射，解除监控状态。
+                    */
                     case PGM_PAGE_STATE_WRITE_MONITORED:
                     case PGM_PAGE_STATE_SHARED:
                         return pgmPhyIemGCphys2PtrNoLockReturnReadOnly(pVM, pVCpu, uTlbPhysRev, GCPhys, &PageCopy,
-                                                                       (PPGMRAMRANGE)pRam, (PPGMPAGE)pPage, ppb, pfTlb);
+                                                                       (PPGMRAMRANGE)pRam, (PPGMPAGE)pPage, ppb, pfTlb); // 只读（零页）
 
                     default: AssertFailed(); RT_FALL_THROUGH();
                     case PGM_PAGE_STATE_BALLOONED:
@@ -5286,6 +5337,7 @@ VMM_INT_DECL(int) PGMPhysIemGCPhys2PtrNoLock(PVMCC pVM, PVMCPUCC pVCpu, RTGCPHYS
                 break;
 
             case PGM_PAGE_HNDL_PHYS_STATE_WRITE:
+                // 处理写保护页面（如COW页）
                 Assert(!PGM_PAGE_IS_SPECIAL_ALIAS_MMIO(&PageCopy));
                 switch (PGM_PAGE_GET_STATE_NA(&PageCopy))
                 {
@@ -5305,12 +5357,14 @@ VMM_INT_DECL(int) PGMPhysIemGCPhys2PtrNoLock(PVMCC pVM, PVMCPUCC pVCpu, RTGCPHYS
                 break;
 
             case PGM_PAGE_HNDL_PHYS_STATE_ALL:
+                // 完全受物理处理程序控制的页面（如MMIO设备）
                 Assert(!PGM_PAGE_IS_SPECIAL_ALIAS_MMIO(&PageCopy));
-                return pgmPhyIemGCphys2PtrNoLockReturnNoNothing(uTlbPhysRev, ppb, pfTlb, GCPhys, &PageCopy);
+                return pgmPhyIemGCphys2PtrNoLockReturnNoNothing(uTlbPhysRev, ppb, pfTlb, GCPhys, &PageCopy)// MMIO特殊页
         }
     }
     else
     {
+        //若地址查找失败（rc != VINF_SUCCESS），设置无访问权限标志：
         *pfTlb |= *puTlbPhysRev | PGMIEMGCPHYS2PTR_F_NO_WRITE | PGMIEMGCPHYS2PTR_F_NO_READ
                |  PGMIEMGCPHYS2PTR_F_NO_MAPPINGR3 | PGMIEMGCPHYS2PTR_F_UNASSIGNED;
         *ppb    = NULL;
@@ -5347,31 +5401,34 @@ VMM_INT_DECL(int) PGMPhysIemGCPhys2PtrNoLock(PVMCC pVM, PVMCPUCC pVCpu, RTGCPHYS
  * @remarks This is more or a less a copy of PGMR3PhysTlbGCPhys2Ptr.
  * @thread  EMT(pVCpu).
  */
+//负责将客户机物理地址（GCPhys）转换为可供 Hypervisor 直接操作的主机虚拟地址（*ppv），
+//同时处理内存权限和状态。其设计目标是为软件模拟路径提供高效且安全的内存访问机制。
 VMM_INT_DECL(int) PGMPhysIemGCPhys2Ptr(PVMCC pVM, PVMCPUCC pVCpu, RTGCPHYS GCPhys, bool fWritable, bool fByPassHandlers,
                                        void **ppv, PPGMPAGEMAPLOCK pLock)
 {
-    PGM_A20_APPLY_TO_VAR(pVCpu, GCPhys);
+    PGM_A20_APPLY_TO_VAR(pVCpu, GCPhys);//修正客户机物理地址，模拟传统 CPU 的地址回绕行为（如 8086 的 20 位地址空间）。
 
     PGM_LOCK_VOID(pVM);
 
     PPGMRAMRANGE pRam;
     PPGMPAGE pPage;
+    //根据 GCPhys 获取对应的 内存页描述符 pPage和 RAM 范围 pRam。
     int rc = pgmPhysGetPageAndRangeEx(pVM, GCPhys, &pPage, &pRam);
     if (RT_SUCCESS(rc))
     {
         if (PGM_PAGE_IS_BALLOONED(pPage))
-            rc = VERR_PGM_PHYS_TLB_CATCH_WRITE;
+            rc = VERR_PGM_PHYS_TLB_CATCH_WRITE;//需协调动态内存回收。
         else if (PGM_PAGE_IS_SPECIAL_ALIAS_MMIO(pPage))
-            rc = VERR_PGM_PHYS_TLB_CATCH_ALL;
+            rc = VERR_PGM_PHYS_TLB_CATCH_ALL;//触发设备模拟。
         else if (   !PGM_PAGE_HAS_ANY_HANDLERS(pPage)
                  || (fByPassHandlers && !PGM_PAGE_IS_MMIO(pPage)) )
-            rc = VINF_SUCCESS;
+            rc = VINF_SUCCESS;//允许直接访问
         else
         {
             if (PGM_PAGE_HAS_ACTIVE_ALL_HANDLERS(pPage)) /* catches MMIO */
             {
                 Assert(!fByPassHandlers || PGM_PAGE_IS_MMIO(pPage));
-                rc = VERR_PGM_PHYS_TLB_CATCH_ALL;
+                rc = VERR_PGM_PHYS_TLB_CATCH_ALL;//触发设备模拟。
             }
             else if (PGM_PAGE_HAS_ACTIVE_HANDLERS(pPage) && fWritable)
             {
@@ -5384,6 +5441,8 @@ VMM_INT_DECL(int) PGMPhysIemGCPhys2Ptr(PVMCC pVM, PVMCPUCC pVCpu, RTGCPHYS GCPhy
             int rc2;
 
             /* Make sure what we return is writable. */
+            //若页面为 零页（Zero）、共享页（Shared）或 写监控页（Write Monitored），
+            //调用 pgmPhysPageMakeWritable 触发 写时复制（Copy-on-Write），分配物理页并复制数据
             if (fWritable)
                 switch (PGM_PAGE_GET_STATE(pPage))
                 {
@@ -5402,14 +5461,15 @@ VMM_INT_DECL(int) PGMPhysIemGCPhys2Ptr(PVMCC pVM, PVMCPUCC pVCpu, RTGCPHYS GCPhy
 
             /* Get a ring-3 mapping of the address. */
             PPGMPAGEMAPTLBE pTlbe;
+            // 从 页映射 TLB获取主机虚拟地址条目 pTlbe
             rc2 = pgmPhysPageQueryTlbeWithPage(pVM, pPage, GCPhys, &pTlbe);
             AssertLogRelRCReturn(rc2, rc2);
 
             /* Lock it and calculate the address. */
             if (fWritable)
-                pgmPhysPageMapLockForWriting(pVM, pPage, pTlbe, pLock);
+                pgmPhysPageMapLockForWriting(pVM, pPage, pTlbe, pLock);//写访问：pgmPhysPageMapLockForWriting 锁定页面，防止并发写入冲突。
             else
-                pgmPhysPageMapLockForReading(pVM, pPage, pTlbe, pLock);
+                pgmPhysPageMapLockForReading(pVM, pPage, pTlbe, pLock);//读访问：pgmPhysPageMapLockForReading 锁定页面，确保读取期间内存不被释放。
             *ppv = (void *)((uintptr_t)pTlbe->pv | (uintptr_t)(GCPhys & GUEST_PAGE_OFFSET_MASK));
 
             Log6(("PGMPhysIemGCPhys2Ptr: GCPhys=%RGp rc=%Rrc pPage=%R[pgmpage] *ppv=%p\n", GCPhys, rc, pPage, *ppv));
@@ -5450,25 +5510,49 @@ VMM_INT_DECL(int) PGMPhysIemGCPhys2Ptr(PVMCC pVM, PVMCPUCC pVCpu, RTGCPHYS GCPhy
  *          a stop gap thing that should be removed once there is a better TLB
  *          for virtual address accesses.
  */
+//IEM（In-kernel Execution Manager）
+//检查指定客户物理地址（GCPhys）的访问权限，判断是否需要 软件模拟处理（如触发 MMIO 或 Ballooning 逻辑），
+//返回 TLB（Translation Lookaside Buffer）捕获状态
+/*
+IEM 负责在 非硬件加速路径（如单步调试、复杂指令模拟）中处理内存访问，需主动检查每次访问是否需要软件介入。
+硬件虚拟化路径（如 VT-x/AMD-V）：通过 EPT/NPT 缺页异常自动触发 VM-Exit，由 Hypervisor 统一处理，无需显式查询。
+
+路径选择逻辑
+  默认启用硬件加速：若 CPU 支持 VT-x/AMD-V 且已启用，VirtualBox 优先使用硬件虚拟化路径4。
+  回退到软件路径：仅在硬件加速不可用（如嵌套虚拟化、调试模式）时，才会切换到 IEM 路径
+
+  可以理解成，在硬件加速的情况下，对于硬件加速处理不了的指令，我们需要IEM的介入
+
+硬件加速与 IEM 的分工
+场景	                    处理方式	    示例
+常规指令	                硬件直接执行	普通内存读写、大部分非特权指令
+硬件无法处理的指令	        IEM 介入模拟	复杂指令（如 CPUID）、特权操作（如 MOV CR3）、特殊内存访问（MMIO）
+调试/监控需求	            IEM 强制介入	单步调试、内存断点、性能分析
+*/
 VMM_INT_DECL(int) PGMPhysIemQueryAccess(PVMCC pVM, RTGCPHYS GCPhys, bool fWritable, bool fByPassHandlers)
 {
     PGM_LOCK_VOID(pVM);
+
+    //PGM_A20_ASSERT_MASKED 验证客户物理地址已应用 A20 掩码（兼容传统硬件寻址）
     PGM_A20_ASSERT_MASKED(VMMGetCpu(pVM), GCPhys);
 
     PPGMRAMRANGE pRam;
     PPGMPAGE pPage;
+    // 获取内存页描述符 pPage 和所属 RAM 范围 pRam
+    // 若地址无效（如未映射或越界），直接返回 VERR_PGM_PHYS_TLB_UNASSIGNED
     int rc = pgmPhysGetPageAndRangeEx(pVM, GCPhys, &pPage, &pRam);
     if (RT_SUCCESS(rc))
     {
         if (PGM_PAGE_IS_BALLOONED(pPage))
-            rc = VERR_PGM_PHYS_TLB_CATCH_WRITE;
-        else if (PGM_PAGE_IS_SPECIAL_ALIAS_MMIO(pPage))
+            rc = VERR_PGM_PHYS_TLB_CATCH_WRITE;//Balloon 页（PGM_PAGE_IS_BALLOONED）：需捕获写操作以协调内存动态回收
+        else if (PGM_PAGE_IS_SPECIAL_ALIAS_MMIO(pPage)) //MMIO 别名页：拦截所有访问以触发设备模拟
             rc = VERR_PGM_PHYS_TLB_CATCH_ALL;
-        else if (   !PGM_PAGE_HAS_ANY_HANDLERS(pPage)
+        else if (   !PGM_PAGE_HAS_ANY_HANDLERS(pPage)   //若页面无处理程序或允许绕过（fByPassHandlers），直接放行（VINF_SUCCESS）
                  || (fByPassHandlers && !PGM_PAGE_IS_MMIO(pPage)) )
             rc = VINF_SUCCESS;
         else
         {
+            //对活跃处理程序（如 MMIO 或监控逻辑），根据访问类型（读/写）返回对应的捕获状态
             if (PGM_PAGE_HAS_ACTIVE_ALL_HANDLERS(pPage)) /* catches MMIO */
             {
                 Assert(!fByPassHandlers || PGM_PAGE_IS_MMIO(pPage));
@@ -5599,6 +5683,13 @@ VMM_INT_DECL(int) PGMPhysNemPageInfoChecker(PVMCC pVM, PVMCPUCC pVCpu, RTGCPHYS 
  * @param   pfnCallback     The callback function.
  * @param   pvUser          User argument for the callback.
  */
+//遍历虚拟机物理内存页（RAM Range），根据 NEM（Native Execution Manager）
+//状态筛选符合条件的页面，并调用回调函数进行处理（如状态更新、内存回收等）。
+/*
+  遍历所有物理内存页（RAM Range）；
+  根据 NEM 状态（如脏页、锁定页）筛选页面；
+  通过回调函数处理符合条件的页面（如更新 EPT/NPT）
+*/
 VMM_INT_DECL(int) PGMPhysNemEnumPagesByState(PVMCC pVM, PVMCPUCC pVCpu, uint8_t uMinState,
                                              PFNPGMPHYSNEMENUMCALLBACK pfnCallback, void *pvUser)
 {

@@ -1080,8 +1080,15 @@ size NAME(RT_CONCAT(hmR0VmxStartVmHostRIP,%1))  NAME(RT_CONCAT(hmR0VmxStartVm,%1
 
 
 %endmacro ; hmR0VmxStartVmTemplate
-
+;定义一个 NASM 宏，名为 hmR0VmxStartVmSseTemplate，接受 2 个参数：
+;%1：通常用于传递 SSE 保存/恢复标志（如 sse 或 no-sse）。
+;%2：用于扩展函数名后缀（如 _resume 或 _launch）。
 %macro hmR0VmxStartVmSseTemplate 2
+
+;param1:：函数名后缀（如 _SansXcr0_SansIbpbEntry_...），与 %2 拼接
+;第2参数：XCR0 处理标志（0=不处理，1=处理）。
+;第3参数：安全措施标志的位掩码（HM_WSF_IBPB_ENTRY、HM_WSF_L1D_ENTRY 等）。
+;第4参数：SSE 相关标志（来自 %1）。
 hmR0VmxStartVmTemplate _SansXcr0_SansIbpbEntry_SansL1dEntry_SansMdsEntry_SansIbpbExit %+ %2, 0, 0                 | 0                | 0                | 0               , %1
 hmR0VmxStartVmTemplate _WithXcr0_SansIbpbEntry_SansL1dEntry_SansMdsEntry_SansIbpbExit %+ %2, 1, 0                 | 0                | 0                | 0               , %1
 hmR0VmxStartVmTemplate _SansXcr0_WithIbpbEntry_SansL1dEntry_SansMdsEntry_SansIbpbExit %+ %2, 0, HM_WSF_IBPB_ENTRY | 0                | 0                | 0               , %1
@@ -1321,9 +1328,7 @@ BEGINPROC RT_CONCAT(hmR0SvmVmRun,%1)
  %endif
 
         ; Save host fs, gs, sysenter msr etc.
-        mov     rax, [rsi + GVMCPU.hmr0 + HMR0PERVCPU.svm + HMR0CPUSVM.HCPhysVmcbHost]
-        mov     qword [rbp + frm_HCPhysVmcbHost], rax ; save for the vmload after vmrun
-        lea     rsi, [rsi + VMCPU.cpum.GstCtx]
+        mov     rax, [rsi + GVMCPU.hmr0 + HMR0PERVCPU.svm + HMR0CPUSVM.HCPhysVmcbHost] mov     qword [rbp + frm_HCPhysVmcbHost], rax ; save for the vmload after vmrun lea     rsi, [rsi + VMCPU.cpum.GstCtx]
         mov     qword [rbp + frm_pGstCtx], rsi
         vmsave
 

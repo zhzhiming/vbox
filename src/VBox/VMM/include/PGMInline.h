@@ -332,6 +332,10 @@ DECLINLINE(int) pgmPhysPageQueryTlbe(PVMCC pVM, RTGCPHYS GCPhys, PPPGMPAGEMAPTLB
  * @param   GCPhys      The address of the guest page.
  * @param   ppTlbe      Where to store the pointer to the TLB entry.
  */
+/*
+  EPT Violation 处理：当硬件检测到 EPT 表缺失时，触发 VM-Exit，VMM 调用此函数填充 TLB
+  内存访问模拟：如客户机执行 MOV [eax], ebx，若 TLB 未命中需加载页表
+ * */
 DECLINLINE(int) pgmPhysPageQueryTlbeWithPage(PVMCC pVM, PPGMPAGE pPage, RTGCPHYS GCPhys, PPPGMPAGEMAPTLBE ppTlbe)
 {
     int rc;

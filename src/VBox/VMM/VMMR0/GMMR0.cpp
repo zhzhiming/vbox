@@ -739,6 +739,13 @@ static uint32_t             gmmR0StrictPageChecksum(PGMM pGMM, PGVM pGVM, uint32
  *
  * @returns VBox status code.
  */
+/*
+分层锁设计
+锁类型	            用途	        初始化方式
+块级锁池	        保护独立内存块	RTSemFastMutexCreate循环创建
+自旋锁（树）	    保护AVL树结构	RTSpinlockCreate中断安全模式
+自旋锁（ChunkID）	保护ID分配位图	同上
+ * */
 GMMR0DECL(int) GMMR0Init(void)
 {
     LogFlow(("GMMInit:\n"));
@@ -747,8 +754,8 @@ GMMR0DECL(int) GMMR0Init(void)
        dish out guest pages with different size from the host page later if
        needed, though a restriction would be the host page size must be larger
        than the guest page size. */
-    AssertCompile(GUEST_PAGE_SIZE == HOST_PAGE_SIZE);
-    AssertCompile(GUEST_PAGE_SIZE <= HOST_PAGE_SIZE);
+    AssertCompile(GUEST_PAGE_SIZE == HOST_PAGE_SIZE); // 静态断言确保页大小一致
+    AssertCompile(GUEST_PAGE_SIZE <= HOST_PAGE_SIZE);// 防御性二次验证
 
     /*
      * Allocate the instance data and the locks.
@@ -758,11 +765,17 @@ GMMR0DECL(int) GMMR0Init(void)
         return VERR_NO_MEMORY;
 
     pGMM->u32Magic = GMM_MAGIC;
+    //TLB预热：避免首次访问时的冷启动问题
+    /*
+       如果TLB未初始化，首次访问可能触发页表查询，导致不可预测的延迟。
+       通过显式初始化，确保TLB的初始状态可控，减少运行时的不确定性。
+    */
     for (unsigned i = 0; i < RT_ELEMENTS(pGMM->ChunkTLB.aEntries); i++)
-        pGMM->ChunkTLB.aEntries[i].idChunk = NIL_GMM_CHUNKID;
+        pGMM->ChunkTLB.aEntries[i].idChunk = NIL_GMM_CHUNKID; // TLB初始化
     RTListInit(&pGMM->ChunkList);
-    ASMBitSet(&pGMM->bmChunkId[0], NIL_GMM_CHUNKID);
+    ASMBitSet(&pGMM->bmChunkId[0], NIL_GMM_CHUNKID);// 位图标记保留ID
 
+    //通过编译宏选择锁实现（关键区段适合复杂操作，互斥量侧重性能）
 #ifdef VBOX_USE_CRIT_SECT_FOR_GIANT
     int rc = RTCritSectInit(&pGMM->GiantCritSect);
 #else
@@ -779,6 +792,7 @@ GMMR0DECL(int) GMMR0Init(void)
         }
         pGMM->hSpinLockTree = NIL_RTSPINLOCK;
         if (RT_SUCCESS(rc))
+            //中断安全：自旋锁标记RTSPINLOCK_FLAGS_INTERRUPT_SAFE确保内核态可用
             rc = RTSpinlockCreate(&pGMM->hSpinLockTree, RTSPINLOCK_FLAGS_INTERRUPT_SAFE, "gmm-chunk-tree");
         pGMM->hSpinLockChunkId = NIL_RTSPINLOCK;
         if (RT_SUCCESS(rc))
@@ -794,11 +808,14 @@ GMMR0DECL(int) GMMR0Init(void)
             pGMM->fHasWorkingAllocPhysNC = false;
 
             RTR0MEMOBJ hMemObj;
+            // 能力检测：运行时检查宿主是否支持非连续物理内存映射
+            // 尝试非连续物理内存分配
             rc = RTR0MemObjAllocPhysNC(&hMemObj, GMM_CHUNK_SIZE, NIL_RTHCPHYS);
             if (RT_SUCCESS(rc))
             {
                 rc = RTR0MemObjFree(hMemObj, true);
                 AssertRC(rc);
+                //成功时设置标志位，如果失败没有设置标志位,后续逻辑切换至保守分配策略
                 pGMM->fHasWorkingAllocPhysNC = true;
             }
             else if (rc != VERR_NOT_SUPPORTED)
@@ -831,7 +848,7 @@ GMMR0DECL(int) GMMR0Init(void)
         RTSpinlockDestroy(pGMM->hSpinLockChunkId);
         RTSpinlockDestroy(pGMM->hSpinLockTree);
         while (iMtx-- > 0)
-            RTSemFastMutexDestroy(pGMM->aChunkMtx[iMtx].hMtx);
+            RTSemFastMutexDestroy(pGMM->aChunkMtx[iMtx].hMtx);// 逆向销毁已创建的块级锁
 #ifdef VBOX_USE_CRIT_SECT_FOR_GIANT
         RTCritSectDelete(&pGMM->GiantCritSect);
 #else
@@ -849,6 +866,11 @@ GMMR0DECL(int) GMMR0Init(void)
 /**
  * Terminates the GMM component.
  */
+/*
+  销毁阶段：作为GMM模块的终止函数，负责逆向执行GMMR0Init的初始化流程
+  资源清理：释放所有动态分配的资源（内存、锁、数据结构等）
+  状态终结：确保系统处于可安全卸载状态（避免内存泄漏或悬垂指针）
+ * */
 GMMR0DECL(void) GMMR0Term(void)
 {
     LogFlow(("GMMTerm:\n"));
@@ -859,7 +881,7 @@ GMMR0DECL(void) GMMR0Term(void)
     PGMM pGMM = g_pGMM;
     if (!RT_VALID_PTR(pGMM))
         return;
-    if (pGMM->u32Magic != GMM_MAGIC)
+    if (pGMM->u32Magic != GMM_MAGIC)// 魔数校验
     {
         SUPR0Printf("GMMR0Term: u32Magic=%#x\n", pGMM->u32Magic);
         return;
@@ -869,8 +891,15 @@ GMMR0DECL(void) GMMR0Term(void)
      * Undo what init did and free all the resources we've acquired.
      */
     /* Destroy the fundamentals. */
-    g_pGMM = NULL;
-    pGMM->u32Magic    = ~GMM_MAGIC;
+    g_pGMM = NULL; // 清除全局指针
+    pGMM->u32Magic    = ~GMM_MAGIC;// 反转魔数
+    /*
+     * 锁销毁序列
+锁类型	    销毁方式	                               注意事项
+全局锁	    RTCritSectDelete/RTSemFastMutexDestroy	根据编译选项选择实现
+自旋锁	    RTSpinlockDestroy	                    销毁树状结构锁和ChunkID锁
+块级锁池	遍历aChunkMtx数组销毁	                需断言检查cUsers == 0（无残留用户）
+     * */
 #ifdef VBOX_USE_CRIT_SECT_FOR_GIANT
     RTCritSectDelete(&pGMM->GiantCritSect);
 #else
@@ -883,6 +912,7 @@ GMMR0DECL(void) GMMR0Term(void)
     pGMM->hSpinLockChunkId = NIL_RTSPINLOCK;
 
     /* Free any chunks still hanging around. */
+    //使用AVL树销毁回调gmmR0TermDestroyChunk释放所有残留内存块
     RTAvlU32Destroy(&pGMM->pChunks, gmmR0TermDestroyChunk, pGMM);
 
     /* Destroy the chunk locks. */
@@ -894,7 +924,7 @@ GMMR0DECL(void) GMMR0Term(void)
     }
 
     /* Finally the instance data itself. */
-    RTMemFree(pGMM);
+    RTMemFree(pGMM);// 最终释放GMM实例自身
     LogFlow(("GMMTerm: done\n"));
 }
 
@@ -1011,6 +1041,12 @@ static int gmmR0MutexRelease(PGMM pGMM)
  * @param   puLockNanoTS    Where the lock acquisition time stamp is kept
  *                          (in/out).
  */
+//全局锁主动让出
+/*
+  协作式并发控制：通过主动让出全局锁（Giant Lock）减少线程争用
+  自适应性：仅在检测到实际竞争（cMtxContenders > 0）且持有锁超时（≥2ms）时触发
+  公平性保障：通过RTThreadYield()让出CPU时间片，避免线程饥饿
+ * */
 static bool gmmR0MutexYield(PGMM pGMM, uint64_t *puLockNanoTS)
 {
     /*
@@ -1032,22 +1068,28 @@ static bool gmmR0MutexYield(PGMM pGMM, uint64_t *puLockNanoTS)
 #ifdef VBOX_STRICT
     pGMM->hMtxOwner = NIL_RTNATIVETHREAD;
 #endif
-    ASMAtomicIncU32(&pGMM->cMtxContenders);
+    //为何在释放全局锁之前要标记为竞争状态?
+    /*
+      原子递增必要性：在释放锁与后续重获锁的间隙期，其他线程可能修改共享资源。
+        通过预先增加竞争者计数，确保后续线程能感知当前存在并发访问需求
+      状态同步保障：避免出现“释放锁后→ 其他线程误判无竞争→ 跳过等待”的竞态场景
+    */
+    ASMAtomicIncU32(&pGMM->cMtxContenders); // 标记为竞争状态
 #ifdef VBOX_USE_CRIT_SECT_FOR_GIANT
     int rc1 = RTCritSectLeave(&pGMM->GiantCritSect); AssertRC(rc1);
 #else
-    int rc1 = RTSemFastMutexRelease(pGMM->hMtx); AssertRC(rc1);
+    int rc1 = RTSemFastMutexRelease(pGMM->hMtx); AssertRC(rc1);// 释放全局锁
 #endif
 
-    RTThreadYield();
+    RTThreadYield();                         // 主动让出CPU
 
 #ifdef VBOX_USE_CRIT_SECT_FOR_GIANT
     int rc2 = RTCritSectEnter(&pGMM->GiantCritSect); AssertRC(rc2);
 #else
-    int rc2 = RTSemFastMutexRequest(pGMM->hMtx); AssertRC(rc2);
+    int rc2 = RTSemFastMutexRequest(pGMM->hMtx); AssertRC(rc2);// 重新获取锁
 #endif
     *puLockNanoTS = RTTimeSystemNanoTS();
-    ASMAtomicDecU32(&pGMM->cMtxContenders);
+    ASMAtomicDecU32(&pGMM->cMtxContenders);// 清除竞争标记
 #ifdef VBOX_STRICT
     pGMM->hMtxOwner = RTThreadNativeSelf();
 #endif
@@ -1070,10 +1112,30 @@ static bool gmmR0MutexYield(PGMM pGMM, uint64_t *puLockNanoTS)
  * @param   pChunk      Pointer to the chunk.
  * @param   fFlags      Flags regarding the giant lock, GMMR0CHUNK_MTX_XXX.
  */
+//分块互斥锁获取
+/*
+ *两锁协作机制
+交互阶段	全局锁状态	        块锁状态	目的
+初始操作	持有	            未持有	    安全查找/分配块锁索引56
+核心操作	可释放（DROP_GIANT）持有	    允许其他线程并发操作非冲突内存块6
+收尾操作	可重获（RETAKE）	释放	    确保全局状态一致性（如引用计数归零检查）
+
+允许其他线程并发操作非冲突内存块 内存块不冲突了为何还需要块锁?
+1. 内存块元数据共享冲突
+     元数据竞争：不同内存块可能共享全局管理结构（如空闲链表、引用计数表），修改非冲突块的元数据仍可能引发数据竞争12
+     示例：两个线程同时修改不同chunk的cUsers引用计数时，若不加锁会导致原子操作失效
+   全局状态同步：内存分配/释放操作需要更新全局位图或树状结构，这些共享数据结构必须受保护58
+2. 操作原子性要求
+     复合操作保护：单个内存块操作（如分配）可能包含多个不可分割的子步骤：
+         1. 检查空闲位图 → 2. 修改映射表 → 3. 更新统计计数器
+     即使操作不同内存块，这些步骤仍需保证原子性15
+     内存一致性：防止CPU缓存未及时刷新导致其他线程读取到中间状态
+
+ * */
 static int gmmR0ChunkMutexAcquire(PGMMR0CHUNKMTXSTATE pMtxState, PGMM pGMM, PGMMCHUNK pChunk, uint32_t fFlags)
 {
     Assert(fFlags > GMMR0CHUNK_MTX_INVALID && fFlags < GMMR0CHUNK_MTX_END);
-    Assert(pGMM->hMtxOwner == RTThreadNativeSelf());
+    Assert(pGMM->hMtxOwner == RTThreadNativeSelf());//调用线程必须已持有全局GMM锁
 
     pMtxState->pGMM   = pGMM;
     pMtxState->fFlags = (uint8_t)fFlags;
@@ -1083,8 +1145,10 @@ static int gmmR0ChunkMutexAcquire(PGMMR0CHUNKMTXSTATE pMtxState, PGMM pGMM, PGMM
      */
     Assert(pGMM->hMtxOwner == RTThreadNativeSelf());
     uint32_t iChunkMtx = pChunk->iChunkMtx;
-    if (iChunkMtx == UINT8_MAX)
+    if (iChunkMtx == UINT8_MAX) // 首次分配索引
     {
+        //动态分配策略：采用轮询分配（iNextChunkMtx）避免热点争用
+        //冲突解决：最多三次回退尝试寻找空闲锁槽（cUsers == 0）
         iChunkMtx = pGMM->iNextChunkMtx++;
         iChunkMtx %= RT_ELEMENTS(pGMM->aChunkMtx);
 
@@ -1109,7 +1173,7 @@ static int gmmR0ChunkMutexAcquire(PGMMR0CHUNKMTXSTATE pMtxState, PGMM pGMM, PGMM
     }
     AssertCompile(RT_ELEMENTS(pGMM->aChunkMtx) < UINT8_MAX);
     pMtxState->iChunkMtx = (uint8_t)iChunkMtx;
-    ASMAtomicIncU32(&pGMM->aChunkMtx[iChunkMtx].cUsers);
+    ASMAtomicIncU32(&pGMM->aChunkMtx[iChunkMtx].cUsers);//引用计数
 
     /*
      * Drop the giant?
@@ -1118,7 +1182,7 @@ static int gmmR0ChunkMutexAcquire(PGMMR0CHUNKMTXSTATE pMtxState, PGMM pGMM, PGMM
     {
         /** @todo GMM life cycle cleanup (we may race someone
          *        destroying and cleaning up GMM)? */
-        gmmR0MutexRelease(pGMM);
+        gmmR0MutexRelease(pGMM); // 释放全局锁
     }
 
     /*
@@ -1141,6 +1205,7 @@ static int gmmR0ChunkMutexAcquire(PGMMR0CHUNKMTXSTATE pMtxState, PGMM pGMM, PGMM
  *                      can be selected next time, thus avoiding contented
  *                      mutexes.
  */
+//分块互斥锁释放
 static int gmmR0ChunkMutexRelease(PGMMR0CHUNKMTXSTATE pMtxState, PGMMCHUNK pChunk)
 {
     PGMM pGMM = pMtxState->pGMM;
@@ -1148,6 +1213,7 @@ static int gmmR0ChunkMutexRelease(PGMMR0CHUNKMTXSTATE pMtxState, PGMMCHUNK pChun
     /*
      * Release the chunk mutex and reacquire the giant if requested.
      */
+    //先释放块级锁（RTSemFastMutexRelease），再根据标志位决定是否重获全局锁（gmmR0MutexAcquire）
     int rc = RTSemFastMutexRelease(pGMM->aChunkMtx[pMtxState->iChunkMtx].hMtx);
     AssertRC(rc);
     if (pMtxState->fFlags == GMMR0CHUNK_MTX_RETAKE_GIANT)
@@ -1159,6 +1225,8 @@ static int gmmR0ChunkMutexRelease(PGMMR0CHUNKMTXSTATE pMtxState, PGMMCHUNK pChun
      * Drop the chunk mutex user reference and deassociate it from the chunk
      * when possible.
      */
+    //减少块锁的引用计数
+    //当引用归零时，将块结构中的iChunkMtx置为UINT8_MAX解除关联
     if (   ASMAtomicDecU32(&pGMM->aChunkMtx[pMtxState->iChunkMtx].cUsers) == 0
         && pChunk
         && RT_SUCCESS(rc) )
@@ -1167,10 +1235,17 @@ static int gmmR0ChunkMutexRelease(PGMMR0CHUNKMTXSTATE pMtxState, PGMMCHUNK pChun
             pChunk->iChunkMtx = UINT8_MAX;
         else
         {
-            rc = gmmR0MutexAcquire(pGMM);
+            //在DROP_GIANT模式下需重获全局锁后二次检查引用计数，避免竞态条件
+            /*
+             * 当线程A释放块锁后、重获全局锁前，可能发生：
+               线程B同时获取全局锁并修改块锁引用计数
+               线程A的旧引用计数检查结果失效（cUsers可能被其他线程修改)
+               所以线程A需要重新检查cUsers
+             * */
+            rc = gmmR0MutexAcquire(pGMM);// 重获全局锁
             if (RT_SUCCESS(rc))
             {
-                if (pGMM->aChunkMtx[pMtxState->iChunkMtx].cUsers == 0)
+                if (pGMM->aChunkMtx[pMtxState->iChunkMtx].cUsers == 0) // 二次检查
                     pChunk->iChunkMtx = UINT8_MAX;
                 rc = gmmR0MutexRelease(pGMM);
             }
@@ -1225,6 +1300,12 @@ static uint16_t gmmR0GetCurrentNumaNodeId(void)
  *
  * @param   pGVM    Pointer to the Global VM structure.
  */
+//虚拟机清理
+/*
+  内存资源回收：彻底清理虚拟机占用的私有页、共享页和固定内存页
+  全局状态维护：更新GMM全局统计信息（cRegisteredVMs、cAllocatedPages等）
+  异常处理：检测并报告"内存泄漏"（未正确释放的页面）
+*/
 GMMR0DECL(void) GMMR0CleanupVM(PGVM pGVM)
 {
     LogFlow(("GMMR0CleanupVM: pGVM=%p:{.hSelf=%#x}\n", pGVM, pGVM->hSelf));
@@ -1274,8 +1355,10 @@ GMMR0DECL(void) GMMR0CleanupVM(PGVM pGVM)
         do
         {
             fRedoFromStart = false;
+            //反向遍历：从最新分配的内存块开始扫描（RTListForEachReverse）
             RTListForEachReverse(&pGMM->ChunkList, pChunk, GMMCHUNK, ListNode)
             {
+                //绑定模式优化：在绑定内存模式下只处理属于当前VM的chunk
                 uint32_t const cFreeChunksOld = pGMM->cFreedChunks;
                 if (   (   !pGMM->fBoundMemoryMode
                         || pChunk->hGVM == pGVM->hSelf)
@@ -1288,6 +1371,7 @@ GMMR0DECL(void) GMMR0CleanupVM(PGVM pGVM)
                 else
                 {
                     /* Didn't leave it, so do normal yielding. */
+                    //锁控制：通过iCountDown实现周期性锁让步（gmmR0MutexYield）
                     if (!iCountDown)
                         gmmR0MutexYield(pGMM, &uLockNanoTS);
                     else
@@ -1318,10 +1402,12 @@ GMMR0DECL(void) GMMR0CleanupVM(PGVM pGVM)
             while (pChunk)
             {
                 PGMMCHUNK pNext = pChunk->pFreeNext;
+                //专门回收完全空闲的chunk
                 Assert(pChunk->cFree == GMM_CHUNK_NUM_PAGES);
                 if (   !pGMM->fBoundMemoryMode
                     || pChunk->hGVM == pGVM->hSelf)
                 {
+                    //通过idGeneration检测链表结构变化
                     uint64_t const idGenerationOld = pPrivateSet->idGeneration;
                     if (gmmR0FreeChunk(pGMM, pGVM, pChunk, true /*fRelaxedSem*/))
                     {
@@ -1351,6 +1437,7 @@ GMMR0DECL(void) GMMR0CleanupVM(PGVM pGVM)
         /*
          * Account for shared pages that weren't freed.
          */
+        //强制扣除未释放的共享页计数（最后手段）
         if (pGVM->gmm.s.Stats.cSharedPages)
         {
             Assert(pGMM->cSharedPages >= pGVM->gmm.s.Stats.cSharedPages);
@@ -1410,6 +1497,25 @@ GMMR0DECL(void) GMMR0CleanupVM(PGVM pGVM)
  * @param   pGVM        The global VM handle.
  * @param   pChunk      The chunk to scan.
  */
+//虚拟机终止时清理其占用的内存资源
+/*
+  内存页回收：扫描指定内存块(chunk)，释放属于目标虚拟机(pGVM)的私有页
+  状态校验：验证内存块统计信息(cFree/cPrivate/cShared)的准确性
+  映射清理：解除虚拟机在该内存块上的所有内存映射
+*/
+/*
+  struct GMMCHUNK {
+      uint32_t            cFree;          // 空闲页计数
+      uint32_t            cPrivate;       // 私有页计数
+      uint32_t            cShared;        // 共享页计数
+      uint16_t            iFreeHead;      // 空闲链表头
+      struct {
+          uint16_t        hGVM;           // 所属虚拟机句柄
+          // ...其他字段
+      } aPages[GMM_CHUNK_NUM_PAGES];     // 页描述符数组
+      // ...其他字段
+  };
+*/
 static bool gmmR0CleanupVMScanChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk)
 {
     Assert(!pGMM->fBoundMemoryMode || pChunk->hGVM == pGVM->hSelf);
@@ -1433,6 +1539,7 @@ static bool gmmR0CleanupVMScanChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk)
         while (iPage-- > 0)
             if (GMM_PAGE_IS_PRIVATE(&pChunk->aPages[iPage]))
             {
+                // 释放私有页
                 if (pChunk->aPages[iPage].Private.hGVM == hGVM)
                 {
                     /*
@@ -1443,11 +1550,11 @@ static bool gmmR0CleanupVMScanChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk)
                      * an AVL tree walk here.
                      */
                     pChunk->aPages[iPage].u = 0;
-                    pChunk->aPages[iPage].Free.u2State = GMM_PAGE_STATE_FREE;
+                    pChunk->aPages[iPage].Free.u2State = GMM_PAGE_STATE_FREE; //将页面状态标记为GMM_PAGE_STATE_FREE
                     pChunk->aPages[iPage].Free.fZeroed = false;
-                    pChunk->aPages[iPage].Free.iNext   = pChunk->iFreeHead;
+                    pChunk->aPages[iPage].Free.iNext   = pChunk->iFreeHead;//更新空闲链表头(iFreeHead)
                     pChunk->iFreeHead = iPage;
-                    pChunk->cPrivate--;
+                    pChunk->cPrivate--; //调整计数
                     pChunk->cFree++;
                     pGVM->gmm.s.Stats.cPrivatePages--;
                     cFree++;
@@ -1455,6 +1562,7 @@ static bool gmmR0CleanupVMScanChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk)
                 else
                     cPrivate++;
             }
+            // 统计其他类型页面
             else if (GMM_PAGE_IS_FREE(&pChunk->aPages[iPage]))
                 cFree++;
             else
@@ -1465,6 +1573,7 @@ static bool gmmR0CleanupVMScanChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk)
         /*
          * Did it add up?
          */
+        // 强制修正统计值
         if (RT_UNLIKELY(    pChunk->cFree != cFree
                         ||  pChunk->cPrivate != cPrivate
                         ||  pChunk->cShared != cShared))
@@ -1488,7 +1597,7 @@ static bool gmmR0CleanupVMScanChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk)
         else if (pChunk->cFree != GMM_CHUNK_NUM_PAGES)
         {
             SUPR0Printf("gmmR0CleanupVMScanChunk: %RKv/%#x: cFree=%#x - it should be 0 in bound mode!\n",
-                        pChunk, pChunk->Core.Key, pChunk->cFree);
+                        pChunk, pChunk->Core.Key, pChunk->cFree);//通过SUPR0Printf输出错误详情（生产环境可见）
             AssertMsgFailed(("%p/%#x: cFree=%#x - it should be 0 in bound mode!\n", pChunk, pChunk->Core.Key, pChunk->cFree));
 
             gmmR0UnlinkChunk(pChunk);
@@ -1504,6 +1613,7 @@ static bool gmmR0CleanupVMScanChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk)
     gmmR0ChunkMutexAcquire(&MtxState, pGMM, pChunk, GMMR0CHUNK_MTX_KEEP_GIANT);
     unsigned cMappings = pChunk->cMappingsX;
     for (unsigned i = 0; i < cMappings; i++)
+        //// 从映射数组中移除该项
         if (pChunk->paMappingsX[i].pGVM == pGVM)
         {
             gmmR0ChunkMutexDropGiant(&MtxState);
@@ -1518,6 +1628,7 @@ static bool gmmR0CleanupVMScanChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk)
             Assert(pChunk->cMappingsX - 1U == cMappings);
             pChunk->cMappingsX = cMappings;
 
+            //释放宿主内存对象
             int rc = RTR0MemObjFree(hMemObj, false /* fFreeMappings (NA) */);
             if (RT_FAILURE(rc))
             {
@@ -1661,6 +1772,20 @@ GMMR0DECL(int) GMMR0InitialReservationReq(PGVM pGVM, VMCPUID idCpu, PGMMINITIALR
  *
  * @thread  EMT(idCpu)
  */
+//更新虚拟机内存预留
+/*
+  内存预留更新：调整虚拟机(GVM)的三种内存页预留数量：
+    cBasePages：普通客户机物理内存页
+    cShadowPages：影子页表（用于硬件虚拟化加速）
+    cFixedPages：固定用途内存页（如DMA缓冲区）
+*/
+/*
+典型应用场景
+ 该函数被以下场景调用：
+   虚拟机启动配置：初始化内存预留
+   动态内存调整：通过VMMDev实现热调整
+   内存气球驱动：Ballooning机制调整预留值
+*/
 GMMR0DECL(int) GMMR0UpdateReservation(PGVM pGVM, VMCPUID idCpu, uint64_t cBasePages,
                                       uint32_t cShadowPages, uint32_t cFixedPages)
 {
@@ -1696,10 +1821,10 @@ GMMR0DECL(int) GMMR0UpdateReservation(PGVM pGVM, VMCPUID idCpu, uint64_t cBasePa
                 /*
                  * Update the records.
                  */
-                pGMM->cReservedPages -= pGVM->gmm.s.Stats.Reserved.cBasePages
+                pGMM->cReservedPages -= pGVM->gmm.s.Stats.Reserved.cBasePages// 先减去旧值
                                       + pGVM->gmm.s.Stats.Reserved.cFixedPages
                                       + pGVM->gmm.s.Stats.Reserved.cShadowPages;
-                pGMM->cReservedPages += cBasePages + cFixedPages + cShadowPages;
+                pGMM->cReservedPages += cBasePages + cFixedPages + cShadowPages;// 再加新值
 
                 pGVM->gmm.s.Stats.Reserved.cBasePages   = cBasePages;
                 pGVM->gmm.s.Stats.Reserved.cFixedPages  = cFixedPages;
@@ -1750,6 +1875,9 @@ GMMR0DECL(int) GMMR0UpdateReservationReq(PGVM pGVM, VMCPUID idCpu, PGMMUPDATERES
  * @param   pszFunction The function from which it was called.
  * @param   uLine       The line number.
  */
+/*
+ * 内存一致性检查：验证空闲内存页的实际数量(cPages)与记录值(pSet->cFreePages)是否匹配
+ * */
 static uint32_t gmmR0SanityCheckSet(PGMM pGMM, PGMMCHUNKFREESET pSet, const char *pszSetName,
                                     const char *pszFunction, unsigned uLineNo)
 {
@@ -1759,14 +1887,17 @@ static uint32_t gmmR0SanityCheckSet(PGMM pGMM, PGMMCHUNKFREESET pSet, const char
      * Count the free pages in all the chunks and match it against pSet->cFreePages.
      */
     uint32_t cPages = 0;
+    //循环遍历所有空闲链表
     for (unsigned i = 0; i < RT_ELEMENTS(pSet->apLists); i++)
     {
+        //遍历每个链表节点，累加各内存块的空闲页数(cFree)
         for (PGMMCHUNK pCur = pSet->apLists[i]; pCur; pCur = pCur->pFreeNext)
         {
             /** @todo check that the chunk is hash into the right set. */
             cPages += pCur->cFree;
         }
     }
+    //一致性验证
     if (RT_UNLIKELY(cPages != pSet->cFreePages))
     {
         SUPR0Printf("GMM insanity: found %#x pages in the %s set, expected %#x. (%s, line %u)\n",
@@ -1831,6 +1962,7 @@ static PGMMCHUNK gmmR0GetChunkSlow(PGMM pGMM, uint32_t idChunk, PGMMCHUNKTLBE pT
  * @param   pGMM        Pointer to the GMM instance.
  * @param   idChunk     The ID of the chunk to find.
  */
+//通过TLB（Translation Lookaside Buffer）加速查找内存块，若TLB未命中则触发慢路径查询
 DECLINLINE(PGMMCHUNK) gmmR0GetChunkLocked(PGMM pGMM, uint32_t idChunk)
 {
     /*
@@ -1957,22 +2089,29 @@ DECLINLINE(void) gmmR0UnlinkChunk(PGMMCHUNK pChunk)
  * @param   pChunk      The allocation chunk.
  * @param   pSet        The free set.
  */
+//这个有点像linux内核内存的伙伴系统
 DECLINLINE(void) gmmR0LinkChunk(PGMMCHUNK pChunk, PGMMCHUNKFREESET pSet)
 {
+    // 断言检查：确保该chunk当前不属于任何free set，且没有前后链接
     Assert(!pChunk->pSet);
     Assert(!pChunk->pFreeNext);
     Assert(!pChunk->pFreePrev);
 
+    // 只有chunk中有空闲页时才进行链接
     if (pChunk->cFree > 0)
     {
+        // 设置chunk所属的free set
         pChunk->pSet = pSet;
         pChunk->pFreePrev = NULL;
+        // 根据空闲页数量选择适当的链表索引
         unsigned const iList = gmmR0SelectFreeSetList(pChunk->cFree);
+        // 将chunk插入到链表头部
         pChunk->pFreeNext = pSet->apLists[iList];
         if (pChunk->pFreeNext)
             pChunk->pFreeNext->pFreePrev = pChunk;
         pSet->apLists[iList] = pChunk;
 
+        // 更新free set的总空闲页数和生成ID
         pSet->cFreePages += pChunk->cFree;
         pSet->idGeneration++;
     }
@@ -1988,15 +2127,29 @@ DECLINLINE(void) gmmR0LinkChunk(PGMMCHUNK pChunk, PGMMCHUNKFREESET pSet)
  * @param   pGVM        Pointer to the kernel-only VM instace data.
  * @param   pChunk      The allocation chunk.
  */
+/*
+ PrivateX
+动态扩展性
+  通过位图（bmChunkId）和空闲链表（iFreeHead）实现高效内存块分配
+  支持按需扩展，避免固定大小限制
+隔离性
+  内存块一旦分配为私有，仅归属单个虚拟机（通过 hGVM 标记），防止跨 VM 访问
+性能优化
+  与共享集合（Shared）分离，减少多虚拟机竞争全局锁的开销
+  通过顺序分配（idChunkPrev）和局部扫描（ASMBitNextClear）降低查找延迟
+典型应用
+  内存热插拔：动态扩展虚拟机内存时，从私有扩展集合分配新块
+  内存碎片整理：将碎片化空闲页合并后重新链入私有扩展集合
+*/
 DECLINLINE(void) gmmR0SelectSetAndLinkChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk)
 {
     PGMMCHUNKFREESET pSet;
     if (pGMM->fBoundMemoryMode)
-        pSet = &pGVM->gmm.s.Private;
+        pSet = &pGVM->gmm.s.Private;// 绑定模式：链接到虚拟机私有集合
     else if (pChunk->cShared)
-        pSet = &pGMM->Shared;
+        pSet = &pGMM->Shared;       // 共享页：链接到全局共享集合
     else
-        pSet = &pGMM->PrivateX;
+        pSet = &pGMM->PrivateX;   // 默认：链接到全局私有扩展集合
     gmmR0LinkChunk(pChunk, pSet);
 }
 
@@ -2025,12 +2178,25 @@ static void gmmR0FreeChunkId(PGMM pGMM, uint32_t idChunk)
  * @returns The Chunk ID.
  * @param   pGMM        Pointer to the GMM instance.
  */
+//从全局位图（pGMM->bmChunkId）中分配一个 未被使用的 Chunk ID，用于标识新注册的内存块。
+/*
+  线程安全：通过自旋锁（pGMM->hSpinLockChunkId）保护位图操作。
+  高效查找：顺序扫描 + 位图优化（ASMBitNextClear/ASMBitFirstClear）。
+  ID 复用：避免频繁分配导致位图耗尽。
+*/
+/*
+  三级查找策略：
+    顺序分配（O(1) 常见情况）。
+    局部扫描（O(n) 局部碎片时）。
+    全局扫描（O(n) 极端情况）。
+    缓存友好：idChunkPrev 减少扫描范围。
+*/
 static uint32_t gmmR0AllocateChunkId(PGMM pGMM)
 {
-    AssertCompile(!((GMM_CHUNKID_LAST + 1) & 31)); /* must be a multiple of 32 */
-    AssertCompile(NIL_GMM_CHUNKID == 0);
+    AssertCompile(!((GMM_CHUNKID_LAST + 1) & 31)); /* must be a multiple of 32 */ // 确保位图大小为 32 的倍数
+    AssertCompile(NIL_GMM_CHUNKID == 0); // 空 ID 必须为 0
 
-    RTSpinlockAcquire(pGMM->hSpinLockChunkId);
+    RTSpinlockAcquire(pGMM->hSpinLockChunkId);// 获取锁,防止多线程同时修改位图。
 
     /*
      * Try the next sequential one.
@@ -2039,25 +2205,28 @@ static uint32_t gmmR0AllocateChunkId(PGMM pGMM)
     if (   (uint32_t)idChunk <= GMM_CHUNKID_LAST
         && idChunk > NIL_GMM_CHUNKID)
     {
+        //若该 ID 未被占用（位图对应位为 0），则通过 ASMAtomicBitTestAndSet 原子标记为已用。
         if (!ASMAtomicBitTestAndSet(&pGMM->bmChunkId[0], idChunk))
         {
             RTSpinlockRelease(pGMM->hSpinLockChunkId);
-            return idChunk;
+            return idChunk;// 成功分配
         }
 
         /*
          * Scan sequentially from the last one.
          */
+        //若顺序分配失败，调用 ASMBitNextClear 从当前位置向后查找第一个空闲 ID。
+        //确保找到的 ID 有效（> NIL_GMM_CHUNKID 且 <= GMM_CHUNKID_LAST）。
         if ((uint32_t)idChunk < GMM_CHUNKID_LAST)
         {
             idChunk = ASMBitNextClear(&pGMM->bmChunkId[0], GMM_CHUNKID_LAST + 1, idChunk);
             if (   idChunk > NIL_GMM_CHUNKID
                 && (uint32_t)idChunk <= GMM_CHUNKID_LAST)
             {
-                AssertMsgReturnStmt(!ASMAtomicBitTestAndSet(&pGMM->bmChunkId[0], idChunk), ("%#x\n", idChunk),
+                AssertMsgReturnStmt(!ASMAtomicBitTestAndSet(&pGMM->bmChunkId[0], idChunk), ("%#x\n", idChunk), // 标记为已用
                                     RTSpinlockRelease(pGMM->hSpinLockChunkId), NIL_GMM_CHUNKID);
 
-                pGMM->idChunkPrev = idChunk;
+                pGMM->idChunkPrev = idChunk;// 更新上次分配的 ID
                 RTSpinlockRelease(pGMM->hSpinLockChunkId);
                 return idChunk;
             }
@@ -2068,6 +2237,11 @@ static uint32_t gmmR0AllocateChunkId(PGMM pGMM)
      * Ok, scan from the start.
      * We're not racing anyone, so there is no need to expect failures or have restart loops.
      */
+    //全局扫描（从头开始）
+    /*
+      若局部扫描仍失败，调用 ASMBitFirstClear 从位图起始位置查找。
+      更新 idChunkPrev 以优化下一次分配。
+    */
     idChunk = ASMBitFirstClear(&pGMM->bmChunkId[0], GMM_CHUNKID_LAST + 1);
     AssertMsgReturnStmt(idChunk > NIL_GMM_CHUNKID && (uint32_t)idChunk <= GMM_CHUNKID_LAST, ("%#x\n", idChunk),
                         RTSpinlockRelease(pGMM->hSpinLockChunkId), NIL_GVM_HANDLE);
@@ -2089,45 +2263,55 @@ static uint32_t gmmR0AllocateChunkId(PGMM pGMM)
  * @param   hGVM        The GVM handle of the VM requesting memory.
  * @param   pPageDesc   The page descriptor.
  */
+//从指定内存块（pChunk）中分配 一个空闲物理页，
+//绑定到目标虚拟机（hGVM），并填充页描述符（pPageDesc）。
+/*
+  更新内存块的空闲页统计信息。
+  从空闲链表中摘取一个页。
+  初始化页状态为私有（GMM_PAGE_STATE_PRIVATE）。
+  填充输出描述符（物理地址、页ID等）。
+*/
 static void gmmR0AllocatePage(PGMMCHUNK pChunk, uint32_t hGVM, PGMMPAGEDESC pPageDesc)
 {
     /* update the chunk stats. */
     if (pChunk->hGVM == NIL_GVM_HANDLE)
-        pChunk->hGVM = hGVM;
-    Assert(pChunk->cFree);
-    pChunk->cFree--;
-    pChunk->cPrivate++;
+        pChunk->hGVM = hGVM;// 若内存块未绑定虚拟机，则绑定当前请求的VM
+    Assert(pChunk->cFree);// 确保有空闲页
+    pChunk->cFree--; // 空闲页计数减1
+    pChunk->cPrivate++;  // 私有页计数加1
 
     /* unlink the first free page. */
-    const uint32_t iPage = pChunk->iFreeHead;
+    const uint32_t iPage = pChunk->iFreeHead;   // 获取空闲链表头索引
     AssertReleaseMsg(iPage < RT_ELEMENTS(pChunk->aPages), ("%d\n", iPage));
-    PGMMPAGE pPage = &pChunk->aPages[iPage];
-    Assert(GMM_PAGE_IS_FREE(pPage));
-    pChunk->iFreeHead = pPage->Free.iNext;
+    PGMMPAGE pPage = &pChunk->aPages[iPage];    // 获取页指针
+    Assert(GMM_PAGE_IS_FREE(pPage));            // 确保页状态为“空闲”
+    pChunk->iFreeHead = pPage->Free.iNext;      // 更新链表头为下一页,通过 pPage->Free.iNext 获取下一个空闲页索引
     Log3(("A pPage=%p iPage=%#x/%#x u2State=%d iFreeHead=%#x iNext=%#x\n",
           pPage, iPage, (pChunk->Core.Key << GMM_CHUNKID_SHIFT) | iPage,
           pPage->Common.u2State, pChunk->iFreeHead, pPage->Free.iNext));
 
-    bool const fZeroed = pPage->Free.fZeroed;
+    bool const fZeroed = pPage->Free.fZeroed;// 记录页是否已清零
 
     /* make the page private. */
-    pPage->u = 0;
+    pPage->u = 0; // 重置页结构体
     AssertCompile(GMM_PAGE_STATE_PRIVATE == 0);
-    pPage->Private.hGVM = hGVM;
+    pPage->Private.hGVM = hGVM;// 设置归属虚拟机
     AssertCompile(NIL_RTHCPHYS >= GMM_GCPHYS_LAST);
     AssertCompile(GMM_GCPHYS_UNSHAREABLE >= GMM_GCPHYS_LAST);
+    //若描述符中指定了物理地址（HCPhysGCPhys），将其转换为页帧号（pfn）。
     if (pPageDesc->HCPhysGCPhys <= GMM_GCPHYS_LAST)
-        pPage->Private.pfn = pPageDesc->HCPhysGCPhys >> GUEST_PAGE_SHIFT;
+        pPage->Private.pfn = pPageDesc->HCPhysGCPhys >> GUEST_PAGE_SHIFT;// 设置物理页帧号
     else
-        pPage->Private.pfn = GMM_PAGE_PFN_UNSHAREABLE; /* unshareable / unassigned - same thing. */
+        //否则标记为不可共享（UNSHAREABLE）。
+        pPage->Private.pfn = GMM_PAGE_PFN_UNSHAREABLE; /* unshareable / unassigned - same thing. */ // 标记为不可共享
 
     /* update the page descriptor. */
-    pPageDesc->idSharedPage = NIL_GMM_PAGEID;
-    pPageDesc->idPage       = (pChunk->Core.Key << GMM_CHUNKID_SHIFT) | iPage;
-    RTHCPHYS const HCPhys = RTR0MemObjGetPagePhysAddr(pChunk->hMemObj, iPage);
+    pPageDesc->idSharedPage = NIL_GMM_PAGEID;// 非共享页
+    pPageDesc->idPage       = (pChunk->Core.Key << GMM_CHUNKID_SHIFT) | iPage;// 全局唯一页ID
+    RTHCPHYS const HCPhys = RTR0MemObjGetPagePhysAddr(pChunk->hMemObj, iPage);// 获取物理地址
     Assert(HCPhys != NIL_RTHCPHYS); Assert(HCPhys < NIL_GMMPAGEDESC_PHYS);
-    pPageDesc->HCPhysGCPhys = HCPhys;
-    pPageDesc->fZeroed      = fZeroed;
+    pPageDesc->HCPhysGCPhys = HCPhys;// 写入描述符
+    pPageDesc->fZeroed      = fZeroed;// 记录清零状态
 }
 
 
@@ -2142,15 +2326,22 @@ static void gmmR0AllocatePage(PGMMCHUNK pChunk, uint32_t hGVM, PGMMPAGEDESC pPag
  * @param   cPages      The total number of pages to allocate.
  * @param   paPages     The page descriptor table (input + ouput).
  */
+//从指定内存块（Chunk）分配连续物理页的核心逻辑，
+//主要职责是从已注册的 pChunk 中分配指定数量的页（cPages）并填充页描述符（paPages）
 static uint32_t gmmR0AllocatePagesFromChunk(PGMMCHUNK pChunk, uint16_t const hGVM, uint32_t iPage, uint32_t cPages,
                                             PGMMPAGEDESC paPages)
 {
     PGMMCHUNKFREESET pSet = pChunk->pSet; Assert(pSet);
     gmmR0UnlinkChunk(pChunk);
 
+    /*
+       遍历空闲页链表（pChunk->aPages），调用 gmmR0AllocatePage 填充 paPages
+       更新 pChunk->cFree（剩余空闲页数）和 pChunk->iFreeHead（空闲链表头
+    */
     for (; pChunk->cFree && iPage < cPages; iPage++)
         gmmR0AllocatePage(pChunk, hGVM, &paPages[iPage]);
 
+    //若仍有剩余空闲页，将 pChunk 重新插入空闲集合（pSet）
     gmmR0LinkChunk(pChunk, pSet);
     return iPage;
 }
@@ -2184,15 +2375,16 @@ static uint32_t gmmR0AllocatePagesFromChunk(PGMMCHUNK pChunk, uint16_t const hGV
  *          The giant GMM mutex will be acquired and returned acquired in
  *          the success path.   On failure, no locks will be held.
  */
+//负责 注册新分配的内存块（Chunk）到全局管理结构中，并关联到指定虚拟机（hGVM）。
 static int gmmR0RegisterChunk(PGMM pGMM, PGMMCHUNKFREESET pSet, RTR0MEMOBJ hMemObj, uint16_t hGVM, PSUPDRVSESSION pSession,
                               uint16_t fChunkFlags, uint32_t cPages, PGMMPAGEDESC paPages, uint32_t *piPage, PGMMCHUNK *ppChunk)
 {
     /*
      * Validate input & state.
      */
-    Assert(pGMM->hMtxOwner != RTThreadNativeSelf());
-    Assert(hGVM != NIL_GVM_HANDLE || pGMM->fBoundMemoryMode);
-    Assert(fChunkFlags == 0 || fChunkFlags == GMM_CHUNK_FLAGS_LARGE_PAGE);
+    Assert(pGMM->hMtxOwner != RTThreadNativeSelf()); // 确保未持有全局锁
+    Assert(hGVM != NIL_GVM_HANDLE || pGMM->fBoundMemoryMode);// 共享块需显式启用fBoundMemoryMode
+    Assert(fChunkFlags == 0 || fChunkFlags == GMM_CHUNK_FLAGS_LARGE_PAGE);// 标志合法性检查
     if (!(fChunkFlags &= GMM_CHUNK_FLAGS_LARGE_PAGE))
     {
         AssertPtr(paPages);
@@ -2211,7 +2403,8 @@ static int gmmR0RegisterChunk(PGMM pGMM, PGMMCHUNKFREESET pSet, RTR0MEMOBJ hMemO
     /*
      * Get a ring-0 mapping of the object.
      */
-    uint8_t *pbMapping = (uint8_t *)RTR0MemObjAddress(hMemObj);
+    //VBOX_WITH_LINEAR_HOST_PHYS_MEM 模式下跳过此步骤（直接使用物理地址）。
+    uint8_t *pbMapping = (uint8_t *)RTR0MemObjAddress(hMemObj); // 获取内核虚拟地址
     if (!pbMapping)
     {
         RTR0MEMOBJ hMapObj;
@@ -2231,40 +2424,41 @@ static int gmmR0RegisterChunk(PGMM pGMM, PGMMCHUNKFREESET pSet, RTR0MEMOBJ hMemO
     PGMMCHUNK pChunk = (PGMMCHUNK)RTMemAllocZ(sizeof(*pChunk));
     if (pChunk)
     {
-        pChunk->Core.Key = gmmR0AllocateChunkId(pGMM);
+        pChunk->Core.Key = gmmR0AllocateChunkId(pGMM);// 分配唯一块 ID
         if (   pChunk->Core.Key != NIL_GMM_CHUNKID
             && pChunk->Core.Key <= GMM_CHUNKID_LAST)
         {
             /*
              * Initialize it.
              */
-            pChunk->hMemObj     = hMemObj;
+            pChunk->hMemObj     = hMemObj;// 绑定内存对象
 #ifndef VBOX_WITH_LINEAR_HOST_PHYS_MEM
             pChunk->pbMapping   = pbMapping;
 #endif
-            pChunk->hGVM        = hGVM;
-            pChunk->idNumaNode  = gmmR0GetCurrentNumaNodeId();
+            pChunk->hGVM        = hGVM; // 关联虚拟机,通过 hGVM 区分私有块与共享块
+            pChunk->idNumaNode  = gmmR0GetCurrentNumaNodeId();// 设置 NUMA 节点,NUMA 亲和性优化。
             pChunk->iChunkMtx   = UINT8_MAX;
-            pChunk->fFlags      = fChunkFlags;
-            pChunk->uidOwner    = pSession ? SUPR0GetSessionUid(pSession) : NIL_RTUID;
+            pChunk->fFlags      = fChunkFlags;// 设置标志（如大页）
+            pChunk->uidOwner    = pSession ? SUPR0GetSessionUid(pSession) : NIL_RTUID;//会话 UID（权限控制）。会话权限：uidOwner 确保只有创建者会话可操作内存块。
             /*pChunk->cShared   = 0; */
 
             uint32_t const iDstPageFirst = piPage ? *piPage : cPages;
-            if (!(fChunkFlags & GMM_CHUNK_FLAGS_LARGE_PAGE))
+            if (!(fChunkFlags & GMM_CHUNK_FLAGS_LARGE_PAGE))//普通页模式处理
             {
                 /*
                  * Allocate the requested number of pages from the start of the chunk,
                  * queue the rest (if any) on the free list.
                  */
                 uint32_t const cPagesAlloc = RT_MIN(cPages - iDstPageFirst, GMM_CHUNK_NUM_PAGES);
-                pChunk->cPrivate    = cPagesAlloc;
-                pChunk->cFree       = GMM_CHUNK_NUM_PAGES - cPagesAlloc;
-                pChunk->iFreeHead   = GMM_CHUNK_NUM_PAGES > cPagesAlloc ? cPagesAlloc : UINT16_MAX;
+                pChunk->cPrivate    = cPagesAlloc;// 已分配页数
+                pChunk->cFree       = GMM_CHUNK_NUM_PAGES - cPagesAlloc;// 剩余空闲页数
+                pChunk->iFreeHead   = GMM_CHUNK_NUM_PAGES > cPagesAlloc ? cPagesAlloc : UINT16_MAX;  // 空闲链表头索引,通过链表管理（iFreeHead 指向首个空闲页）。
 
                 /* Alloc pages: */
                 uint32_t const idPageChunk = pChunk->Core.Key << GMM_CHUNKID_SHIFT;
                 uint32_t       iDstPage    = iDstPageFirst;
                 uint32_t       iPage;
+                // 填充页描述符（paPages）
                 for (iPage = 0; iPage < cPagesAlloc; iPage++, iDstPage++)
                 {
                     if (paPages[iDstPage].HCPhysGCPhys <= GMM_GCPHYS_LAST)
@@ -2276,7 +2470,7 @@ static int gmmR0RegisterChunk(PGMM pGMM, PGMMCHUNKFREESET pSet, RTR0MEMOBJ hMemO
 
                     paPages[iDstPage].HCPhysGCPhys = RTR0MemObjGetPagePhysAddr(hMemObj, iPage);
                     paPages[iDstPage].fZeroed      = true;
-                    paPages[iDstPage].idPage       = idPageChunk | iPage;
+                    paPages[iDstPage].idPage       = idPageChunk | iPage; // 全局页 ID
                     paPages[iDstPage].idSharedPage = NIL_GMM_PAGEID;
                 }
                 *piPage = iDstPage;
@@ -2289,7 +2483,7 @@ static int gmmR0RegisterChunk(PGMM pGMM, PGMMCHUNKFREESET pSet, RTR0MEMOBJ hMemO
                     {
                         pChunk->aPages[iPage].Free.u2State = GMM_PAGE_STATE_FREE;
                         pChunk->aPages[iPage].Free.fZeroed = true;
-                        pChunk->aPages[iPage].Free.iNext   = iPage + 1;
+                        pChunk->aPages[iPage].Free.iNext   = iPage + 1; // 链式连接空闲页
                     }
                     pChunk->aPages[RT_ELEMENTS(pChunk->aPages) - 1].Free.u2State = GMM_PAGE_STATE_FREE;
                     pChunk->aPages[RT_ELEMENTS(pChunk->aPages) - 1].Free.fZeroed = true;
@@ -2298,7 +2492,8 @@ static int gmmR0RegisterChunk(PGMM pGMM, PGMMCHUNKFREESET pSet, RTR0MEMOBJ hMemO
                 else
                     Assert(pChunk->iFreeHead == UINT16_MAX);
             }
-            else
+            else//大页模式处理
+            //大页模式下不拆分块，直接整块管理（无空闲链表）。
             {
                 /*
                  * Large page: Mark all pages as privately allocated (watered down gmmR0AllocatePage).
@@ -2475,6 +2670,15 @@ static int gmmR0AllocateChunkNew(PGMM pGMM, PGVM pGVM, PGMMCHUNKFREESET pSet, ui
  * @param   cPages      The total number of pages to allocate.
  * @param   paPages     The page descriptor table (input + ouput).
  */
+/*
+ 无差别分配物理页的核心逻辑，主要目标是从内存池中快速分配连续物理页
+ ，优先复用空闲块或未映射的共享块，适用于 紧急内存需求或 低优先级分配场景
+
+适用场景：
+  虚拟机无法从本地 NUMA 节点或关联块分配足够内存（如 gmmR0AllocatePagesFromSameNode 失败后回退）
+  需要快速分配大块连续内存（如 DMA 缓冲区或临时映射）
+*/
+//在内存紧张或碎片化严重时，绕过 NUMA 亲和性和虚拟机关联性检查，直接从全局内存池分配物理页
 static uint32_t gmmR0AllocatePagesIndiscriminately(PGMMCHUNKFREESET pSet, PGVM pGVM, RTUID uidSelf,
                                                    uint32_t iPage, uint32_t cPages, PGMMPAGEDESC paPages)
 {
@@ -2485,9 +2689,9 @@ static uint32_t gmmR0AllocatePagesIndiscriminately(PGMMCHUNKFREESET pSet, PGVM p
         while (pChunk)
         {
             PGMMCHUNK pNext = pChunk->pFreeNext;
-            if (   pChunk->uidOwner == uidSelf
-                || (   pChunk->cMappingsX == 0
-                    && pChunk->cFree == (GMM_CHUNK_SIZE >> GUEST_PAGE_SHIFT)))
+            if (   pChunk->uidOwner == uidSelf // 条件1：属于当前用户
+                || (   pChunk->cMappingsX == 0 // 条件2：未被映射的共享块
+                    && pChunk->cFree == (GMM_CHUNK_SIZE >> GUEST_PAGE_SHIFT)))// 且完全空闲
             {
                 iPage = gmmR0AllocatePagesFromChunk(pChunk, pGVM->hSelf, iPage, cPages, paPages);
                 if (iPage >= cPages)
@@ -2555,11 +2759,19 @@ static uint32_t gmmR0AllocatePagesFromEmptyChunksOnSameNode(PGMMCHUNKFREESET pSe
  * @param   cPages      The total number of pages to allocate.
  * @param   paPages     The page descriptor table (input + ouput).
  */
+//用于从 同一 NUMA 节点且 同一用户（uidSelf）的内存块（Chunk）中分配物理页
+/*
+      PGMMCHUNKFREESET pSet,   // 内存块集合（如 PrivateX 或 Shared 池）
+      PGVM pGVM,               // 目标虚拟机
+      RTUID const uidSelf,     // 当前用户 ID（如 QEMU 进程的 UID）
+      uint32_t iPage,          // 当前已分配的页数（初始为0）
+      uint32_t cPages,         // 需分配的总页数
+      PGMMPAGEDESC paPages     // 页描述符数组（存储分配结果）*/
 static uint32_t gmmR0AllocatePagesFromSameNode(PGMMCHUNKFREESET pSet, PGVM pGVM, RTUID const uidSelf,
                                                uint32_t iPage, uint32_t cPages, PGMMPAGEDESC paPages)
 {
     /** @todo start by picking from chunks with about the right size first?  */
-    uint16_t const  idNumaNode = gmmR0GetCurrentNumaNodeId();
+    uint16_t const  idNumaNode = gmmR0GetCurrentNumaNodeId();// 获取当前 CPU 的 NUMA 节点 ID
     unsigned        iList      = GMM_CHUNK_FREE_SET_UNUSED_LIST;
     while (iList-- > 0)
     {
@@ -2568,14 +2780,16 @@ static uint32_t gmmR0AllocatePagesFromSameNode(PGMMCHUNKFREESET pSet, PGVM pGVM,
         {
             PGMMCHUNK pNext = pChunk->pFreeNext;
 
+            //内存块必须位于当前 CPU 的 NUMA 节点
             if (   pChunk->idNumaNode == idNumaNode
+                    //内存块必须属于同一用户（避免跨进程安全风险
                 && pChunk->uidOwner   == uidSelf)
             {
                 iPage = gmmR0AllocatePagesFromChunk(pChunk, pGVM->hSelf, iPage, cPages, paPages);
                 if (iPage >= cPages)
                 {
                     pGVM->gmm.s.idLastChunkHint = pChunk->cFree ? pChunk->Core.Key : NIL_GMM_CHUNKID;
-                    return iPage;
+                    return iPage;// 分配成功
                 }
             }
 
@@ -2597,12 +2811,15 @@ static uint32_t gmmR0AllocatePagesFromSameNode(PGMMCHUNKFREESET pSet, PGVM pGVM,
  * @param   cPages      The total number of pages to allocate.
  * @param   paPages     The page descriptor table (input + ouput).
  */
+//从与当前虚拟机（VM）关联的内存块（Chunk）中分配物理页
 static uint32_t gmmR0AllocatePagesAssociatedWithVM(PGMM pGMM, PGVM pGVM, PGMMCHUNKFREESET pSet,
                                                    uint32_t iPage, uint32_t cPages, PGMMPAGEDESC paPages)
 {
     uint16_t const hGVM = pGVM->hSelf;
 
     /* Hint. */
+    //优化策略：利用 idLastChunkHint 记录上次成功分配的块 ID，优先尝试从该块分配
+    //性能意义：减少链表遍历开销，提升局部性
     if (pGVM->gmm.s.idLastChunkHint != NIL_GMM_CHUNKID)
     {
         PGMMCHUNK pChunk = gmmR0GetChunk(pGMM, pGVM->gmm.s.idLastChunkHint);
@@ -2622,7 +2839,8 @@ static uint32_t gmmR0AllocatePagesAssociatedWithVM(PGMM pGMM, PGVM pGVM, PGMMCHU
         {
             PGMMCHUNK pNext = pChunk->pFreeNext;
 
-            if (pChunk->hGVM == hGVM)
+            //通过 hGVM 匹配，优先复用当前虚拟机曾使用的内存块，减少跨虚拟机共享带来的 NUMA 延迟
+            if (pChunk->hGVM == hGVM)// 检查是否属于当前VM
             {
                 iPage = gmmR0AllocatePagesFromChunk(pChunk, hGVM, iPage, cPages, paPages);
                 if (iPage >= cPages)
@@ -2738,6 +2956,11 @@ static bool gmmR0ShouldAllocatePagesInOtherChunksBecauseOfLotsFree(PGMM pGMM)
  *
  * @remarks Caller owns the giant GMM lock.
  */
+/*
+  多账户类型：支持三种内存账户（基础内存、影子页表内存、固定内存）。
+  两级限制检查：先检查全局内存上限，再校验VM专属的账户配额。
+  两种分配模式：绑定模式（NUMA亲和）和共享模式（跨VM复用内存块）。
+*/
 static int gmmR0AllocatePagesNew(PGMM pGMM, PGVM pGVM, uint32_t cPages, PGMMPAGEDESC paPages, GMMACCOUNT enmAccount)
 {
     Assert(pGMM->hMtxOwner == RTThreadNativeSelf());
@@ -2748,7 +2971,7 @@ static int gmmR0AllocatePagesNew(PGMM pGMM, PGVM pGVM, uint32_t cPages, PGMMPAGE
     if (RT_LIKELY(pGMM->cAllocatedPages + cPages <= pGMM->cMaxPages))
     { /* likely */ }
     else
-        return VERR_GMM_HIT_GLOBAL_LIMIT;
+        return VERR_GMM_HIT_GLOBAL_LIMIT; // 全局内存不足
 
     switch (enmAccount)
     {
@@ -2761,7 +2984,7 @@ static int gmmR0AllocatePagesNew(PGMM pGMM, PGVM pGVM, uint32_t cPages, PGMMPAGE
                 Log(("gmmR0AllocatePages:Base: Reserved=%#llx Allocated+Ballooned+Requested=%#llx+%#llx+%#x!\n",
                      pGVM->gmm.s.Stats.Reserved.cBasePages, pGVM->gmm.s.Stats.Allocated.cBasePages,
                      pGVM->gmm.s.Stats.cBalloonedPages, cPages));
-                return VERR_GMM_HIT_VM_ACCOUNT_LIMIT;
+                return VERR_GMM_HIT_VM_ACCOUNT_LIMIT;// VM的基础内存配额不足
             }
             break;
         case GMMACCOUNT_SHADOW:
@@ -2808,6 +3031,9 @@ static int gmmR0AllocatePagesNew(PGMM pGMM, PGVM pGVM, uint32_t cPages, PGMMPAGE
      */
     uint32_t iPage = 0;
     int rc = VINF_SUCCESS;
+    //绑定模式（fBoundMemoryMode = true）
+    //直接分配：优先从VM关联的NUMA节点获取内存。
+    //后备机制：若不足，调用gmmR0AllocateChunkNew申请新内存块。
     if (pGMM->fBoundMemoryMode)
     {
         iPage = gmmR0AllocatePagesInBoundMode(pGVM, iPage, cPages, paPages);
@@ -2821,11 +3047,20 @@ static int gmmR0AllocatePagesNew(PGMM pGMM, PGVM pGVM, uint32_t cPages, PGMMPAGE
      * in bound mode, but smartly make use of non-full chunks allocated by
      * other VMs if we're low on memory.
      */
+    //共享模式（默认）
+    /*
+       最优路径：从当前VM的私有内存池分配（gmmR0AllocatePagesAssociatedWithVM）。
+       同级借用：从同一NUMA节点的其他VM内存池借用（gmmR0AllocatePagesFromSameNode）。
+       空块复用：查找同节点的空闲内存块（gmmR0AllocatePagesFromEmptyChunksOnSameNode）。
+       全局共享：尝试分配共享内存池的空闲块。
+       最终手段：申请全新的内存块（gmmR0AllocateChunkNew）。
+    */
     else
     {
         RTUID const uidSelf = SUPR0GetSessionUid(pGVM->pSession);
 
         /* Pick the most optimal pages first. */
+        // 策略1：优先从当前虚拟机的关联内存块分配
         iPage = gmmR0AllocatePagesAssociatedWithVM(pGMM, pGVM, &pGMM->PrivateX, iPage, cPages, paPages);
         if (iPage < cPages)
         {
@@ -2834,11 +3069,13 @@ static int gmmR0AllocatePagesNew(PGMM pGMM, PGVM pGVM, uint32_t cPages, PGMMPAGE
             bool fTriedOnSameAlready = false;
             if (gmmR0ShouldAllocatePagesInOtherChunksBecauseOfLimits(pGVM))
             {
+                // 策略2：从同NUMA节点的其他虚拟机块分配
                 iPage = gmmR0AllocatePagesFromSameNode(&pGMM->PrivateX, pGVM, uidSelf, iPage, cPages, paPages);
                 fTriedOnSameAlready = true;
             }
 
             /* Allocate memory from empty chunks. */
+            // 策略3：从同节点的空闲块分配
             if (iPage < cPages)
                 iPage = gmmR0AllocatePagesFromEmptyChunksOnSameNode(&pGMM->PrivateX, pGVM, uidSelf, iPage, cPages, paPages);
 
@@ -2851,6 +3088,7 @@ static int gmmR0AllocatePagesNew(PGMM pGMM, PGVM pGVM, uint32_t cPages, PGMMPAGE
             if (   !fTriedOnSameAlready
                 && gmmR0ShouldAllocatePagesInOtherChunksBecauseOfLotsFree(pGMM))
             {
+                 // 策略4：从全局共享池分配
                 iPage = gmmR0AllocatePagesFromSameNode(&pGMM->PrivateX, pGVM, uidSelf, iPage, cPages, paPages);
                 if (iPage < cPages)
                     iPage = gmmR0AllocatePagesIndiscriminately(&pGMM->PrivateX, pGVM, uidSelf, iPage, cPages, paPages);
@@ -3174,6 +3412,22 @@ GMMR0DECL(int) GMMR0AllocateHandyPages(PGVM pGVM, VMCPUID idCpu, uint32_t cPages
  *
  * @thread  EMT.
  */
+//负责为虚拟机分配 物理内存页，支持多种内存类型（基础页、固定页、影子页等）
+/*
+  核心任务：为指定虚拟机（pGVM）分配 cPages 个物理页，填充到 paPages 描述符数组中。
+  内存类型（enmAccount）：
+    GMMACCOUNT_BASE：普通虚拟机内存（可共享或独占）。
+    GMMACCOUNT_FIXED：固定内存（如 DMA 缓冲区）。
+    GMMACCOUNT_SHADOW：影子页表内存。
+  设计目标：
+    确保分配不超过虚拟机预留配额（Reserved.c*Pages）。
+    支持物理地址预绑定（HCPhysGCPhys）和零页初始化需求。
+*/
+
+/*
+ * paPages	PGMMPAGEDESC	页描述符数组（输出物理页信息）
+*/
+
 GMMR0DECL(int) GMMR0AllocatePages(PGVM pGVM, VMCPUID idCpu, uint32_t cPages, PGMMPAGEDESC paPages, GMMACCOUNT enmAccount)
 {
     LogFlow(("GMMR0AllocatePages: pGVM=%p cPages=%#x paPages=%p enmAccount=%d\n", pGVM, cPages, paPages, enmAccount));
@@ -3216,9 +3470,17 @@ GMMR0DECL(int) GMMR0AllocatePages(PGVM pGVM, VMCPUID idCpu, uint32_t cPages, PGM
         if (RT_LIKELY(    pGVM->gmm.s.Stats.Reserved.cBasePages
                       &&  pGVM->gmm.s.Stats.Reserved.cFixedPages
                       &&  pGVM->gmm.s.Stats.Reserved.cShadowPages))
+            /*
+            分配策略：
+              优先从 空闲页链表（pGMM->FreeList）获取页面。
+              若空闲页不足，从主机 OS 申请新内存（RTR0MemObjAllocPage）。
+            页描述符填充：
+              设置 HCPhysGCPhys（主机物理地址）和 idPage（GMM 页 ID）。
+              标记零页（fZeroed）若需初始化。
+             * */
             rc = gmmR0AllocatePagesNew(pGMM, pGVM, cPages, paPages, enmAccount);
         else
-            rc = VERR_WRONG_ORDER;
+            rc = VERR_WRONG_ORDER;// 未预留内存配
         GMM_CHECK_SANITY_UPON_LEAVING(pGMM);
     }
     else
@@ -3275,6 +3537,9 @@ GMMR0DECL(int) GMMR0AllocatePagesReq(PGVM pGVM, VMCPUID idCpu, PGMMALLOCATEPAGES
  * @param   pIdPage     Where to return the GMM page ID of the page.
  * @param   pHCPhys     Where to return the host physical address of the page.
  */
+//该函数是 VirtualBox 大页内存分配的核心接口，用于为虚拟机分配 2MB 大页,以提升内存访问性能
+//支持 大页内存映射（减少 TLB 缺失，提升性能）。
+//确保内存分配不超过虚拟机配额（Reserved.cBasePages）。
 GMMR0DECL(int)  GMMR0AllocateLargePage(PGVM pGVM, VMCPUID idCpu, uint32_t cbPage, uint32_t *pIdPage, RTHCPHYS *pHCPhys)
 {
     LogFlow(("GMMR0AllocateLargePage: pGVM=%p cbPage=%x\n", pGVM, cbPage));
@@ -3283,6 +3548,7 @@ GMMR0DECL(int)  GMMR0AllocateLargePage(PGVM pGVM, VMCPUID idCpu, uint32_t cbPage
     *pIdPage = NIL_GMM_PAGEID;
     AssertPtrReturn(pHCPhys, VERR_INVALID_PARAMETER);
     *pHCPhys = NIL_RTHCPHYS;
+    //GMM_CHUNK_SIZE，即 2MB
     AssertReturn(cbPage == GMM_CHUNK_SIZE, VERR_INVALID_PARAMETER);
 
     /*
@@ -3308,6 +3574,7 @@ GMMR0DECL(int)  GMMR0AllocateLargePage(PGVM pGVM, VMCPUID idCpu, uint32_t cbPage
              */
             /** @todo r=bird: Quota checking could be done w/o the giant mutex but using
              *        a VM specific mutex... */
+            // 已分配页数（Allocated.cBasePages） + 本次请求（GMM_CHUNK_NUM_PAGES） ≤ 预留配额（Reserved.cBasePages）。
             if (RT_LIKELY(   pGVM->gmm.s.Stats.Allocated.cBasePages + pGVM->gmm.s.Stats.cBalloonedPages + GMM_CHUNK_NUM_PAGES
                           <= pGVM->gmm.s.Stats.Reserved.cBasePages))
             {
@@ -3321,6 +3588,7 @@ GMMR0DECL(int)  GMMR0AllocateLargePage(PGVM pGVM, VMCPUID idCpu, uint32_t cbPage
                 gmmR0MutexRelease(pGMM);
 
                 RTR0MEMOBJ hMemObj;
+                //RTMEMOBJ_ALLOC_LARGE_F_FAST 标志优先使用大页
                 rc = RTR0MemObjAllocLarge(&hMemObj, GMM_CHUNK_SIZE, GMM_CHUNK_SIZE, RTMEMOBJ_ALLOC_LARGE_F_FAST);
                 if (RT_SUCCESS(rc))
                 {
@@ -3332,6 +3600,11 @@ GMMR0DECL(int)  GMMR0AllocateLargePage(PGVM pGVM, VMCPUID idCpu, uint32_t cbPage
                      */
                     PGMMCHUNK              pChunk = NULL;
                     PGMMCHUNKFREESET const pSet   = pGMM->fBoundMemoryMode ? &pGVM->gmm.s.Private : &pGMM->PrivateX;
+                    /*
+                      将内存块注册为 大页类型（GMM_CHUNK_FLAGS_LARGE_PAGE）。
+                      绑定到虚拟机的 私有内存池（pGVM->gmm.s.Private 或 pGMM->PrivateX）。
+                      返回 pChunk 对象（包含页 ID 和元数据）。
+                    */
                     rc = gmmR0RegisterChunk(pGMM, pSet, hMemObj, pGVM->hSelf, pGVM->pSession, GMM_CHUNK_FLAGS_LARGE_PAGE,
                                             0 /*cPages*/, NULL /*paPages*/, NULL /*piPage*/, &pChunk);
                     if (RT_SUCCESS(rc))
@@ -3347,10 +3620,10 @@ GMMR0DECL(int)  GMMR0AllocateLargePage(PGVM pGVM, VMCPUID idCpu, uint32_t cbPage
                         pGVM->gmm.s.Stats.cPrivatePages        += GMM_CHUNK_NUM_PAGES;
                         pGMM->cAllocatedPages                  += GMM_CHUNK_NUM_PAGES;
 
-                        gmmR0LinkChunk(pChunk, pSet);
+                        gmmR0LinkChunk(pChunk, pSet); // 将内存块加入空闲集合
                         gmmR0MutexRelease(pGMM);
 
-                        VMMR0EmtResumeAfterBlocking(pGVCpu, &Ctx);
+                        VMMR0EmtResumeAfterBlocking(pGVCpu, &Ctx);// 恢复 vCPU 执行
                         LogFlow(("GMMR0AllocateLargePage: returns VINF_SUCCESS\n"));
                         return VINF_SUCCESS;
                     }
@@ -3369,7 +3642,7 @@ GMMR0DECL(int)  GMMR0AllocateLargePage(PGVM pGVM, VMCPUID idCpu, uint32_t cbPage
                 Log(("GMMR0AllocateLargePage: Reserved=%#llx Allocated+Requested=%#llx+%#x!\n",
                      pGVM->gmm.s.Stats.Reserved.cBasePages, pGVM->gmm.s.Stats.Allocated.cBasePages, GMM_CHUNK_NUM_PAGES));
                 gmmR0MutexRelease(pGMM);
-                rc = VERR_GMM_HIT_VM_ACCOUNT_LIMIT;
+                rc = VERR_GMM_HIT_VM_ACCOUNT_LIMIT;// 超出配额
             }
         }
         else
@@ -3473,17 +3746,37 @@ GMMR0DECL(int) GMMR0FreeLargePageReq(PGVM pGVM, VMCPUID idCpu, PGMMFREELARGEPAGE
  * @callback_method_impl{FNGVMMR0ENUMCALLBACK,
  * Used by gmmR0FreeChunkFlushPerVmTlbs().}
  */
+//强制刷新单个虚拟机的 Chunk TLB（Translation Lookaside Buffer）缓存
+/*
+轻量级无效化：
+  仅重置代次和指针，不涉及内存释放，性能开销极低
+惰性验证：
+  后续访问 TLB 时，若发现 idGeneration 不匹配当前全局代次（pGMM->idFreeGeneration），自动触发缓存重填
+并发安全
+  自旋锁保护确保多虚拟机环境下的原子性
+ * */
 static DECLCALLBACK(int) gmmR0InvalidatePerVmChunkTlbCallback(PGVM pGVM, void *pvUser)
 {
     RT_NOREF(pvUser);
     if (pGVM->gmm.s.hChunkTlbSpinLock != NIL_RTSPINLOCK)
     {
         RTSpinlockAcquire(pGVM->gmm.s.hChunkTlbSpinLock);
+        //清空 TLB 条目
+        /*
+         aChunkTlbEntries 是固定大小的数组（通常 4~16 项），缓存虚拟机最近访问的 ‌Chunk 物理地址映射‌‌67。
+         每个条目包含：
+           idGeneration：内存块释放代次（用于验证缓存有效性）。
+           pChunk：指向关联的 GMMCHUNK 对象。
+
+         清空逻辑：
+           将代次设为最大值（UINT64_MAX），确保后续访问必然失效
+           清空内存块指针（pChunk = NULL），避免悬垂引用。
+         * */
         uintptr_t i = RT_ELEMENTS(pGVM->gmm.s.aChunkTlbEntries);
         while (i-- > 0)
         {
-            pGVM->gmm.s.aChunkTlbEntries[i].idGeneration = UINT64_MAX;
-            pGVM->gmm.s.aChunkTlbEntries[i].pChunk       = NULL;
+            pGVM->gmm.s.aChunkTlbEntries[i].idGeneration = UINT64_MAX;// 标记代次无效
+            pGVM->gmm.s.aChunkTlbEntries[i].pChunk       = NULL;     // 清除内存块指针
         }
         RTSpinlockRelease(pGVM->gmm.s.hChunkTlbSpinLock);
     }
@@ -3503,24 +3796,39 @@ static DECLCALLBACK(int) gmmR0InvalidatePerVmChunkTlbCallback(PGVM pGVM, void *p
  *
  * @param   pGMM        Pointer to the GMM instance.
  */
+//刷新所有虚拟机的 Chunk TLB（Translation Lookaside Buffer），
+//确保内存释放后各虚拟机的地址映射一致性。
+//在 全局内存释放代次（idFreeGeneration）接近溢出时，强制刷新所有虚拟机的 Chunk TLB 缓存
+//gmmR0FreeChunk 中检测到 idFreeGeneration == UINT64_MAX / 4（即将溢出）
 static void gmmR0FreeChunkFlushPerVmTlbs(PGMM pGMM)
 {
     /*
      * First invalidation pass.
      */
+    /*
+     调用 GVMMR0EnumVMs 遍历所有虚拟机，
+     对每个 VM 执行回调函数 gmmR0InvalidatePerVmChunkTlbCallback
+       回调函数会清除目标 VM 的 Chunk TLB 缓存（类似 Linux 的 flush_tlb 操作）
+    */
     int rc = GVMMR0EnumVMs(gmmR0InvalidatePerVmChunkTlbCallback, NULL);
     AssertRCSuccess(rc);
 
     /*
      * Reset the generation number.
      */
+    //重置代次计数器
     RTSpinlockAcquire(pGMM->hSpinLockTree);
-    ASMAtomicWriteU64(&pGMM->idFreeGeneration, 1);
+    ASMAtomicWriteU64(&pGMM->idFreeGeneration, 1);// 重置为 1
     RTSpinlockRelease(pGMM->hSpinLockTree);
 
     /*
      * Second invalidation pass.
      */
+    //第二次 TLB 无效化
+    /*
+       防止在第一次无效化和计数器重置之间，有虚拟机缓存了旧的代次信息
+       双重刷新确保所有 VM 的 TLB 完全同步
+    */
     rc = GVMMR0EnumVMs(gmmR0InvalidatePerVmChunkTlbCallback, NULL);
     AssertRCSuccess(rc);
 }
@@ -3536,11 +3844,25 @@ static void gmmR0FreeChunkFlushPerVmTlbs(PGMM pGMM)
  * @param   fRelaxedSem Whether we can release the semaphore while doing the
  *                      freeing (@c true) or not.
  */
+//负责 释放整个内存块（Chunk）并归还物理内存给主机 OS。
+/*
+  检查内存块是否可释放（无映射）。
+  从全局数据结构中解链。
+  释放物理内存和元数据。
+*/
+/*
+  pGMM	PGMM	全局内存管理器
+  pGVM	PGVM	关联的虚拟机（可为 NULL）
+  pChunk	PGMMCHUNK	目标内存块
+  fRelaxedSem	bool	是否临时释放全局锁（避免死锁）
+ * */
+//每个 GMMCHUNK 对象包含 页数组（aPages）和 映射表（paMappingsX）。
 static bool gmmR0FreeChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, bool fRelaxedSem)
 {
     Assert(pChunk->Core.Key != NIL_GMM_CHUNKID);
 
     GMMR0CHUNKMTXSTATE MtxState;
+    //获取 内存块级锁（pChunk->Mtx）和 全局锁（pGMM->Mtx）
     gmmR0ChunkMutexAcquire(&MtxState, pGMM, pChunk, GMMR0CHUNK_MTX_KEEP_GIANT);
 
     /*
@@ -3548,7 +3870,7 @@ static bool gmmR0FreeChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, bool fRelaxed
      * This shouldn't happen, so screw lock contention...
      */
     if (pChunk->cMappingsX && pGVM)
-        gmmR0UnmapChunkLocked(pGMM, pGVM, pChunk);
+        gmmR0UnmapChunkLocked(pGMM, pGVM, pChunk);// 强制解除当前 VM 的映射
 
     /*
      * If there are current mappings of the chunk, then request the
@@ -3561,7 +3883,7 @@ static bool gmmR0FreeChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, bool fRelaxed
         /* The chunk can be mapped by more than one VM if fBoundMemoryMode is false! */
         Log(("gmmR0FreeChunk: chunk still has %d mappings; don't free!\n", pChunk->cMappingsX));
         gmmR0ChunkMutexRelease(&MtxState, pChunk);
-        return false;
+        return false;// 存在映射则放弃释放
     }
 
 
@@ -3569,21 +3891,23 @@ static bool gmmR0FreeChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, bool fRelaxed
      * Save and trash the handle.
      */
     RTR0MEMOBJ const hMemObj = pChunk->hMemObj;
-    pChunk->hMemObj = NIL_RTR0MEMOBJ;
+    pChunk->hMemObj = NIL_RTR0MEMOBJ;// 标记为无效
 
     /*
      * Unlink it from everywhere.
      */
-    gmmR0UnlinkChunk(pChunk);
+    gmmR0UnlinkChunk(pChunk); // 从空闲集合解链
 
     RTSpinlockAcquire(pGMM->hSpinLockTree);
 
-    RTListNodeRemove(&pChunk->ListNode);
+    RTListNodeRemove(&pChunk->ListNode);// 从全局链表移除
 
-    PAVLU32NODECORE pCore = RTAvlU32Remove(&pGMM->pChunks, pChunk->Core.Key);
+    PAVLU32NODECORE pCore = RTAvlU32Remove(&pGMM->pChunks, pChunk->Core.Key);// 从 AVL 树移除
     Assert(pCore == &pChunk->Core); NOREF(pCore);
 
+    //ChunkTLB 缓存最近访问的内存块，加速查找
     PGMMCHUNKTLBE pTlbe = &pGMM->ChunkTLB.aEntries[GMM_CHUNKTLB_IDX(pChunk->Core.Key)];
+    //清除 ChunkTLB 缓存（若命中）
     if (pTlbe->pChunk == pChunk)
     {
         pTlbe->idChunk = NIL_GMM_CHUNKID;
@@ -3591,13 +3915,13 @@ static bool gmmR0FreeChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, bool fRelaxed
     }
 
     Assert(pGMM->cChunks > 0);
-    pGMM->cChunks--;
+    pGMM->cChunks--;// 减少全局内存块计数
 
-    uint64_t const idFreeGeneration = ASMAtomicIncU64(&pGMM->idFreeGeneration);
+    uint64_t const idFreeGeneration = ASMAtomicIncU64(&pGMM->idFreeGeneration);// 递增释放代次
 
     RTSpinlockRelease(pGMM->hSpinLockTree);
 
-    pGMM->cFreedChunks++;
+    pGMM->cFreedChunks++; // 增加释放计数
 
     /* Drop the lock. */
     gmmR0ChunkMutexRelease(&MtxState, NULL);
@@ -3613,17 +3937,19 @@ static bool gmmR0FreeChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, bool fRelaxed
     /*
      * Free the Chunk ID and all memory associated with the chunk.
      */
-    gmmR0FreeChunkId(pGMM, pChunk->Core.Key);
-    pChunk->Core.Key = NIL_GMM_CHUNKID;
+    gmmR0FreeChunkId(pGMM, pChunk->Core.Key); // 回收 ChunkID
+    pChunk->Core.Key = NIL_GMM_CHUNKID;// 标记为无效
 
-    RTMemFree(pChunk->paMappingsX);
+    RTMemFree(pChunk->paMappingsX);// 释放映射数组
     pChunk->paMappingsX = NULL;
 
-    RTMemFree(pChunk);
+    RTMemFree(pChunk); // 释放内存块对象
 
+    //归还主机物理内存
 #ifndef VBOX_WITH_LINEAR_HOST_PHYS_MEM
     int rc = RTR0MemObjFree(hMemObj, true /* fFreeMappings */);
 #else
+    //模式下需保留映射
     int rc = RTR0MemObjFree(hMemObj, false /* fFreeMappings */);
 #endif
     AssertLogRelRC(rc);
@@ -3645,6 +3971,13 @@ static bool gmmR0FreeChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, bool fRelaxed
  * @param   idPage      The Page ID.
  * @param   pPage       Pointer to the page.
  */
+//虚拟机释放私有页（gmmR0FreePrivatePage）。
+//共享页引用计数归零（gmmR0FreeSharedPage）。
+/*
+  将页加入空闲链表。
+  更新内存块和全局统计。
+  在特定条件下触发 内存块释放（归还给主机 OS）。
+*/
 static void gmmR0FreePageWorker(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, uint32_t idPage, PGMMPAGE pPage)
 {
     Log3(("F pPage=%p iPage=%#x/%#x u2State=%d iFreeHead=%#x\n",
@@ -3653,12 +3986,13 @@ static void gmmR0FreePageWorker(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, uint32_t
     /*
      * Put the page on the free list.
      */
-    pPage->u = 0;
-    pPage->Free.u2State = GMM_PAGE_STATE_FREE;
-    pPage->Free.fZeroed = false;
+    pPage->u = 0;// 清空页的所有字段
+    pPage->Free.u2State = GMM_PAGE_STATE_FREE;// 标记为“空闲”
+    pPage->Free.fZeroed = false;// 标记为“未清零”（后续分配时需清零）
     Assert(pChunk->iFreeHead < RT_ELEMENTS(pChunk->aPages) || pChunk->iFreeHead == UINT16_MAX);
-    pPage->Free.iNext = pChunk->iFreeHead;
-    pChunk->iFreeHead = pPage - &pChunk->aPages[0];
+    //加入空闲链表
+    pPage->Free.iNext = pChunk->iFreeHead;// 新页指向当前链表头部
+    pChunk->iFreeHead = pPage - &pChunk->aPages[0];// 更新链表头部为当前页
 
     /*
      * Update statistics (the cShared/cPrivate stats are up to date already),
@@ -3666,16 +4000,18 @@ static void gmmR0FreePageWorker(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, uint32_t
      */
     unsigned const cFree = pChunk->cFree;
     if (   !cFree
+            // 根据空闲页数（cFree）决定内存块所属的集合（pSet）。
+            // 当 cFree 跨越阈值（如 0→1 或 127→128）时，需 切换集合
         || gmmR0SelectFreeSetList(cFree) != gmmR0SelectFreeSetList(cFree + 1))
     {
-        gmmR0UnlinkChunk(pChunk);
-        pChunk->cFree++;
-        gmmR0SelectSetAndLinkChunk(pGMM, pGVM, pChunk);
+        gmmR0UnlinkChunk(pChunk); // 从当前集合解链
+        pChunk->cFree++;// 增加空闲页计数
+        gmmR0SelectSetAndLinkChunk(pGMM, pGVM, pChunk);// 重新选择集合并链接
     }
     else
     {
-        pChunk->cFree = cFree + 1;
-        pChunk->pSet->cFreePages++;
+        pChunk->cFree = cFree + 1;// 仅增加空闲页计数
+        pChunk->pSet->cFreePages++;// 更新集合的空闲页总数
     }
 
     /*
@@ -3688,12 +4024,14 @@ static void gmmR0FreePageWorker(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, uint32_t
      * a bit...
      */
     /** @todo Do this on the way out. */
-    if (RT_LIKELY(   pChunk->cFree != GMM_CHUNK_NUM_PAGES
-                  || pChunk->pFreeNext == NULL
-                  || pChunk->pFreePrev == NULL /** @todo this is probably misfiring, see reset... */))
+    if (RT_LIKELY(   pChunk->cFree != GMM_CHUNK_NUM_PAGES// 内存块完全空闲
+                  || pChunk->pFreeNext == NULL// 存在其他空闲块
+                  || pChunk->pFreePrev == NULL /** @todo this is probably misfiring, see reset... */))// 避免误判
     { /* likely */ }
     else
-        gmmR0FreeChunk(pGMM, NULL, pChunk, false);
+        //当内存块完全空闲 且同类型空闲块充足（≥240 页）时，归还内存给主机 OS。
+        //由于内存块可能仍被映射（paMappingsX），实际释放可能延迟
+        gmmR0FreeChunk(pGMM, NULL, pChunk, false);// 尝试释放内存块
 }
 
 
@@ -3756,6 +4094,11 @@ DECLINLINE(void) gmmR0FreePrivatePage(PGMM pGMM, PGVM pGVM, uint32_t idPage, PGM
  * @param   paPages     Pointer to the page descriptors.
  * @param   enmAccount  The account this relates to.
  */
+//释放虚拟机（VM）的内存页，处理 私有页（Private）和 共享页（Shared）的不同逻辑
+/*
+paPages: 页描述符数组（包含 idPage 标识符）。
+enmAccount: 内存账户类型（BASE / SHADOW / FIXED）
+ * */
 static int gmmR0FreePages(PGMM pGMM, PGVM pGVM, uint32_t cPages, PGMMFREEPAGEDESC paPages, GMMACCOUNT enmAccount)
 {
     /*
@@ -3764,6 +4107,7 @@ static int gmmR0FreePages(PGMM pGMM, PGVM pGVM, uint32_t cPages, PGMMFREEPAGEDES
     switch (enmAccount)
     {
         case GMMACCOUNT_BASE:
+            //确保 已分配页数 ≥ 请求释放页数
             if (RT_UNLIKELY(pGVM->gmm.s.Stats.Allocated.cBasePages < cPages))
             {
                 Log(("gmmR0FreePages: allocated=%#llx cPages=%#x!\n", pGVM->gmm.s.Stats.Allocated.cBasePages, cPages));
@@ -3796,33 +4140,37 @@ static int gmmR0FreePages(PGMM pGMM, PGVM pGVM, uint32_t cPages, PGMMFREEPAGEDES
      */
     int rc = VINF_SUCCESS;
     uint32_t iPage;
+    //遍历页描述符并释放内存
     for (iPage = 0; iPage < cPages; iPage++)
     {
         uint32_t idPage = paPages[iPage].idPage;
-        PGMMPAGE pPage = gmmR0GetPage(pGMM, idPage);
+        PGMMPAGE pPage = gmmR0GetPage(pGMM, idPage);//获取页对象
         if (RT_LIKELY(pPage))
         {
+            //处理私有页
             if (RT_LIKELY(GMM_PAGE_IS_PRIVATE(pPage)))
             {
                 if (RT_LIKELY(pPage->Private.hGVM == pGVM->hSelf))
                 {
                     Assert(pGVM->gmm.s.Stats.cPrivatePages);
-                    pGVM->gmm.s.Stats.cPrivatePages--;
-                    gmmR0FreePrivatePage(pGMM, pGVM, idPage, pPage);
+                    pGVM->gmm.s.Stats.cPrivatePages--; // 更新私有页计数
+                    gmmR0FreePrivatePage(pGMM, pGVM, idPage, pPage);// 实际释放
                 }
                 else
                 {
                     Log(("gmmR0AllocatePages: #%#x/%#x: not owner! hGVM=%#x hSelf=%#x\n", iPage, idPage,
                          pPage->Private.hGVM, pGVM->hSelf));
-                    rc = VERR_GMM_NOT_PAGE_OWNER;
+                    rc = VERR_GMM_NOT_PAGE_OWNER;// 非当前 VM 的私有页
                     break;
                 }
             }
+            // 处理共享页
             else if (RT_LIKELY(GMM_PAGE_IS_SHARED(pPage)))
             {
                 Assert(pGVM->gmm.s.Stats.cSharedPages);
-                Assert(pPage->Shared.cRefs);
+                Assert(pPage->Shared.cRefs);// 引用计数必须 > 0
 #if defined(VBOX_WITH_PAGE_SHARING) && defined(VBOX_STRICT)
+                //确保共享页内容未被篡改（仅调试模式生效）。
                 if (pPage->Shared.u14Checksum)
                 {
                     uint32_t uChecksum = gmmR0StrictPageChecksum(pGMM, pGVM, idPage);
@@ -3831,29 +4179,29 @@ static int gmmR0FreePages(PGMM pGMM, PGVM pGVM, uint32_t cPages, PGMMFREEPAGEDES
                               ("%#x vs %#x - idPage=%#x\n", uChecksum, pPage->Shared.u14Checksum, idPage));
                 }
 #endif
-                pGVM->gmm.s.Stats.cSharedPages--;
-                if (!--pPage->Shared.cRefs)
+                pGVM->gmm.s.Stats.cSharedPages--;// 更新共享页计数
+                if (!--pPage->Shared.cRefs) // 引用归零时释放
                     gmmR0FreeSharedPage(pGMM, pGVM, idPage, pPage);
                 else
                 {
                     Assert(pGMM->cDuplicatePages);
-                    pGMM->cDuplicatePages--;
+                    pGMM->cDuplicatePages--; // 仅减少全局重复页计数
                 }
             }
             else
             {
                 Log(("gmmR0AllocatePages: #%#x/%#x: already free!\n", iPage, idPage));
-                rc = VERR_GMM_PAGE_ALREADY_FREE;
+                rc = VERR_GMM_PAGE_ALREADY_FREE; // 页已空闲
                 break;
             }
         }
         else
         {
             Log(("gmmR0AllocatePages: #%#x/%#x: not found!\n", iPage, idPage));
-            rc = VERR_GMM_PAGE_NOT_FOUND;
+            rc = VERR_GMM_PAGE_NOT_FOUND;// 页不存在
             break;
         }
-        paPages[iPage].idPage = NIL_GMM_PAGEID;
+        paPages[iPage].idPage = NIL_GMM_PAGEID;// 标记为已释放
     }
 
     /*
@@ -3979,6 +4327,15 @@ GMMR0DECL(int) GMMR0FreePagesReq(PGVM pGVM, VMCPUID idCpu, PGMMFREEPAGESREQ pReq
  *
  * @thread  EMT(idCpu)
  */
+//即动态调整客户机（Guest VM）的内存占用，以优化主机（Host）内存利用率
+//根据 enmAction 执行 膨胀（Inflate）、收缩（Deflate）或 重置（Reset）内存气球。
+/*
+参数
+  pGVM：目标虚拟机控制块。
+  idCpu：当前 CPU ID（用于验证 EMT 线程）。
+  enmAction：操作类型（GMMBALLOONACTION_INFLATE / DEFLATE / RESET）。
+  cBalloonedPages：要调整的内存页数（以 4KB 页为单位）。
+ * */
 GMMR0DECL(int) GMMR0BalloonedPages(PGVM pGVM, VMCPUID idCpu, GMMBALLOONACTION enmAction, uint32_t cBalloonedPages)
 {
     LogFlow(("GMMR0BalloonedPages: pGVM=%p enmAction=%d cBalloonedPages=%#x\n",
@@ -3991,6 +4348,7 @@ GMMR0DECL(int) GMMR0BalloonedPages(PGVM pGVM, VMCPUID idCpu, GMMBALLOONACTION en
      */
     PGMM pGMM;
     GMM_GET_VALID_INSTANCE(pGMM, VERR_GMM_INSTANCE);
+    //检查当前线程是否为 EMT（Emulation Thread）。
     int rc = GVMMR0ValidateGVMandEMT(pGVM, idCpu);
     if (RT_FAILURE(rc))
         return rc;
@@ -4003,8 +4361,11 @@ GMMR0DECL(int) GMMR0BalloonedPages(PGVM pGVM, VMCPUID idCpu, GMMBALLOONACTION en
     {
         switch (enmAction)
         {
+            //膨胀（Inflate）
             case GMMBALLOONACTION_INFLATE:
             {
+                //检查是否超出预留内存
+                //已分配内存 + 气球内存 + 新请求 ≤ 预留内存。
                 if (RT_LIKELY(pGVM->gmm.s.Stats.Allocated.cBasePages + pGVM->gmm.s.Stats.cBalloonedPages + cBalloonedPages
                               <= pGVM->gmm.s.Stats.Reserved.cBasePages))
                 {
@@ -4017,6 +4378,7 @@ GMMR0DECL(int) GMMR0BalloonedPages(PGVM pGVM, VMCPUID idCpu, GMMBALLOONACTION en
                         /* Codepath never taken. Might be interesting in the future to request ballooned memory from guests in low memory conditions.. */
                         AssertFailed();
 
+                        //全局和 VM 级别的气球内存计数增加。
                         pGVM->gmm.s.Stats.cBalloonedPages            += cBalloonedPages;
                         pGVM->gmm.s.Stats.cReqActuallyBalloonedPages += cBalloonedPages;
                         Log(("GMMR0BalloonedPages: +%#x - Global=%#llx / VM: Total=%#llx Req=%#llx Actual=%#llx (pending)\n",
@@ -4035,20 +4397,25 @@ GMMR0DECL(int) GMMR0BalloonedPages(PGVM pGVM, VMCPUID idCpu, GMMBALLOONACTION en
                     Log(("GMMR0BalloonedPages: cBasePages=%#llx Total=%#llx cBalloonedPages=%#llx Reserved=%#llx\n",
                          pGVM->gmm.s.Stats.Allocated.cBasePages, pGVM->gmm.s.Stats.cBalloonedPages, cBalloonedPages,
                          pGVM->gmm.s.Stats.Reserved.cBasePages));
+                    //超出预留内存
                     rc = VERR_GMM_ATTEMPT_TO_FREE_TOO_MUCH;
                 }
                 break;
             }
 
+            //收缩（Deflate）
             case GMMBALLOONACTION_DEFLATE:
             {
                 /* Deflate. */
+                //检查是否有足够气球内存可释放
+                //当前气球内存 ≥ 请求释放的页数。
                 if (pGVM->gmm.s.Stats.cBalloonedPages >= cBalloonedPages)
                 {
                     /*
                      * Record the ballooned memory.
                      */
                     Assert(pGMM->cBalloonedPages >= cBalloonedPages);
+                    //减少全局和 VM 的气球内存计数。
                     pGMM->cBalloonedPages             -= cBalloonedPages;
                     pGVM->gmm.s.Stats.cBalloonedPages -= cBalloonedPages;
                     if (pGVM->gmm.s.Stats.cReqDeflatePages)
@@ -4069,16 +4436,19 @@ GMMR0DECL(int) GMMR0BalloonedPages(PGVM pGVM, VMCPUID idCpu, GMMBALLOONACTION en
                 else
                 {
                     Log(("GMMR0BalloonedPages: Total=%#llx cBalloonedPages=%#llx\n", pGVM->gmm.s.Stats.cBalloonedPages, cBalloonedPages));
+                    //若请求释放的页数超过当前气球内存
                     rc = VERR_GMM_ATTEMPT_TO_DEFLATE_TOO_MUCH;
                 }
                 break;
             }
 
             case GMMBALLOONACTION_RESET:
+            //强制清空气球内存
             {
                 /* Reset to an empty balloon. */
                 Assert(pGMM->cBalloonedPages >= pGVM->gmm.s.Stats.cBalloonedPages);
 
+                //将 VM 的气球内存归零，并调整全局计数。
                 pGMM->cBalloonedPages             -= pGVM->gmm.s.Stats.cBalloonedPages;
                 pGVM->gmm.s.Stats.cBalloonedPages  = 0;
                 break;
@@ -4286,6 +4656,8 @@ static int gmmR0UnmapChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, bool fRelaxed
  *                      In the VERR_GMM_CHUNK_ALREADY_MAPPED case, this will be
  *                      contain the address of the existing mapping.
  */
+// 将内存块（pChunk）映射到指定虚拟机（pGVM）的用户态地址空间，
+// 并返回映射后的虚拟地址
 static int gmmR0MapChunkLocked(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, PRTR3PTR ppvR3)
 {
     RT_NOREF(pGMM);
@@ -4301,6 +4673,7 @@ static int gmmR0MapChunkLocked(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, PRTR3PTR 
             *ppvR3 = RTR0MemObjAddressR3(pChunk->paMappingsX[i].hMapObj);
             Log(("gmmR0MapChunk: chunk %#x is already mapped at %p!\n", pChunk->Core.Key, *ppvR3));
 #ifdef VBOX_WITH_PAGE_SHARING
+            //若启用 VBOX_WITH_PAGE_SHARING，允许重复映射（因 R3 缓存可能不同步）。
             /* The ring-3 chunk cache can be out of sync; don't fail. */
             return VINF_SUCCESS;
 #else
@@ -4313,9 +4686,15 @@ static int gmmR0MapChunkLocked(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, PRTR3PTR 
      * Do the mapping.
      */
     RTR0MEMOBJ hMapObj;
+    //将内存块（pChunk->hMemObj）映射到用户态
     int rc = RTR0MemObjMapUser(&hMapObj, pChunk->hMemObj, (RTR3PTR)-1, 0, RTMEM_PROT_READ | RTMEM_PROT_WRITE, NIL_RTR0PROCESS);
     if (RT_SUCCESS(rc))
     {
+         /*
+          空间预分配策略：
+            小规模优化：若当前映射数 iMapping ≤ 3，仅扩容 1 个条目。
+            批量扩容：若映射数为 4 的倍数（(iMapping & 3) == 0），扩容 4 个条目。
+        */
         /* reallocate the array? assumes few users per chunk (usually one). */
         unsigned iMapping = pChunk->cMappingsX;
         if (   iMapping <= 3
@@ -4341,11 +4720,13 @@ static int gmmR0MapChunkLocked(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, PRTR3PTR 
         }
 
         /* insert new entry */
+        //更新映射表
         pChunk->paMappingsX[iMapping].hMapObj = hMapObj;
         pChunk->paMappingsX[iMapping].pGVM    = pGVM;
         Assert(pChunk->cMappingsX == iMapping);
         pChunk->cMappingsX = iMapping + 1;
 
+        //通过 RTR0MemObjAddressR3 获取用户态虚拟地址并写入 ppvR3。
         *ppvR3 = RTR0MemObjAddressR3(hMapObj);
     }
 
@@ -4396,10 +4777,13 @@ static int gmmR0MapChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, bool fRelaxedSe
  * @param   pChunk      Pointer to the chunk to be mapped.
  * @param   ppvR3       Where to store the ring-3 address of the mapping.
  */
+// 验证指定内存块（pChunk）是否已映射到目标虚拟机（pGVM）的地址空间
+// 并返回映射后的主机虚拟地址（ppvR3）
 static bool gmmR0IsChunkMapped(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, PRTR3PTR ppvR3)
 {
     GMMR0CHUNKMTXSTATE MtxState;
     gmmR0ChunkMutexAcquire(&MtxState, pGMM, pChunk, GMMR0CHUNK_MTX_KEEP_GIANT);
+    //遍历内存块的扩展映射表
     for (uint32_t i = 0; i < pChunk->cMappingsX; i++)
     {
         Assert(pChunk->paMappingsX[i].pGVM && pChunk->paMappingsX[i].hMapObj != NIL_RTR0MEMOBJ);
@@ -4432,6 +4816,8 @@ static bool gmmR0IsChunkMapped(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, PRTR3PTR 
  * @param   ppvR3           Where to store the address of the mapped chunk. NULL is ok if nothing to map.
  * @thread  EMT ???
  */
+//核心逻辑是 原子化地处理内存块的映射（Map）
+//与解除映射（Unmap），确保客户机内存管理的安全性和一致性
 GMMR0DECL(int) GMMR0MapUnmapChunk(PGVM pGVM, uint32_t idChunkMap, uint32_t idChunkUnmap, PRTR3PTR ppvR3)
 {
     LogFlow(("GMMR0MapUnmapChunk: pGVM=%p idChunkMap=%#x idChunkUnmap=%#x ppvR3=%p\n",
@@ -4441,7 +4827,7 @@ GMMR0DECL(int) GMMR0MapUnmapChunk(PGVM pGVM, uint32_t idChunkMap, uint32_t idChu
      * Validate input and get the basics.
      */
     PGMM pGMM;
-    GMM_GET_VALID_INSTANCE(pGMM, VERR_GMM_INSTANCE);
+    GMM_GET_VALID_INSTANCE(pGMM, VERR_GMM_INSTANCE);//通过 GMM_GET_VALID_INSTANCE 验证全局内存管理器（pGMM）有效性。
     int rc = GVMMR0ValidateGVM(pGVM);
     if (RT_FAILURE(rc))
         return rc;
@@ -4474,7 +4860,9 @@ GMMR0DECL(int) GMMR0MapUnmapChunk(PGVM pGVM, uint32_t idChunkMap, uint32_t idChu
         PGMMCHUNK pMap = NULL;
         if (idChunkMap != NIL_GVM_HANDLE)
         {
+            //调用 gmmR0GetChunk 根据 idChunkMap 获取块描述符 pMap
             pMap = gmmR0GetChunk(pGMM, idChunkMap);
+            //若块有效（pMap != NULL），调用 gmmR0MapChunk 将其映射到客户机地址空间，并通过 ppvR3 返回映射后的主机虚拟地址。
             if (RT_LIKELY(pMap))
                 rc = gmmR0MapChunk(pGMM, pGVM, pMap, true /*fRelaxedSem*/, ppvR3);
             else
@@ -4489,8 +4877,10 @@ GMMR0DECL(int) GMMR0MapUnmapChunk(PGVM pGVM, uint32_t idChunkMap, uint32_t idChu
         if (    idChunkUnmap != NIL_GMM_CHUNKID
             &&  RT_SUCCESS(rc))
         {
+            //通过 gmmR0GetChunk 获取 idChunkUnmap 对应的块 pUnmap
             PGMMCHUNK pUnmap = gmmR0GetChunk(pGMM, idChunkUnmap);
             if (RT_LIKELY(pUnmap))
+                //若块有效，调用 gmmR0UnmapChunk 解除映射。
                 rc = gmmR0UnmapChunk(pGMM, pGVM, pUnmap, true /*fRelaxedSem*/);
             else
             {
@@ -4498,6 +4888,8 @@ GMMR0DECL(int) GMMR0MapUnmapChunk(PGVM pGVM, uint32_t idChunkMap, uint32_t idChu
                 rc = VERR_GMM_CHUNK_NOT_FOUND;
             }
 
+
+            ///若块无效或卸载失败，回滚已完成的映射操作（若存在）
             if (RT_FAILURE(rc) && pMap)
                 gmmR0UnmapChunk(pGMM, pGVM, pMap, false /*fRelaxedSem*/);
         }
@@ -4547,12 +4939,14 @@ GMMR0DECL(int)  GMMR0MapUnmapChunkReq(PGVM pGVM, PGMMMAPUNMAPCHUNKREQ pReq)
  * @param   ppv         Where to store the address.
  * @thread  EMT
  */
+//将 客户机物理页 ID（idPage）转换为 主机虚拟地址（ppv），同时确保页所有权和访问安全性。
 GMMR0DECL(int)  GMMR0PageIdToVirt(PGVM pGVM, uint32_t idPage, void **ppv)
 {
     *ppv = NULL;
     PGMM pGMM;
     GMM_GET_VALID_INSTANCE(pGMM, VERR_GMM_INSTANCE);
 
+    //提取 内存块 ID
     uint32_t const idChunk = idPage >> GMM_CHUNKID_SHIFT;
 
     /*
@@ -4560,6 +4954,8 @@ GMMR0DECL(int)  GMMR0PageIdToVirt(PGVM pGVM, uint32_t idPage, void **ppv)
      */
     RTSpinlockAcquire(pGVM->gmm.s.hChunkTlbSpinLock);
 
+    //首先检查 VM 本地 TLB（pGVM->gmm.s.aChunkTlbEntries），
+    //若命中（pChunk 有效且代际匹配 idGeneration），直接复用缓存结果，减少全局锁竞争。
     PGMMPERVMCHUNKTLBE pTlbe = &pGVM->gmm.s.aChunkTlbEntries[GMMPERVM_CHUNKTLB_IDX(idChunk)];
     PGMMCHUNK pChunk = pTlbe->pChunk;
     if (   pChunk              != NULL
@@ -4567,6 +4963,8 @@ GMMR0DECL(int)  GMMR0PageIdToVirt(PGVM pGVM, uint32_t idPage, void **ppv)
         && pChunk->Core.Key    == idChunk)
         pGVM->R0Stats.gmm.cChunkTlbHits++; /* hopefully this is a likely outcome */
     else
+        //若未命中，需全局锁（pGMM->hSpinLockTree）保护下查询 全局内存块树（gmmR0GetChunkLocked），
+        //并更新 TLB 条目（pTlbe->pChunk 和 idGeneration）。
     {
         pGVM->R0Stats.gmm.cChunkTlbMisses++;
 
@@ -4595,12 +4993,14 @@ GMMR0DECL(int)  GMMR0PageIdToVirt(PGVM pGVM, uint32_t idPage, void **ppv)
     /*
      * Got a chunk, now validate the page ownership and calcuate it's address.
      */
+    //idPage & GMM_PAGEID_IDX_MASK 提取 页在块内的索引
     const GMMPAGE * const pPage = &pChunk->aPages[idPage & GMM_PAGEID_IDX_MASK];
     if (RT_LIKELY(   (   GMM_PAGE_IS_PRIVATE(pPage)
                       && pPage->Private.hGVM == pGVM->hSelf)
                   || GMM_PAGE_IS_SHARED(pPage)))
     {
         AssertPtr(pChunk->pbMapping);
+        //通过块映射基地址（pChunk->pbMapping）和页索引偏移量（<< GUEST_PAGE_SHIFT）得到主机虚拟地址
         *ppv = &pChunk->pbMapping[(idPage & GMM_PAGEID_IDX_MASK) << GUEST_PAGE_SHIFT];
         return VINF_SUCCESS;
     }
@@ -4623,12 +5023,14 @@ GMMR0DECL(int)  GMMR0PageIdToVirt(PGVM pGVM, uint32_t idPage, void **ppv)
  * @param   pGVM        Pointer to the kernel-only VM instace data.
  * @param   idPage      The page ID.
  */
+//通过计算客户机内存页的 CRC32 校验和来验证页面内容的完整性
 static uint32_t gmmR0StrictPageChecksum(PGMM pGMM, PGVM pGVM, uint32_t idPage)
 {
     PGMMCHUNK pChunk = gmmR0GetChunk(pGMM, idPage >> GMM_CHUNKID_SHIFT);
     AssertMsgReturn(pChunk, ("idPage=%#x\n", idPage), 0);
 
     uint8_t *pbChunk;
+    // 验证内存块是否已映射到当前 VM 的地址空间
     if (!gmmR0IsChunkMapped(pGMM, pGVM, pChunk, (PRTR3PTR)&pbChunk))
         return 0;
     uint8_t const *pbPage = pbChunk + ((idPage & GMM_PAGEID_IDX_MASK) << GUEST_PAGE_SHIFT);
@@ -4791,6 +5193,7 @@ static void gmmR0ShModDeleteGlobal(PGMM pGMM, PGMMSHAREDMODULE pGblMod)
 }
 
 
+//为单个 VM 注册共享模块的 VM 级记录
 static int gmmR0ShModNewPerVM(PGVM pGVM, RTGCPTR GCBaseAddr, uint32_t cRegions, const VMMDEVSHAREDREGIONDESC *paRegions,
                               PGMMSHAREDMODULEPERVM *ppRecVM)
 {
@@ -4802,10 +5205,14 @@ static int gmmR0ShModNewPerVM(PGVM pGVM, RTGCPTR GCBaseAddr, uint32_t cRegions, 
     if (!pRecVM)
         return VERR_NO_MEMORY;
 
+    //将输入参数 GCBaseAddr 作为 AVL 树节点的键值（Core.Key）
     pRecVM->Core.Key = GCBaseAddr;
     for (uint32_t i = 0; i < cRegions; i++)
+        //遍历 paRegions 数组，将每个区域的客户机物理地址（GCRegionAddr）
+        //复制到 aRegionsGCPtrs 中
         pRecVM->aRegionsGCPtrs[i] = paRegions[i].GCRegionAddr;
 
+    //将新节点插入 VM 的共享模块树
     bool fInsert = RTAvlGCPtrInsert(&pGVM->gmm.s.pSharedModuleTree, &pRecVM->Core);
     Assert(fInsert); NOREF(fInsert);
     pGVM->gmm.s.Stats.cShareableModules++;
@@ -4861,6 +5268,18 @@ static void gmmR0ShModDeletePerVM(PGMM pGMM, PGVM pGVM, PGMMSHAREDMODULEPERVM pR
  * @param   paRegions       Pointer to an array of shared region(s).
  * @thread  EMT(idCpu)
  */
+/*
+用于注册和管理共享模块，以支持内存页共享（Page Sharing）功能。该函数的主要职责包括：
+  验证输入参数（模块名称、版本、内存区域等）。
+  检查模块是否已注册（避免重复注册）。
+  管理全局和 VM 级别的模块记录
+  处理模块哈希匹配，以支持跨 VM 的页面去重（Page Deduplication）。
+*/
+/*
+ virtualbox的VM在共享相同OS的时候，镜像大小通常大于1G， GMMR0RegisterSharedModule 是如何处理的
+   模块大小限制：函数会验证模块大小（cbModule ≤ 1GB），但实际支持更大的模块通过分区域处理（cRegions 和 paRegions 描述分段）
+   区域校验：每个内存区域（paRegions[i].cbRegion）需满足 ≤ 1GB，总和可超过 1GB，但需通过循环累加校验（cbTotal）
+ * */
 GMMR0DECL(int) GMMR0RegisterSharedModule(PGVM pGVM, VMCPUID idCpu, VBOXOSFAMILY enmGuestOS, char *pszModuleName,
                                          char *pszVersion, RTGCPTR GCPtrModBase, uint32_t cbModule,
                                          uint32_t cRegions, struct VMMDEVSHAREDREGIONDESC const *paRegions)
@@ -4878,12 +5297,15 @@ GMMR0DECL(int) GMMR0RegisterSharedModule(PGVM pGVM, VMCPUID idCpu, VBOXOSFAMILY 
     if (RT_FAILURE(rc))
         return rc;
 
+    /* 检查区域数量是否超过限制 */
     if (RT_UNLIKELY(cRegions > VMMDEVSHAREDREGIONDESC_MAX))
         return VERR_GMM_TOO_MANY_REGIONS;
 
+    /* 检查模块大小是否合法 */
     if (RT_UNLIKELY(cbModule == 0 || cbModule > _1G))
         return VERR_GMM_BAD_SHARED_MODULE_SIZE;
 
+    /* 检查每个区域的大小是否合法 */
     uint32_t cbTotal = 0;
     for (uint32_t i = 0; i < cRegions; i++)
     {
@@ -4895,6 +5317,7 @@ GMMR0DECL(int) GMMR0RegisterSharedModule(PGVM pGVM, VMCPUID idCpu, VBOXOSFAMILY 
             return VERR_GMM_SHARED_MODULE_BAD_REGIONS_SIZE;
     }
 
+    /* 检查模块名称和版本字符串是否合法 */
     AssertPtrReturn(pszModuleName, VERR_INVALID_POINTER);
     if (RT_UNLIKELY(!memchr(pszModuleName, '\0', GMM_SHARED_MODULE_MAX_NAME_STRING)))
         return VERR_GMM_MODULE_NAME_TOO_LONG;
@@ -4903,6 +5326,7 @@ GMMR0DECL(int) GMMR0RegisterSharedModule(PGVM pGVM, VMCPUID idCpu, VBOXOSFAMILY 
     if (RT_UNLIKELY(!memchr(pszVersion, '\0', GMM_SHARED_MODULE_MAX_VERSION_STRING)))
         return VERR_GMM_MODULE_NAME_TOO_LONG;
 
+    //计算模块名称和版本的哈希值，用于全局模块匹配。
     uint32_t const uHash = gmmR0ShModCalcHash(pszModuleName, pszVersion);
     Log(("GMMR0RegisterSharedModule %s %s base %RGv size %x hash %x\n", pszModuleName, pszVersion, GCPtrModBase, cbModule, uHash));
 
@@ -4917,8 +5341,10 @@ GMMR0DECL(int) GMMR0RegisterSharedModule(PGVM pGVM, VMCPUID idCpu, VBOXOSFAMILY 
          * it if it isn't.  The base address is a unique module identifier
          * locally.
          */
+        //在 VM 的共享模块树中查找是否已注册相同基地址的模块。
         PGMMSHAREDMODULEPERVM pRecVM = (PGMMSHAREDMODULEPERVM)RTAvlGCPtrGet(&pGVM->gmm.s.pSharedModuleTree, GCPtrModBase);
         bool fNewModule = pRecVM == NULL;
+        //处理新模块注册
         if (fNewModule)
         {
             rc = gmmR0ShModNewPerVM(pGVM, GCPtrModBase, cRegions, paRegions, &pRecVM);
@@ -4927,6 +5353,7 @@ GMMR0DECL(int) GMMR0RegisterSharedModule(PGVM pGVM, VMCPUID idCpu, VBOXOSFAMILY 
                 /*
                  * Find a matching global module, register a new one if needed.
                  */
+                /* 查找全局匹配的模块 */
                 PGMMSHAREDMODULE pGblMod = gmmR0ShModFindGlobal(pGMM, uHash, cbModule, enmGuestOS, cRegions,
                                                                 pszModuleName, pszVersion, paRegions);
                 if (!pGblMod)
@@ -4944,6 +5371,7 @@ GMMR0DECL(int) GMMR0RegisterSharedModule(PGVM pGVM, VMCPUID idCpu, VBOXOSFAMILY 
                 }
                 else
                 {
+                    /* 全局模块已存在，增加引用计数 */
                     Assert(pGblMod->cUsers > 0 && pGblMod->cUsers < UINT32_MAX / 2);
                     pGblMod->cUsers++;
                     pRecVM->pGlobalModule = pGblMod;
@@ -4957,6 +5385,7 @@ GMMR0DECL(int) GMMR0RegisterSharedModule(PGVM pGVM, VMCPUID idCpu, VBOXOSFAMILY 
             /*
              * Attempt to re-register an existing module.
              */
+            /* 检查是否与全局模块匹配 */
             PGMMSHAREDMODULE pGblMod = gmmR0ShModFindGlobal(pGMM, uHash, cbModule, enmGuestOS, cRegions,
                                                             pszModuleName, pszVersion, paRegions);
             if (pRecVM->pGlobalModule == pGblMod)
@@ -4968,6 +5397,7 @@ GMMR0DECL(int) GMMR0RegisterSharedModule(PGVM pGVM, VMCPUID idCpu, VBOXOSFAMILY 
             {
                 /** @todo may have to unregister+register when this happens in case it's caused
                  * by VBoxService crashing and being restarted... */
+                 /* 地址冲突！可能是 VBoxService 崩溃后重新启动 */
                 Log(("GMMR0RegisterSharedModule: Address clash!\n"
                      "  incoming at %RGvLB%#x %s %s rgns %u\n"
                      "  existing at %RGvLB%#x %s %s rgns %u\n",
@@ -5029,6 +5459,7 @@ GMMR0DECL(int) GMMR0RegisterSharedModuleReq(PGVM pGVM, VMCPUID idCpu, PGMMREGIST
  * @param   GCPtrModBase    The module base address.
  * @param   cbModule        The module size.
  */
+/*  注销虚拟机（VM）的共享模块 */
 GMMR0DECL(int) GMMR0UnregisterSharedModule(PGVM pGVM, VMCPUID idCpu, char *pszModuleName, char *pszVersion,
                                            RTGCPTR GCPtrModBase, uint32_t cbModule)
 {
@@ -5037,17 +5468,17 @@ GMMR0DECL(int) GMMR0UnregisterSharedModule(PGVM pGVM, VMCPUID idCpu, char *pszMo
      * Validate input and get the basics.
      */
     PGMM pGMM;
-    GMM_GET_VALID_INSTANCE(pGMM, VERR_GMM_INSTANCE);
-    int rc = GVMMR0ValidateGVMandEMT(pGVM, idCpu);
+    GMM_GET_VALID_INSTANCE(pGMM, VERR_GMM_INSTANCE); // 获取GMM实例
+    int rc = GVMMR0ValidateGVMandEMT(pGVM, idCpu); // 验证VM和CPU ID有效性
     if (RT_FAILURE(rc))
         return rc;
 
-    AssertPtrReturn(pszModuleName, VERR_INVALID_POINTER);
+    AssertPtrReturn(pszModuleName, VERR_INVALID_POINTER);// 模块名称非空
     AssertPtrReturn(pszVersion, VERR_INVALID_POINTER);
     if (RT_UNLIKELY(!memchr(pszModuleName, '\0', GMM_SHARED_MODULE_MAX_NAME_STRING)))
-        return VERR_GMM_MODULE_NAME_TOO_LONG;
+        return VERR_GMM_MODULE_NAME_TOO_LONG;// 检查名称长度
     if (RT_UNLIKELY(!memchr(pszVersion, '\0', GMM_SHARED_MODULE_MAX_VERSION_STRING)))
-        return VERR_GMM_MODULE_NAME_TOO_LONG;
+        return VERR_GMM_MODULE_NAME_TOO_LONG; // 检查版本长度
 
     Log(("GMMR0UnregisterSharedModule %s %s base=%RGv size %x\n", pszModuleName, pszVersion, GCPtrModBase, cbModule));
 
@@ -5067,7 +5498,13 @@ GMMR0DECL(int) GMMR0UnregisterSharedModule(PGVM pGVM, VMCPUID idCpu, char *pszMo
              *        name + version + cbModule matches? */
             NOREF(cbModule);
             Assert(pRecVM->pGlobalModule);
-            gmmR0ShModDeletePerVM(pGMM, pGVM, pRecVM, true /*fRemove*/);
+            /*
+             * 查找逻辑：基于模块基地址（GCPtrModBase）在AVL树中快速定位。
+            删除操作：调用 gmmR0ShModDeletePerVM 清理VM与模块的关联：
+              减少全局模块的引用计数。
+              若引用归零，释放全局模块描述符。
+            */
+            gmmR0ShModDeletePerVM(pGMM, pGVM, pRecVM, true /*fRemove*/);// 执行删除
         }
         else
             rc = VERR_GMM_SHARED_MODULE_NOT_FOUND;
@@ -5115,16 +5552,28 @@ GMMR0DECL(int)  GMMR0UnregisterSharedModuleReq(PGVM pGVM, VMCPUID idCpu, PGMMUNR
  * @param   pGVM        Pointer to the GVM instance.
  * @param   pPage       The page structure.
  */
+/*
+示例场景
+  场景：3个VM运行相同的应用程序：
+    VM1 加载应用代码页 → 转为共享页（cRefs=1）。
+    VM2/VM3 加载相同代码页 → 分别调用 gmmR0UseSharedPage：
+    cRefs 递增至3。
+    cDuplicatePages 增加2（节省2个物理页）。
+  统计结果：
+    pGMM->cSharedPages=1（1个共享页）。
+    pGMM->cDuplicatePages=2（节省2页内存）。
+    每个VM的 cSharedPages 和 cBasePages 各+1。
+*/
 DECLINLINE(void) gmmR0UseSharedPage(PGMM pGMM, PGVM pGVM, PGMMPAGE pPage)
 {
     Assert(pGMM->cSharedPages > 0);
     Assert(pGMM->cAllocatedPages > 0);
 
-    pGMM->cDuplicatePages++;
+    pGMM->cDuplicatePages++;//统计因共享而节省的物理页数。
 
-    pPage->Shared.cRefs++;
-    pGVM->gmm.s.Stats.cSharedPages++;
-    pGVM->gmm.s.Stats.Allocated.cBasePages++;
+    pPage->Shared.cRefs++; //共享页的引用计数，表示当前被多少VM使用。
+    pGVM->gmm.s.Stats.cSharedPages++; //当前VM使用的共享页数+1。
+    pGVM->gmm.s.Stats.Allocated.cBasePages++;//当前VM的总分配页数+1（共享页也计入VM的内存占用）。
 }
 
 
@@ -5138,22 +5587,31 @@ DECLINLINE(void) gmmR0UseSharedPage(PGMM pGMM, PGVM pGVM, PGMMPAGE pPage)
  * @param   pPage       The page structure.
  * @param   pPageDesc   Shared page descriptor
  */
+/*
+负责将私有内存页（Private Page）转换为共享页（Shared Page），实现多虚拟机间的内存去重（Deduplication）。其核心操作包括：
+  状态转换：私有页 → 共享页
+  引用计数初始化：标记首次共享的VM
+  统计信息更新：全局和VM级别的计数器维护
+  调试支持：可选的内存校验和验证
+*/
 DECLINLINE(void) gmmR0ConvertToSharedPage(PGMM pGMM, PGVM pGVM, RTHCPHYS HCPhys, uint32_t idPage, PGMMPAGE pPage,
                                           PGMMSHAREDPAGEDESC pPageDesc)
 {
+    //获取所属内存块
     PGMMCHUNK pChunk = gmmR0GetChunk(pGMM, idPage >> GMM_CHUNKID_SHIFT);
     Assert(pChunk);
     Assert(pChunk->cFree < GMM_CHUNK_NUM_PAGES);
     Assert(GMM_PAGE_IS_PRIVATE(pPage));
 
-    pChunk->cPrivate--;
-    pChunk->cShared++;
+    pChunk->cPrivate--; //内存块私有页数-1
+    pChunk->cShared++; //内存块共享页数+1
 
-    pGMM->cSharedPages++;
+    pGMM->cSharedPages++;// 全局共享页总数+1
 
-    pGVM->gmm.s.Stats.cSharedPages++;
-    pGVM->gmm.s.Stats.cPrivatePages--;
+    pGVM->gmm.s.Stats.cSharedPages++; // 当前VM共享页数+1
+    pGVM->gmm.s.Stats.cPrivatePages--;// 当前VM私有页数-1
 
+    //共享页元数据设置
     /* Modify the page structure. */
     pPage->Shared.pfn         = (uint32_t)(uint64_t)(HCPhys >> GUEST_PAGE_SHIFT);
     pPage->Shared.cRefs       = 1;
@@ -5168,6 +5626,16 @@ DECLINLINE(void) gmmR0ConvertToSharedPage(PGMM pGMM, PGVM pGVM, RTHCPHYS HCPhys,
 }
 
 
+/*
+PGMM pGMM,                      // GMM全局管理实例
+    PGVM pGVM,                      // 目标虚拟机控制块
+    PGMMSHAREDMODULE pModule,       // 共享模块信息（未使用）
+    unsigned idxRegion,             // 内存区域索引（未使用）
+    unsigned idxPage,               // 页面索引
+    PGMMSHAREDPAGEDESC pPageDesc,   // 页面描述符（输入/输出）
+    PGMMSHAREDREGIONDESC pGlobalRegion // 全局区域描述符
+*/
+//处理首次发现的共享页面，将其从私有页转换为共享页。
 static int gmmR0SharedModuleCheckPageFirstTime(PGMM pGMM, PGVM pGVM, PGMMSHAREDMODULE pModule,
                                                unsigned idxRegion, unsigned idxPage,
                                                PGMMSHAREDPAGEDESC pPageDesc, PGMMSHAREDREGIONDESC pGlobalRegion)
@@ -5175,17 +5643,27 @@ static int gmmR0SharedModuleCheckPageFirstTime(PGMM pGMM, PGVM pGVM, PGMMSHAREDM
     NOREF(pModule);
 
     /* Easy case: just change the internal page type. */
+    //通过 pPageDesc->idPage 从GMM中获取页面结构体 PGMMPAGE。
     PGMMPAGE pPage = gmmR0GetPage(pGMM, pPageDesc->idPage);
     AssertMsgReturn(pPage, ("idPage=%#x (GCPhys=%RGp HCPhys=%RHp idxRegion=%#x idxPage=%#x) #1\n",
                             pPageDesc->idPage, pPageDesc->GCPhys, pPageDesc->HCPhys, idxRegion, idxPage),
                     VERR_PGM_PHYS_INVALID_PAGE_ID);
     NOREF(idxRegion);
 
+    //验证页面描述符中的客户机物理地址（GCPhys）是否与GMM记录的地址一致。
+    //pPage->Private.pfn << 12 将页面帧号（PFN）转换为物理地址（4KB页对齐）。
     AssertMsg(pPageDesc->GCPhys == (pPage->Private.pfn << 12), ("desc %RGp gmm %RGp\n", pPageDesc->HCPhys, (pPage->Private.pfn << 12)));
 
+    // 转换为共享页面
+    // pPageDesc->HCPhys：主机物理地址（用于共享映射）。
+    //pPage：GMM页面结构体（更新其状态为 GMM_PAGE_STATE_SHARED）。
+      //更新GMM页面状态和引用计数。
+      //可能将页面加入全局共享哈希表。
     gmmR0ConvertToSharedPage(pGMM, pGVM, pPageDesc->HCPhys, pPageDesc->idPage, pPage, pPageDesc);
 
     /* Keep track of these references. */
+    //记录共享引用
+    //后续访问该页面时，可通过 idxPage 直接找到共享页ID，跳过重复检查。
     pGlobalRegion->paidPages[idxPage] = pPageDesc->idPage;
 
     return VINF_SUCCESS;
@@ -5210,6 +5688,16 @@ static int gmmR0SharedModuleCheckPageFirstTime(PGMM pGMM, PGVM pGVM, PGMMSHAREDM
  * @param   idxPage     Page index
  * @param   pPageDesc   Page descriptor
  */
+//该函数实现了 内存去重（Memory Deduplication），即在多个虚拟机运行相同操作系统或应用程序时，
+//让它们共享相同的内存页，从而减少总体内存占用。
+//例如：10 个 Windows 10 VM 运行时，内核代码页、系统 DLL 等完全相同。通过共享这些页，可减少物理内存占用。
+/*
+  pGVM：指向虚拟机控制结构的指针
+  pModule：共享模块信息结构体
+  idxRegion：内存区域索引
+  idxPage：页面索引
+  pPageDesc：页面描述符（输出参数）
+*/
 GMMR0DECL(int) GMMR0SharedModuleCheckPage(PGVM pGVM, PGMMSHAREDMODULE pModule, uint32_t idxRegion, uint32_t idxPage,
                                           PGMMSHAREDPAGEDESC pPageDesc)
 {
@@ -5218,12 +5706,12 @@ GMMR0DECL(int) GMMR0SharedModuleCheckPage(PGVM pGVM, PGMMSHAREDMODULE pModule, u
     GMM_GET_VALID_INSTANCE(pGMM, VERR_GMM_INSTANCE);
     pPageDesc->u32StrictChecksum = 0;
 
-    AssertMsgReturn(idxRegion < pModule->cRegions,
+    AssertMsgReturn(idxRegion < pModule->cRegions,// 检查区域索引是否越界
                     ("idxRegion=%#x cRegions=%#x %s %s\n", idxRegion, pModule->cRegions, pModule->szName, pModule->szVersion),
-                    VERR_INVALID_PARAMETER);
+                    VERR_INVALID_PARAMETER); // 越界则返回无效参数错误
 
-    uint32_t const cPages = pModule->aRegions[idxRegion].cb >> GUEST_PAGE_SHIFT;
-    AssertMsgReturn(idxPage < cPages,
+    uint32_t const cPages = pModule->aRegions[idxRegion].cb >> GUEST_PAGE_SHIFT;// 计算该区域的页数（字节数转页数）
+    AssertMsgReturn(idxPage < cPages,// 检查页面索引是否越界
                     ("idxRegion=%#x cRegions=%#x %s %s\n", idxRegion, pModule->cRegions, pModule->szName, pModule->szVersion),
                     VERR_INVALID_PARAMETER);
 
@@ -5232,14 +5720,15 @@ GMMR0DECL(int) GMMR0SharedModuleCheckPage(PGVM pGVM, PGMMSHAREDMODULE pModule, u
     /*
      * First time; create a page descriptor array.
      */
-    PGMMSHAREDREGIONDESC pGlobalRegion = &pModule->aRegions[idxRegion];
-    if (!pGlobalRegion->paidPages)
+    PGMMSHAREDREGIONDESC pGlobalRegion = &pModule->aRegions[idxRegion]; // 获取目标区域描述符
+    if (!pGlobalRegion->paidPages)// 如果描述符数组未分配
     {
-        Log(("Allocate page descriptor array for %d pages\n", cPages));
-        pGlobalRegion->paidPages = (uint32_t *)RTMemAlloc(cPages * sizeof(pGlobalRegion->paidPages[0]));
+        Log(("Allocate page descriptor array for %d pages\n", cPages));// 记录分配日志
+        pGlobalRegion->paidPages = (uint32_t *)RTMemAlloc(cPages * sizeof(pGlobalRegion->paidPages[0])); // 分配数组内存
         AssertReturn(pGlobalRegion->paidPages, VERR_NO_MEMORY);
 
         /* Invalidate all descriptors. */
+        /* 将所有描述符初始化为无效值 */
         uint32_t i = cPages;
         while (i-- > 0)
             pGlobalRegion->paidPages[i] = NIL_GMM_PAGEID;
@@ -5248,10 +5737,11 @@ GMMR0DECL(int) GMMR0SharedModuleCheckPage(PGVM pGVM, PGMMSHAREDMODULE pModule, u
     /*
      * We've seen this shared page for the first time?
      */
+    /* 首次见到这个共享页面？ */
     if (pGlobalRegion->paidPages[idxPage] == NIL_GMM_PAGEID)
     {
         Log(("New shared page guest %RGp host %RHp\n", pPageDesc->GCPhys, pPageDesc->HCPhys));
-        return gmmR0SharedModuleCheckPageFirstTime(pGMM, pGVM, pModule, idxRegion, idxPage, pPageDesc, pGlobalRegion);
+        return gmmR0SharedModuleCheckPageFirstTime(pGMM, pGVM, pModule, idxRegion, idxPage, pPageDesc, pGlobalRegion);//调用首次处理函数
     }
 
     /*
@@ -5259,44 +5749,50 @@ GMMR0DECL(int) GMMR0SharedModuleCheckPage(PGVM pGVM, PGMMSHAREDMODULE pModule, u
      */
     Log(("Replace existing page guest %RGp host %RHp id %#x -> id %#x\n",
          pPageDesc->GCPhys, pPageDesc->HCPhys, pPageDesc->idPage, pGlobalRegion->paidPages[idxPage]));
-    Assert(pPageDesc->idPage != pGlobalRegion->paidPages[idxPage]);
+    Assert(pPageDesc->idPage != pGlobalRegion->paidPages[idxPage]); //确保新旧页面ID不同
 
     /*
      * Get the shared page source.
      */
-    PGMMPAGE pPage = gmmR0GetPage(pGMM, pGlobalRegion->paidPages[idxPage]);
+    PGMMPAGE pPage = gmmR0GetPage(pGMM, pGlobalRegion->paidPages[idxPage]); //通过ID获取共享页面结构
     AssertMsgReturn(pPage, ("idPage=%#x (idxRegion=%#x idxPage=%#x) #2\n", pPageDesc->idPage, idxRegion, idxPage),
                     VERR_PGM_PHYS_INVALID_PAGE_ID);
 
-    if (pPage->Common.u2State != GMM_PAGE_STATE_SHARED)
+    if (pPage->Common.u2State != GMM_PAGE_STATE_SHARED) // 检查页面状态是否仍为"共享"
     {
         /*
          * Page was freed at some point; invalidate this entry.
          */
         /** @todo this isn't really bullet proof. */
         Log(("Old shared page was freed -> create a new one\n"));
-        pGlobalRegion->paidPages[idxPage] = NIL_GMM_PAGEID;
+        pGlobalRegion->paidPages[idxPage] = NIL_GMM_PAGEID;// 重置为无效状态
         return gmmR0SharedModuleCheckPageFirstTime(pGMM, pGVM, pModule, idxRegion, idxPage, pPageDesc, pGlobalRegion);
     }
 
+    //记录物理地址替换
     Log(("Replace existing page guest host %RHp -> %RHp\n", pPageDesc->HCPhys, ((uint64_t)pPage->Shared.pfn) << GUEST_PAGE_SHIFT));
 
     /*
      * Calculate the virtual address of the local page.
      */
-    PGMMCHUNK pChunk = gmmR0GetChunk(pGMM, pPageDesc->idPage >> GMM_CHUNKID_SHIFT);
+    /* 计算本地页面的虚拟地址 */
+    PGMMCHUNK pChunk = gmmR0GetChunk(pGMM, pPageDesc->idPage >> GMM_CHUNKID_SHIFT);// 获取内存块
     AssertMsgReturn(pChunk, ("idPage=%#x (idxRegion=%#x idxPage=%#x) #4\n", pPageDesc->idPage, idxRegion, idxPage),
                     VERR_PGM_PHYS_INVALID_PAGE_ID);
 
     uint8_t *pbChunk;
+    //检查内存块是否已映射
     AssertMsgReturn(gmmR0IsChunkMapped(pGMM, pGVM, pChunk, (PRTR3PTR)&pbChunk),
                     ("idPage=%#x (idxRegion=%#x idxPage=%#x) #3\n", pPageDesc->idPage, idxRegion, idxPage),
                     VERR_PGM_PHYS_INVALID_PAGE_ID);
+     // 计算本地页面虚拟地址
     uint8_t  *pbLocalPage = pbChunk + ((pPageDesc->idPage & GMM_PAGEID_IDX_MASK) << GUEST_PAGE_SHIFT);
 
     /*
      * Calculate the virtual address of the shared page.
      */
+     /* 计算共享页面的虚拟地址 */
+     // 获取共享页面对应的内存块
     pChunk = gmmR0GetChunk(pGMM, pGlobalRegion->paidPages[idxPage] >> GMM_CHUNKID_SHIFT);
     Assert(pChunk); /* can't fail as gmmR0GetPage succeeded. */
 
@@ -5304,45 +5800,52 @@ GMMR0DECL(int) GMMR0SharedModuleCheckPage(PGVM pGVM, PGMMSHAREDMODULE pModule, u
      * Get the virtual address of the physical page; map the chunk into the VM
      * process if not already done.
      */
-    if (!gmmR0IsChunkMapped(pGMM, pGVM, pChunk, (PRTR3PTR)&pbChunk))
+     /* 获取物理页面的虚拟地址：如果未映射则映射到VM进程 */
+    if (!gmmR0IsChunkMapped(pGMM, pGVM, pChunk, (PRTR3PTR)&pbChunk))// 检查共享内存块是否已映射
     {
         Log(("Map chunk into process!\n"));
-        rc = gmmR0MapChunk(pGMM, pGVM, pChunk, false /*fRelaxedSem*/, (PRTR3PTR)&pbChunk);
+        rc = gmmR0MapChunk(pGMM, pGVM, pChunk, false /*fRelaxedSem*/, (PRTR3PTR)&pbChunk);// 执行映射
         AssertRCReturn(rc, rc);
     }
+    // 计算共享页面虚拟地址
     uint8_t *pbSharedPage = pbChunk + ((pGlobalRegion->paidPages[idxPage] & GMM_PAGEID_IDX_MASK) << GUEST_PAGE_SHIFT);
 
 #ifdef VBOX_STRICT
-    pPageDesc->u32StrictChecksum = RTCrc32(pbSharedPage, GUEST_PAGE_SIZE);
-    uint32_t uChecksum = pPageDesc->u32StrictChecksum & UINT32_C(0x00003fff);
+    pPageDesc->u32StrictChecksum = RTCrc32(pbSharedPage, GUEST_PAGE_SIZE);//计算共享页面CRC32
+    uint32_t uChecksum = pPageDesc->u32StrictChecksum & UINT32_C(0x00003fff);// 取低14位
+     // 校验和必须匹配
     AssertMsg(!uChecksum || uChecksum == pPage->Shared.u14Checksum || !pPage->Shared.u14Checksum,
               ("%#x vs %#x - idPage=%#x - %s %s\n", uChecksum, pPage->Shared.u14Checksum,
                pGlobalRegion->paidPages[idxPage], pModule->szName, pModule->szVersion));
 #endif
 
+    // 比较本地页和共享页内容
     if (memcmp(pbSharedPage, pbLocalPage, GUEST_PAGE_SIZE))
     {
+        // 内容不同则跳过
         Log(("Unexpected differences found between local and shared page; skip\n"));
         /* Signal to the caller that this one hasn't changed. */
-        pPageDesc->idPage = NIL_GMM_PAGEID;
-        return VINF_SUCCESS;
+        pPageDesc->idPage = NIL_GMM_PAGEID; // 标记为无效页面
+        return VINF_SUCCESS;// 返回成功但要求调用方忽略
     }
 
     /*
      * Free the old local page.
      */
+     /* 释放旧的本地页面 */
     GMMFREEPAGEDESC PageDesc;
-    PageDesc.idPage = pPageDesc->idPage;
-    rc = gmmR0FreePages(pGMM, pGVM, 1, &PageDesc, GMMACCOUNT_BASE);
-    AssertRCReturn(rc, rc);
+    PageDesc.idPage = pPageDesc->idPage;// 设置待释放的页面ID
+    rc = gmmR0FreePages(pGMM, pGVM, 1, &PageDesc, GMMACCOUNT_BASE);// 释放页面
+    AssertRCReturn(rc, rc); // 失败则返回错误码
 
-    gmmR0UseSharedPage(pGMM, pGVM, pPage);
+    gmmR0UseSharedPage(pGMM, pGVM, pPage);// 标记共享页面为已使用
 
     /*
      * Pass along the new physical address & page id.
      */
-    pPageDesc->HCPhys = ((uint64_t)pPage->Shared.pfn) << GUEST_PAGE_SHIFT;
-    pPageDesc->idPage = pGlobalRegion->paidPages[idxPage];
+     /* 返回新的物理地址和页面ID */
+    pPageDesc->HCPhys = ((uint64_t)pPage->Shared.pfn) << GUEST_PAGE_SHIFT;// 更新物理地址
+    pPageDesc->idPage = pGlobalRegion->paidPages[idxPage]; // 更新页面ID
 
     return VINF_SUCCESS;
 }
@@ -5355,6 +5858,15 @@ GMMR0DECL(int) GMMR0SharedModuleCheckPage(PGVM pGVM, PGMMSHAREDMODULE pModule, u
  * @param   pNode       The node to destroy.
  * @param   pvArgs      Pointer to an argument packet.
  */
+//作为RTAvlGCPtrDoWithAll或RTAvlGCPtrDestroy的回调函数，用于销毁虚拟机（VM）的单个共享模块节点
+/*
+pNode
+  类型为PAVLGCPTRNODECORE，指向AVL树中待清理的共享模块节点，实际类型为PGMMSHAREDMODULEPERVM（虚拟机级别的共享模块描述结构）
+pvArgs
+  类型为void*，实际传入GMMR0SHMODPERVMDTORARGS结构体指针，包含：
+  pGMM：全局内存管理器实例。
+  pGVM：目标虚拟机指针
+*/
 static DECLCALLBACK(int) gmmR0CleanupSharedModule(PAVLGCPTRNODECORE pNode, void *pvArgs)
 {
     gmmR0ShModDeletePerVM(((GMMR0SHMODPERVMDTORARGS *)pvArgs)->pGMM,
@@ -5399,6 +5911,10 @@ static void gmmR0SharedModuleCleanup(PGMM pGMM, PGVM pGVM)
  * @param   pGVM        The global (ring-0) VM structure.
  * @param   idCpu       The VCPU id.
  */
+/*
+作用：销毁虚拟机的共享模块树（pSharedModuleTree），并清理相关资源
+触发场景：虚拟机重置、关闭或内存管理策略变更时调用
+ * */
 GMMR0DECL(int) GMMR0ResetSharedModules(PGVM pGVM, VMCPUID idCpu)
 {
 #ifdef VBOX_WITH_PAGE_SHARING
@@ -5406,8 +5922,8 @@ GMMR0DECL(int) GMMR0ResetSharedModules(PGVM pGVM, VMCPUID idCpu)
      * Validate input and get the basics.
      */
     PGMM pGMM;
-    GMM_GET_VALID_INSTANCE(pGMM, VERR_GMM_INSTANCE);
-    int rc = GVMMR0ValidateGVMandEMT(pGVM, idCpu);
+    GMM_GET_VALID_INSTANCE(pGMM, VERR_GMM_INSTANCE); //验证GMM实例（pGMM）和虚拟机（pGVM）的有效性
+    int rc = GVMMR0ValidateGVMandEMT(pGVM, idCpu);//检查CPU线程（idCpu）是否属于目标虚拟机
     if (RT_FAILURE(rc))
         return rc;
 
@@ -5468,6 +5984,10 @@ static DECLCALLBACK(int) gmmR0CheckSharedModule(PAVLGCPTRNODECORE pNode, void *p
  * @param   idCpu       The calling EMT number.
  * @thread  EMT(idCpu)
  */
+/*
+  遍历虚拟机（pGVM）的共享模块树（pSharedModuleTree），检查每个模块的有效性
+  通过回调函数gmmR0CheckSharedModule执行具体检查逻辑
+*/
 GMMR0DECL(int) GMMR0CheckSharedModules(PGVM pGVM, VMCPUID idCpu)
 {
 #ifdef VBOX_WITH_PAGE_SHARING
@@ -5486,6 +6006,7 @@ GMMR0DECL(int) GMMR0CheckSharedModules(PGVM pGVM, VMCPUID idCpu)
      */
     gmmR0MutexAcquire(pGMM);
 # endif
+    //GMM_CHECK_SANITY_UPON_ENTERING和GMM_CHECK_SANITY_UPON_LEAVING确保内存管理数据结构的一致性
     if (GMM_CHECK_SANITY_UPON_ENTERING(pGMM))
     {
         /*
@@ -5561,6 +6082,14 @@ static bool gmmR0FindDupPageInChunk(PGMM pGMM, PGVM pGVM, PGMMCHUNK pChunk, uint
  * @param   pGVM        The global (ring-0) VM structure.
  * @param   pReq        Pointer to the request packet.
  */
+//主要用于在虚拟机（VM）内存管理中查找重复页（Duplicate Page）
+/*
+  检查请求参数（pReq）是否合法。
+  获取 GMM 实例（pGMM）并验证其状态。
+  检查目标页（pReq->idPage）是否存在，并获取其物理地址（pbSourcePage）。
+  遍历所有内存块（Chunk），查找是否存在与 pbSourcePage 内容相同的页。
+  返回结果（pReq->fDuplicate 表示是否找到重复页）。
+ * */
 GMMR0DECL(int) GMMR0FindDuplicatePageReq(PGVM pGVM, PGMMFINDDUPLICATEPAGEREQ pReq)
 {
     /*
@@ -5636,6 +6165,7 @@ GMMR0DECL(int) GMMR0FindDuplicatePageReq(PGVM pGVM, PGMMFINDDUPLICATEPAGEREQ pRe
  * @param   pSession    The current session.
  * @param   pGVM        The GVM to obtain statistics for. Optional.
  */
+//用于查询内存管理统计信息
 GMMR0DECL(int) GMMR0QueryStatistics(PGMMSTATS pStats, PSUPDRVSESSION pSession, PGVM pGVM)
 {
     LogFlow(("GVMMR0QueryStatistics: pStats=%p pSession=%p pGVM=%p\n", pStats, pSession, pGVM));
@@ -5648,6 +6178,7 @@ GMMR0DECL(int) GMMR0QueryStatistics(PGMMSTATS pStats, PSUPDRVSESSION pSession, P
     pStats->cMaxPages = 0; /* (crash before taking the mutex...) */
 
     PGMM pGMM;
+    //获取全局 GMM (Guest Memory Manager) 实例
     GMM_GET_VALID_INSTANCE(pGMM, VERR_GMM_INSTANCE);
 
     /*
@@ -5668,18 +6199,19 @@ GMMR0DECL(int) GMMR0QueryStatistics(PGMMSTATS pStats, PSUPDRVSESSION pSession, P
     /*
      * Copy out the GMM statistics.
      */
-    pStats->cMaxPages                   = pGMM->cMaxPages;
-    pStats->cReservedPages              = pGMM->cReservedPages;
-    pStats->cOverCommittedPages         = pGMM->cOverCommittedPages;
-    pStats->cAllocatedPages             = pGMM->cAllocatedPages;
-    pStats->cSharedPages                = pGMM->cSharedPages;
-    pStats->cDuplicatePages             = pGMM->cDuplicatePages;
-    pStats->cLeftBehindSharedPages      = pGMM->cLeftBehindSharedPages;
-    pStats->cBalloonedPages             = pGMM->cBalloonedPages;
-    pStats->cChunks                     = pGMM->cChunks;
-    pStats->cFreedChunks                = pGMM->cFreedChunks;
-    pStats->cShareableModules           = pGMM->cShareableModules;
-    pStats->idFreeGeneration            = pGMM->idFreeGeneration;
+    pStats->cMaxPages                   = pGMM->cMaxPages; //虚拟机可使用的最大物理页面数，反映内存资源池总容量
+    pStats->cReservedPages              = pGMM->cReservedPages;//已预留但未实际分配的页面数，用于预占内存配额`
+    pStats->cOverCommittedPages         = pGMM->cOverCommittedPages;//超额提交的页面数，表示超出物理内存的虚拟内存量
+    pStats->cAllocatedPages             = pGMM->cAllocatedPages;//实际已分配的物理页面总数，包含独占和共享内存
+                                                                //
+    pStats->cSharedPages                = pGMM->cSharedPages; //跨虚拟机共享的只读页面数，如相同系统镜像的共享
+    pStats->cDuplicatePages             = pGMM->cDuplicatePages; //写时复制(COW)产生的副本页面数‌
+    pStats->cLeftBehindSharedPages      = pGMM->cLeftBehindSharedPages; //虚拟机退出后遗留的共享页面数，可能被其他VM复用
+    pStats->cBalloonedPages             = pGMM->cBalloonedPages; //通过内存气球技术回收的页面数，用于动态调整内存占用
+    pStats->cChunks                     = pGMM->cChunks; //当前活跃的内存块(chunk)数量，反映内存碎片化程度
+    pStats->cFreedChunks                = pGMM->cFreedChunks; //已释放但尚未回收的内存块数，用于延迟回收统计
+    pStats->cShareableModules           = pGMM->cShareableModules; //可共享内存模块(如DLL)的数量
+    pStats->idFreeGeneration            = pGMM->idFreeGeneration; //内存块回收代标识符，用于LRU算法实现‌
     RT_ZERO(pStats->au64Reserved);
 
     /*

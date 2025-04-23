@@ -350,6 +350,17 @@ static bool hmR0VmxIsLazyGuestMsr(PCVMCPUCC pVCpu, uint32_t idMsr)
  *
  * @remarks No-long-jump zone!!!
  */
+/*
+减少冗余MSR写入：通过惰性加载机制避免每次VM Entry/Exit时不必要的MSR切换
+安全验证：确保Guest MSR值符合CPU规范（如地址必须为Canonical Form）
+性能优化：通过条件判断跳过已匹配的MSR写入操作
+ * */
+/*
+MSR_K8_KERNEL_GS_BASE	内核GS基址寄存器（用于快速切换内核/用户空间）
+MSR_K8_LSTAR	系统调用目标地址（SYSCALL指令跳转地址）
+MSR_K6_STAR	系统调用CS/SS选择器（SYSCALL/SYSRET时的段寄存器设置）
+MSR_K8_SF_MASK	系统调用标志掩码（控制RFLAGS的哪些位在SYSCALL时被清除）
+ * */
 static void hmR0VmxLazyLoadGuestMsrs(PVMCPUCC pVCpu)
 {
     Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
@@ -368,6 +379,10 @@ static void hmR0VmxLazyLoadGuestMsrs(PVMCPUCC pVCpu)
          * loaded in the CPU. In either case, we need to write the new guest MSR values to the
          * CPU, see @bugref{8728}.
          */
+        //触发条件：
+          //Guest MSR未加载（!VMX_LAZY_MSRS_LOADED_GUEST）
+          //Guest MSR值与Host MSR值完全一致
+          //避免4次MSR写入（约节省100+ CPU周期/次）
         PCCPUMCTX pCtx = &pVCpu->cpum.GstCtx;
         if (   !(pVCpu->hmr0.s.vmx.fLazyMsrs & VMX_LAZY_MSRS_LOADED_GUEST)
             && pCtx->msrKERNELGSBASE == pVCpu->hmr0.s.vmx.u64HostMsrKernelGsBase
@@ -385,8 +400,9 @@ static void hmR0VmxLazyLoadGuestMsrs(PVMCPUCC pVCpu)
         else
         {
             /* Avoid raising #GP caused by writing illegal values to these MSRs. */
+            //验证MSR值符合Canonical Address规范（x64地址规范）
             if (   X86_IS_CANONICAL(pCtx->msrKERNELGSBASE)
-                && X86_IS_CANONICAL(pCtx->msrLSTAR))
+                && X86_IS_CANONICAL(pCtx->msrLSTAR)) //对SFMASK进行32位掩码处理（防止非法值触发#GP异常）
             {
                 ASMWrMsr(MSR_K8_KERNEL_GS_BASE, pCtx->msrKERNELGSBASE);
                 ASMWrMsr(MSR_K8_LSTAR,          pCtx->msrLSTAR);
@@ -470,6 +486,8 @@ static void hmR0VmxLazyRestoreHostMsrs(PVMCPUCC pVCpu)
  * We currently ASSUME that neither HM_WSF_IBPB_ENTRY nor HM_WSF_IBPB_EXIT
  * cannot be changed at runtime.
  */
+//HMR0A.asm
+//BEGINPROC RT_CONCAT(hmR0VmxStartVm,%1)中实现
 static void hmR0VmxUpdateStartVmFunction(PVMCPUCC pVCpu)
 {
     static const struct CLANGWORKAROUND { PFNHMVMXSTARTVM pfn; } s_aHmR0VmxStartVmFunctions[] =
@@ -507,6 +525,7 @@ static void hmR0VmxUpdateStartVmFunction(PVMCPUCC pVCpu)
         { hmR0VmxStartVm_SansXcr0_WithIbpbEntry_WithL1dEntry_WithMdsEntry_WithIbpbExit },
         { hmR0VmxStartVm_WithXcr0_WithIbpbEntry_WithL1dEntry_WithMdsEntry_WithIbpbExit },
     };
+    //5 个二进制标志位（XCR0、IBPB_ENTRY、L1D_ENTRY、MDS_ENTRY、IBPB_EXIT）组合成 2^5 = 32 种可能。
     uintptr_t const idx = (pVCpu->hmr0.s.fLoadSaveGuestXcr0                 ?  1 : 0)
                         | (pVCpu->hmr0.s.fWorldSwitcher & HM_WSF_IBPB_ENTRY ?  2 : 0)
                         | (pVCpu->hmr0.s.fWorldSwitcher & HM_WSF_L1D_ENTRY  ?  4 : 0)
@@ -687,9 +706,9 @@ static int hmR0VmxEnterRootMode(PHMPHYSCPU pHostCpu, PVMCC pVM, RTHCPHYS HCPhysC
 {
     Assert(pHostCpu);
     Assert(HCPhysCpuPage && HCPhysCpuPage != NIL_RTHCPHYS);
-    Assert(RT_ALIGN_T(HCPhysCpuPage, _4K, RTHCPHYS) == HCPhysCpuPage);
+    Assert(RT_ALIGN_T(HCPhysCpuPage, _4K, RTHCPHYS) == HCPhysCpuPage); // 必须 4KB 对齐
     Assert(pvCpuPage);
-    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
+    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD)); // 必须禁用抢占
 
     if (pVM)
     {
@@ -698,16 +717,16 @@ static int hmR0VmxEnterRootMode(PHMPHYSCPU pHostCpu, PVMCC pVM, RTHCPHYS HCPhysC
     }
 
     /* Paranoid: Disable interrupts as, in theory, interrupt handlers might mess with CR4. */
-    RTCCUINTREG const fEFlags = ASMIntDisableFlags();
+    RTCCUINTREG const fEFlags = ASMIntDisableFlags();//禁用中断
 
     /* Enable the VMX bit in CR4 if necessary. */
-    RTCCUINTREG const uOldCr4 = SUPR0ChangeCR4(X86_CR4_VMXE, RTCCUINTREG_MAX);
+    RTCCUINTREG const uOldCr4 = SUPR0ChangeCR4(X86_CR4_VMXE, RTCCUINTREG_MAX);// use asm to 设置 CR4.VMXE 位（启用 VT-x）。
 
     /* Record whether VMXE was already prior to us enabling it above. */
-    pHostCpu->fVmxeAlreadyEnabled = RT_BOOL(uOldCr4 & X86_CR4_VMXE);
+    pHostCpu->fVmxeAlreadyEnabled = RT_BOOL(uOldCr4 & X86_CR4_VMXE); 
 
     /* Enter VMX root mode. */
-    int rc = VMXEnable(HCPhysCpuPage);
+    int rc = VMXEnable(HCPhysCpuPage); //VMXON 
     if (RT_FAILURE(rc))
     {
         /* Restore CR4.VMXE if it was not set prior to our attempt to set it above. */
@@ -888,6 +907,17 @@ static void hmR0VmxVmcsInfoFree(PVMXVMCSINFO pVmcsInfo, PVMXVMCSINFOSHARED pVmcs
  *          This function will not perform any cleanup for failures half-way
  *          through.
  */
+/*
+根据处理器特性决定是否需要MSR位图和影子VMCS
+分配多个VMX相关的内存页面，包括：
+  VMCS本身
+  客户机MSR加载区域
+  主机MSR加载区域
+  MSR位图(如果需要)
+  影子VMCS(如果需要)
+将VM-entry MSR加载区域和VM-exit MSR存储区域设置为同一物理页面
+如果需要TPR(任务优先级寄存器)影子，则获取虚拟APIC页面
+ * */
 static int hmR0VmxAllocVmcsInfo(PVMCPUCC pVCpu, PVMXVMCSINFO pVmcsInfo, bool fIsNstGstVmcs)
 {
     PVMCC pVM = pVCpu->CTX_SUFF(pVM);
@@ -895,15 +925,17 @@ static int hmR0VmxAllocVmcsInfo(PVMCPUCC pVCpu, PVMXVMCSINFO pVmcsInfo, bool fIs
     bool const fMsrBitmaps = RT_BOOL(g_HmMsrs.u.vmx.ProcCtls.n.allowed1 & VMX_PROC_CTLS_USE_MSR_BITMAPS);
     bool const fShadowVmcs = !fIsNstGstVmcs ? pVM->hmr0.s.vmx.fUseVmcsShadowing : pVM->cpum.ro.GuestFeatures.fVmxVmcsShadowing;
     Assert(!pVM->cpum.ro.GuestFeatures.fVmxVmcsShadowing);  /* VMCS shadowing is not yet exposed to the guest. */
+    //条目包含分配标志、物理地址指针和虚拟地址指针
     VMXPAGEALLOCINFO aAllocInfo[] =
     {
-        { true,        0 /* Unused */, &pVmcsInfo->HCPhysVmcs,         &pVmcsInfo->pvVmcs         },
-        { true,        0 /* Unused */, &pVmcsInfo->HCPhysGuestMsrLoad, &pVmcsInfo->pvGuestMsrLoad },
-        { true,        0 /* Unused */, &pVmcsInfo->HCPhysHostMsrLoad,  &pVmcsInfo->pvHostMsrLoad  },
-        { fMsrBitmaps, 0 /* Unused */, &pVmcsInfo->HCPhysMsrBitmap,    &pVmcsInfo->pvMsrBitmap    },
-        { fShadowVmcs, 0 /* Unused */, &pVmcsInfo->HCPhysShadowVmcs,   &pVmcsInfo->pvShadowVmcs   },
+        { true,        0 /* Unused */, &pVmcsInfo->HCPhysVmcs,         &pVmcsInfo->pvVmcs         },// VMCS主体
+        { true,        0 /* Unused */, &pVmcsInfo->HCPhysGuestMsrLoad, &pVmcsInfo->pvGuestMsrLoad },// Guest MSR加载区
+        { true,        0 /* Unused */, &pVmcsInfo->HCPhysHostMsrLoad,  &pVmcsInfo->pvHostMsrLoad  },// Host MSR加载区
+        { fMsrBitmaps, 0 /* Unused */, &pVmcsInfo->HCPhysMsrBitmap,    &pVmcsInfo->pvMsrBitmap    },// MSR位图
+        { fShadowVmcs, 0 /* Unused */, &pVmcsInfo->HCPhysShadowVmcs,   &pVmcsInfo->pvShadowVmcs   },// 影子VMCS
     };
 
+    //批量分配所有需要的页面
     int rc = hmR0VmxPagesAllocZ(&pVmcsInfo->hMemObj, &aAllocInfo[0], RT_ELEMENTS(aAllocInfo));
     if (RT_FAILURE(rc))
         return rc;
@@ -914,6 +946,7 @@ static int hmR0VmxAllocVmcsInfo(PVMCPUCC pVCpu, PVMXVMCSINFO pVmcsInfo, bool fIs
      */
     AssertCompile(RT_ELEMENTS(aAllocInfo) > 0);
     Assert(pVmcsInfo->HCPhysGuestMsrLoad != NIL_RTHCPHYS);
+    //将Guest MSR的加载区和存储区设为同一物理页面
     pVmcsInfo->pvGuestMsrStore     = pVmcsInfo->pvGuestMsrLoad;
     pVmcsInfo->HCPhysGuestMsrStore = pVmcsInfo->HCPhysGuestMsrLoad;
 
@@ -1007,10 +1040,15 @@ static int hmR0VmxStructsAlloc(PVMCC pVM)
     bool const fUseVmcsShadowing = pVM->hmr0.s.vmx.fUseVmcsShadowing;
     VMXPAGEALLOCINFO aAllocInfo[] =
     {
+        //APIC访问页面：当启用虚拟APIC访问时(fVirtApicAccess)，会分配物理页面用于加速APIC寄存器访问
         { fVirtApicAccess,   0 /* Unused */, &pVM->hmr0.s.vmx.HCPhysApicAccess,    (PRTR0PTR)&pVM->hmr0.s.vmx.pbApicAccess },
+        //当位图中某位被置1时，对应VMCS字段的访问将不会触发VM Exit，而是由硬件自动处理
+        //控制VMREAD指令的监控
         { fUseVmcsShadowing, 0 /* Unused */, &pVM->hmr0.s.vmx.HCPhysVmreadBitmap,  &pVM->hmr0.s.vmx.pvVmreadBitmap         },
+        //控制VMWRITE指令的监控,这些位图用于VMCS影子功能，可减少VM-exit次数
         { fUseVmcsShadowing, 0 /* Unused */, &pVM->hmr0.s.vmx.HCPhysVmwriteBitmap, &pVM->hmr0.s.vmx.pvVmwriteBitmap        },
 #ifdef VBOX_WITH_CRASHDUMP_MAGIC
+        //在启用崩溃转储魔法值(VBOX_WITH_CRASHDUMP_MAGIC)时，会分配临时内存区域用于调试信息存储
         { true,              0 /* Unused */, &pVM->hmr0.s.vmx.HCPhysScratch,       (PRTR0PTR)&pVM->hmr0.s.vmx.pbScratch    },
 #endif
     };
@@ -1412,12 +1450,15 @@ static int hmR0VmxRemoveAutoLoadStoreMsr(PVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTran
  *
  * @remarks No-long-jump zone!!!
  */
+//更新 Host（宿主机）MSR 自动加载区域
 static void hmR0VmxUpdateAutoLoadHostMsrs(PCVMCPUCC pVCpu, PCVMXVMCSINFO pVmcsInfo)
 {
     RT_NOREF(pVCpu);
     Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
 
+    //指向 Host MSR 自动加载区域的指针（VMCS 中配置的 MSR 列表）。
     PVMXAUTOMSR pHostMsrLoad = (PVMXAUTOMSR)pVmcsInfo->pvHostMsrLoad;
+    //需要更新的 MSR 数量（从 VMCS 中读取的 cExitMsrLoad）。
     uint32_t const cMsrs     = pVmcsInfo->cExitMsrLoad;
     Assert(pHostMsrLoad);
     Assert(sizeof(*pHostMsrLoad) * cMsrs <= X86_PAGE_4K_SIZE);
@@ -1428,6 +1469,8 @@ static void hmR0VmxUpdateAutoLoadHostMsrs(PCVMCPUCC pVCpu, PCVMXVMCSINFO pVmcsIn
          * Performance hack for the host EFER MSR. We use the cached value rather than re-read it.
          * Strict builds will catch mismatches in hmR0VmxCheckAutoLoadStoreMsrs(). See @bugref{7368}.
          */
+        //优化点：
+           //使用 缓存的 Host EFER MSR 值（g_uHmVmxHostMsrEfer）减少 RDMSR 开销。
         if (pHostMsrLoad[i].u32Msr == MSR_K6_EFER)
             pHostMsrLoad[i].u64Value = g_uHmVmxHostMsrEfer;
         else
@@ -1444,6 +1487,13 @@ static void hmR0VmxUpdateAutoLoadHostMsrs(PCVMCPUCC pVCpu, PCVMXVMCSINFO pVmcsIn
  *
  * @remarks No-long-jump zone!!!
  */
+//主要用于 VMX（Intel VT-x）模式下的上下文切换优化
+/*
+作用：在 VM Entry（进入虚拟机）之前，保存 Host（宿主机）的关键 MSR 值，以便在 VM Exit（退出虚拟机）时恢复。
+"Lazy"（延迟）的含义：
+  不是每次 VM Entry 都保存，而是 仅在首次需要时保存，减少不必要的 MSR 读写开销。
+  通过 fLazyMsrs 标志位管理状态（VMX_LAZY_MSRS_SAVED_HOST）。
+ * */
 static void hmR0VmxLazySaveHostMsrs(PVMCPUCC pVCpu)
 {
     Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
@@ -1453,7 +1503,7 @@ static void hmR0VmxLazySaveHostMsrs(PVMCPUCC pVCpu)
      */
     if (!(pVCpu->hmr0.s.vmx.fLazyMsrs & VMX_LAZY_MSRS_SAVED_HOST))
     {
-        Assert(!(pVCpu->hmr0.s.vmx.fLazyMsrs & VMX_LAZY_MSRS_LOADED_GUEST));  /* Guest MSRs better not be loaded now. */
+        Assert(!(pVCpu->hmr0.s.vmx.fLazyMsrs & VMX_LAZY_MSRS_LOADED_GUEST));  /* Guest MSRs better not be loaded now. *///确保当前没有加载 Guest MSR
         if (pVCpu->CTX_SUFF(pVM)->hmr0.s.fAllow64BitGuests)
         {
             pVCpu->hmr0.s.vmx.u64HostMsrLStar        = ASMRdMsr(MSR_K8_LSTAR);
@@ -1501,6 +1551,9 @@ static void hmR0VmxCheckHostEferMsr(PCVMXVMCSINFO pVmcsInfo)
  * @param   pVmcsInfo       The VMCS info. object.
  * @param   fIsNstGstVmcs   Whether this is a nested-guest VMCS.
  */
+//该函数 hmR0VmxCheckAutoLoadStoreMsrs 的主要目的是在 VM 进入/退出（VM Entry/Exit） 时，
+//确保硬件辅助虚拟化中 MSR 的自动加载和存储操作符合预期，避免因 MSR 状态不一致导致虚拟机运行异常。
+
 static void hmR0VmxCheckAutoLoadStoreMsrs(PVMCPUCC pVCpu, PCVMXVMCSINFO pVmcsInfo, bool fIsNstGstVmcs)
 {
     Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
@@ -1509,6 +1562,11 @@ static void hmR0VmxCheckAutoLoadStoreMsrs(PVMCPUCC pVCpu, PCVMXVMCSINFO pVmcsInf
     uint32_t cEntryLoadMsrs;
     uint32_t cExitStoreMsrs;
     uint32_t cExitLoadMsrs;
+    /*
+       cEntryLoadMsrs（VM 进入时加载的 MSR 数量）
+       cExitStoreMsrs（VM 退出时存储的 MSR 数量）
+       cExitLoadMsrs（VM 退出时重新加载的 MSR 数量）
+    */
     int rc = VMXReadVmcs32(VMX_VMCS32_CTRL_ENTRY_MSR_LOAD_COUNT, &cEntryLoadMsrs);  AssertRC(rc);
     rc     = VMXReadVmcs32(VMX_VMCS32_CTRL_EXIT_MSR_STORE_COUNT, &cExitStoreMsrs);  AssertRC(rc);
     rc     = VMXReadVmcs32(VMX_VMCS32_CTRL_EXIT_MSR_LOAD_COUNT,  &cExitLoadMsrs);   AssertRC(rc);
@@ -1519,8 +1577,10 @@ static void hmR0VmxCheckAutoLoadStoreMsrs(PVMCPUCC pVCpu, PCVMXVMCSINFO pVmcsInf
     uint32_t const cMsrs = cExitLoadMsrs;
 
     /* Verify the MSR counts do not exceed the maximum count supported by the hardware. */
+    //确保 MSR 数量不超过 CPU 支持的最大值（VMX_MISC_MAX_MSRS）。
     Assert(cMsrs < VMX_MISC_MAX_MSRS(g_HmMsrs.u.vmx.u64Misc));
 
+    //确保 MSR 数据不超过 4KB 页面大小（sizeof(VMXAUTOMSR) * cMsrs <= X86_PAGE_4K_SIZE）。
     /* Verify the MSR counts are within the allocated page size. */
     Assert(sizeof(VMXAUTOMSR) * cMsrs <= X86_PAGE_4K_SIZE);
 
@@ -1549,6 +1609,7 @@ static void hmR0VmxCheckAutoLoadStoreMsrs(PVMCPUCC pVCpu, PCVMXVMCSINFO pVmcsInf
                              pHostMsrLoad->u32Msr, pHostMsrLoad->u64Value, u64HostMsr, cMsrs));
 
         /* Verify that cached host EFER MSR matches what's loaded on the CPU. */
+        //检查是否与缓存的宿主机 EFER 值一致
         bool const fIsEferMsr = RT_BOOL(pHostMsrLoad->u32Msr == MSR_K6_EFER);
         AssertMsgReturnVoid(!fIsEferMsr || u64HostMsr == g_uHmVmxHostMsrEfer,
                             ("Cached=%#RX64 ASMRdMsr=%#RX64 cMsrs=%u\n", g_uHmVmxHostMsrEfer, u64HostMsr, cMsrs));
@@ -1565,6 +1626,11 @@ static void hmR0VmxCheckAutoLoadStoreMsrs(PVMCPUCC pVCpu, PCVMXVMCSINFO pVmcsInf
             else
             {
                 /* Verify LBR MSRs (used only for debugging) are intercepted. We don't passthru these MSRs to the guest yet. */
+                /*
+                 * LBR（Last Branch Record）MSR（用于调试）：
+                   如果启用了 LBR 功能，确保这些 MSR 的访问被正确拦截（不能直接透传给 Guest）。
+                   否则，检查 MSR 是否允许读写透传
+                 * */
                 PCVMCC pVM = pVCpu->CTX_SUFF(pVM);
                 if (   pVM->hmr0.s.vmx.fLbr
                     && (   hmR0VmxIsLbrBranchFromMsr(pVM, pGuestMsrLoad->u32Msr, NULL /* pidxMsr */)
@@ -1589,6 +1655,16 @@ static void hmR0VmxCheckAutoLoadStoreMsrs(PVMCPUCC pVCpu, PCVMXVMCSINFO pVmcsInf
                      * Check if the nested-guest MSR bitmap allows passthrough, and if so, assert that we
                      * allow passthrough too.
                      */
+                    /*
+                     * 如果启用了 MSR 位图（VMX_PROC_CTLS_USE_MSR_BITMAPS），确保每个 MSR 的访问权限（读/写）符合预期：
+                       EFER MSR 必须拦截读写（不能透传）。
+                       普通 MSR 默认允许透传读写（除非是 LBR MSR 或嵌套虚拟化场景）。
+                    */
+                    /*
+                     * MSR Bitmap 是一个 4KB 的内存区域，每个 bit 对应一个 MSR 的访问权限（读/写）。
+                       如果某个 MSR 的访问权限设置为 允许（passthrough），则 Guest 访问该 MSR 时 不会触发 VM-Exit，而是直接在 CPU 上执行。
+                       如果权限设置为 拦截（intercept），则访问该 MSR 会触发 VM-Exit，由 Hypervisor 处理。
+                     * */
                     void const *pvMsrBitmapNstGst = pVCpu->cpum.GstCtx.hwvirt.vmx.abMsrBitmap;
                     Assert(pvMsrBitmapNstGst);
                     uint32_t const fMsrpmNstGst = CPUMGetVmxMsrPermission(pvMsrBitmapNstGst, pGuestMsrLoad->u32Msr);
@@ -1763,6 +1839,18 @@ static void hmR0VmxFlushTaggedTlbNone(PHMPHYSCPU pHostCpu, PVMCPUCC pVCpu)
  *
  * @remarks  Called with interrupts disabled.
  */
+/*
+ * 以下是针对 hmR0VmxFlushTaggedTlbBoth 函数的深度解析，结合 Intel VT-x 中 ‌EPT（Extended Page Tables）‌ 和 ‌VPID（Virtual Processor Identifier）‌ 的协同工作机制：
+
+核心作用：在 EPT 和 VPID 同时启用的场景下，管理 TLB 刷新逻辑，确保虚拟机内存访问的正确性与性能。
+关键特性：
+双重刷新机制：同时处理 EPT 的 INVEPT 和 VPID 的 INVVPID 指令需求，但实际仅需执行 INVEPT（因其覆盖 VPID 的刷新需求）
+智能刷新策略：根据跨 CPU 迁移、显式请求、嵌套虚拟化等场景动态决策刷新方式。
+性能优化
+  通过 VPID 避免不必要的全局 TLB 刷新。
+  通过统计计数器（STAM_COUNTER_INC）量化不同场景的刷新频率，辅助调优‌12。
+
+ * */
 static void hmR0VmxFlushTaggedTlbBoth(PHMPHYSCPU pHostCpu, PVMCPUCC pVCpu, PCVMXVMCSINFO pVmcsInfo)
 {
 #ifdef VBOX_WITH_STATISTICS
@@ -1782,6 +1870,8 @@ static void hmR0VmxFlushTaggedTlbBoth(PHMPHYSCPU pHostCpu, PVMCPUCC pVCpu, PCVMX
     Assert(pHostCpu->idCpu != NIL_RTCPUID);
 
     PVMCC pVM = pVCpu->CTX_SUFF(pVM);
+    //EPT 和 VPID 必须同时启用
+    //EPT 管理物理地址翻译（GPA->HPA），VPID 管理线性地址翻译（GVA ->GPA）
     AssertMsg(pVM->hmr0.s.fNestedPaging && pVM->hmr0.s.vmx.fVpid,
               ("hmR0VmxFlushTaggedTlbBoth cannot be invoked unless NestedPaging & VPID are enabled."
                "fNestedPaging=%RTbool fVpid=%RTbool", pVM->hmr0.s.fNestedPaging, pVM->hmr0.s.vmx.fVpid));
@@ -1800,6 +1890,7 @@ static void hmR0VmxFlushTaggedTlbBoth(PHMPHYSCPU pHostCpu, PVMCPUCC pVCpu, PCVMX
         {
             pHostCpu->uCurrentAsid = 1;            /* Wraparound to 1; host uses 0. */
             pHostCpu->cTlbFlushes++;               /* All VCPUs that run on this host CPU must use a new VPID. */
+            // 新 ASID 需先刷新
             pHostCpu->fFlushAsidBeforeUse = true;  /* All VCPUs that run on this host CPU must flush their new VPID before use. */
         }
 
@@ -1811,11 +1902,15 @@ static void hmR0VmxFlushTaggedTlbBoth(PHMPHYSCPU pHostCpu, PVMCPUCC pVCpu, PCVMX
          * Flush by EPT when we get rescheduled to a new host CPU to ensure EPT-only tagged mappings are also
          * invalidated. We don't need to flush-by-VPID here as flushing by EPT covers it. See @bugref{6568}.
          */
+        //EPT 优先：跨 CPU 时仅需 INVEPT，因其会连带刷新 VPID 关联的 TLB 条目（见 Intel SDM 28.3.3.4）‌34。
+        // 同步状态并执行 EPT 刷新
         hmR0VmxFlushEpt(pVCpu, pVmcsInfo, pVM->hmr0.s.vmx.enmTlbFlushEpt);
         STAM_COUNTER_INC(&pVCpu->hm.s.StatFlushTlbWorldSwitch);
         HMVMX_SET_TAGGED_TLB_FLUSHED();
         VMCPU_FF_CLEAR(pVCpu, VMCPU_FF_TLB_FLUSH);
     }
+    //显式 TLB 刷新请求
+    //EPT 页表被修改（如内存热插拔），需刷新所有 GPA->HPA 映射
     else if (VMCPU_FF_TEST_AND_CLEAR(pVCpu, VMCPU_FF_TLB_FLUSH))    /* Check for explicit TLB flushes. */
     {
         /*
@@ -1839,6 +1934,7 @@ static void hmR0VmxFlushTaggedTlbBoth(PHMPHYSCPU pHostCpu, PVMCPUCC pVCpu, PCVMX
          *
          * See Intel spec. 28.3.3.4 "Guidelines for Use of the INVEPT Instruction".
          */
+        //嵌套虚拟化：L1↔ L2 切换时需刷新 EPT TLB，确保 L2 的 APIC-access 地址等变更生效
         hmR0VmxFlushEpt(pVCpu, pVmcsInfo, pVM->hmr0.s.vmx.enmTlbFlushEpt);
         pVCpu->hm.s.vmx.fSwitchedNstGstFlushTlb = false;
         STAM_COUNTER_INC(&pVCpu->hm.s.StatFlushTlbNstGst);
@@ -1848,7 +1944,7 @@ static void hmR0VmxFlushTaggedTlbBoth(PHMPHYSCPU pHostCpu, PVMCPUCC pVCpu, PCVMX
 
     pVCpu->hmr0.s.fForceTLBFlush = false;
     HMVMX_UPDATE_FLUSH_SKIPPED_STAT();
-
+    //确保 vCPU 的 ASID、CPU 绑定和刷新计数与物理 CPU 状态一致
     Assert(pVCpu->hmr0.s.idLastCpu == pHostCpu->idCpu);
     Assert(pVCpu->hmr0.s.cTlbFlushes == pHostCpu->cTlbFlushes);
     AssertMsg(pVCpu->hmr0.s.cTlbFlushes == pHostCpu->cTlbFlushes,
@@ -1929,12 +2025,20 @@ static void hmR0VmxFlushTaggedTlbEpt(PHMPHYSCPU pHostCpu, PVMCPUCC pVCpu, PCVMXV
  *
  * @remarks Called with interrupts disabled.
  */
+/*
+作用：管理基于 VPID 的 TLB（Translation Lookaside Buffer）刷新逻辑，优化虚拟机上下文切换时的内存访问性能
+调用时机：在 vCPU 调度到新物理 CPU 或显式请求 TLB 刷新时调用（如 VMCPU_FF_TLB_FLUSH 标志置位
+核心任务：
+  判断是否需要强制刷新 TLB（跨 CPU 迁移、ASID 耗尽等场景）。
+  分配 VPID（ASID）并执行硬件级 TLB 刷新指令（INVVPID）
+  维护全局 ASID 状态，避免多 vCPU 间的 VPID 冲突
+*/
 static void hmR0VmxFlushTaggedTlbVpid(PHMPHYSCPU pHostCpu, PVMCPUCC pVCpu)
 {
     AssertPtr(pVCpu);
     AssertPtr(pHostCpu);
     Assert(pHostCpu->idCpu != NIL_RTCPUID);
-    AssertMsg(pVCpu->CTX_SUFF(pVM)->hmr0.s.vmx.fVpid, ("hmR0VmxFlushTlbVpid cannot be invoked without VPID."));
+    AssertMsg(pVCpu->CTX_SUFF(pVM)->hmr0.s.vmx.fVpid, ("hmR0VmxFlushTlbVpid cannot be invoked without VPID."));//需 CPU 支持 VPID 特性
     AssertMsg(!pVCpu->CTX_SUFF(pVM)->hmr0.s.fNestedPaging, ("hmR0VmxFlushTlbVpid cannot be invoked with NestedPaging"));
 
     /*
@@ -1943,6 +2047,8 @@ static void hmR0VmxFlushTaggedTlbVpid(PHMPHYSCPU pHostCpu, PVMCPUCC pVCpu)
      * limit while flushing the TLB or the host CPU is online after a suspend/resume, so we
      * cannot reuse the current ASID anymore.
      */
+    //CPU 迁移：vCPU 上次运行的物理 CPU 与当前不同（idLastCpu 不匹配）
+    //全局 ASID 失效：物理 CPU 的 TLB 刷新计数（cTlbFlushes）变化（如 ASID 耗尽或主机休眠恢复）
     if (   pVCpu->hmr0.s.idLastCpu != pHostCpu->idCpu
         || pVCpu->hmr0.s.cTlbFlushes != pHostCpu->cTlbFlushes)
     {
@@ -1950,6 +2056,7 @@ static void hmR0VmxFlushTaggedTlbVpid(PHMPHYSCPU pHostCpu, PVMCPUCC pVCpu)
         STAM_COUNTER_INC(&pVCpu->hm.s.StatFlushTlbWorldSwitch);
     }
 
+    //内存映射变更（如 CR3 修改）或外部强制刷新
     /* Check for explicit TLB flushes. */
     if (VMCPU_FF_TEST_AND_CLEAR(pVCpu, VMCPU_FF_TLB_FLUSH))
     {
@@ -1964,6 +2071,7 @@ static void hmR0VmxFlushTaggedTlbVpid(PHMPHYSCPU pHostCpu, PVMCPUCC pVCpu)
     }
 
     /* Check for TLB flushes while switching to/from a nested-guest. */
+    //嵌套虚拟化：L1 <--> L2 虚拟机切换时需刷新 TLB 以保证隔离性
     if (pVCpu->hm.s.vmx.fSwitchedNstGstFlushTlb)
     {
         pVCpu->hmr0.s.fForceTLBFlush = true;
@@ -1975,17 +2083,20 @@ static void hmR0VmxFlushTaggedTlbVpid(PHMPHYSCPU pHostCpu, PVMCPUCC pVCpu)
     pVCpu->hmr0.s.idLastCpu = pHostCpu->idCpu;
     if (pVCpu->hmr0.s.fForceTLBFlush)
     {
+        /* ASID 分配逻辑 */
         ++pHostCpu->uCurrentAsid;
-        if (pHostCpu->uCurrentAsid >= g_uHmMaxAsid)
+        if (pHostCpu->uCurrentAsid >= g_uHmMaxAsid)// ASID 耗尽
         {
-            pHostCpu->uCurrentAsid        = 1;     /* Wraparound to 1; host uses 0 */
-            pHostCpu->cTlbFlushes++;               /* All VCPUs that run on this host CPU must use a new VPID. */
-            pHostCpu->fFlushAsidBeforeUse = true;  /* All VCPUs that run on this host CPU must flush their new VPID before use. */
+            pHostCpu->uCurrentAsid        = 1;     /* Wraparound to 1; host uses 0 */// 回绕到 1（0 保留给主机）
+            pHostCpu->cTlbFlushes++;               /* All VCPUs that run on this host CPU must use a new VPID. */// 全局失效计数递增
+            pHostCpu->fFlushAsidBeforeUse = true;  /* All VCPUs that run on this host CPU must flush their new VPID before use. */// 新 ASID 需先刷新
         }
 
+         /* 同步状态到 vCPU */
         pVCpu->hmr0.s.fForceTLBFlush = false;
         pVCpu->hmr0.s.cTlbFlushes    = pHostCpu->cTlbFlushes;
         pVCpu->hmr0.s.uCurrentAsid   = pHostCpu->uCurrentAsid;
+        /* 执行硬件刷新, INVVPID：根据类型刷新 TLB： */
         if (pHostCpu->fFlushAsidBeforeUse)
         {
             if (pVM->hmr0.s.vmx.enmTlbFlushVpid == VMXTLBFLUSHVPID_SINGLE_CONTEXT)
@@ -1993,7 +2104,7 @@ static void hmR0VmxFlushTaggedTlbVpid(PHMPHYSCPU pHostCpu, PVMCPUCC pVCpu)
             else if (pVM->hmr0.s.vmx.enmTlbFlushVpid == VMXTLBFLUSHVPID_ALL_CONTEXTS)
             {
                 hmR0VmxFlushVpid(pVCpu, VMXTLBFLUSHVPID_ALL_CONTEXTS, 0 /* GCPtr */);
-                pHostCpu->fFlushAsidBeforeUse = false;
+                pHostCpu->fFlushAsidBeforeUse = false;// 全局刷新后无需单上下文刷新
             }
             else
             {
@@ -2052,6 +2163,14 @@ static void hmR0VmxFlushTaggedTlb(PHMPHYSCPU pHostCpu, PVMCPUCC pVCpu, PVMXVMCSI
  * @returns VBox status code.
  * @param   pVM     The cross context VM structure.
  */
+//根据 CPU 支持的虚拟化特性（EPT 和 VPID），
+//选择最优的 TLB 刷新策略，避免不必要的全局 TLB 刷新，提高虚拟机性能。
+/*
+关键概念：
+  EPT（Extended Page Tables）：Intel 的嵌套分页技术，用于加速虚拟机内存地址转换。
+  VPID（Virtual Processor Identifier）：允许 TLB 条目与特定虚拟 CPU 关联，减少 TLB 刷新开销。
+  TLB 刷新：当内存映射发生变化时（如页表更新），需要刷新 TLB 以确保一致性。
+*/
 static int hmR0VmxSetupTaggedTlb(PVMCC pVM)
 {
     /*
@@ -2063,19 +2182,23 @@ static int hmR0VmxSetupTaggedTlb(PVMCC pVM)
     {
         if (g_HmMsrs.u.vmx.u64EptVpidCaps & MSR_IA32_VMX_EPT_VPID_CAP_INVEPT)
         {
+            //INVEPT_SINGLE_CONTEXT：仅刷新当前 VPID 的 TLB（更高效）。
             if (g_HmMsrs.u.vmx.u64EptVpidCaps & MSR_IA32_VMX_EPT_VPID_CAP_INVEPT_SINGLE_CONTEXT)
                 pVM->hmr0.s.vmx.enmTlbFlushEpt = VMXTLBFLUSHEPT_SINGLE_CONTEXT;
+            //INVEPT_ALL_CONTEXTS：刷新所有 VPID 的 TLB（保守但安全）。
             else if (g_HmMsrs.u.vmx.u64EptVpidCaps & MSR_IA32_VMX_EPT_VPID_CAP_INVEPT_ALL_CONTEXTS)
                 pVM->hmr0.s.vmx.enmTlbFlushEpt = VMXTLBFLUSHEPT_ALL_CONTEXTS;
             else
             {
                 /* Shouldn't happen. EPT is supported but no suitable flush-types supported. */
+                /* 不支持任何有效的 EPT 刷新方式 */
                 pVM->hmr0.s.vmx.enmTlbFlushEpt = VMXTLBFLUSHEPT_NOT_SUPPORTED;
                 VMCC_GET_CPU_0(pVM)->hm.s.u32HMError = VMX_UFC_EPT_FLUSH_TYPE_UNSUPPORTED;
                 return VERR_HM_UNSUPPORTED_CPU_FEATURE_COMBO;
             }
 
             /* Make sure the write-back cacheable memory type for EPT is supported. */
+            /* 检查 EPT 是否支持 WB（Write-Back）内存类型 */
             if (RT_UNLIKELY(!(g_HmMsrs.u.vmx.u64EptVpidCaps & MSR_IA32_VMX_EPT_VPID_CAP_MEMTYPE_WB)))
             {
                 pVM->hmr0.s.vmx.enmTlbFlushEpt = VMXTLBFLUSHEPT_NOT_SUPPORTED;
@@ -2084,6 +2207,7 @@ static int hmR0VmxSetupTaggedTlb(PVMCC pVM)
             }
 
             /* EPT requires a page-walk length of 4. */
+            /* 检查 EPT 页表遍历深度是否为 4 */
             if (RT_UNLIKELY(!(g_HmMsrs.u.vmx.u64EptVpidCaps & MSR_IA32_VMX_EPT_VPID_CAP_PAGE_WALK_LENGTH_4)))
             {
                 pVM->hmr0.s.vmx.enmTlbFlushEpt = VMXTLBFLUSHEPT_NOT_SUPPORTED;
@@ -2134,14 +2258,15 @@ static int hmR0VmxSetupTaggedTlb(PVMCC pVM)
     /*
      * Setup the handler for flushing tagged-TLBs.
      */
+    //最终 TLB 刷新策略选择
     if (pVM->hmr0.s.fNestedPaging && pVM->hmr0.s.vmx.fVpid)
-        pVM->hmr0.s.vmx.enmTlbFlushType = VMXTLBFLUSHTYPE_EPT_VPID;
+        pVM->hmr0.s.vmx.enmTlbFlushType = VMXTLBFLUSHTYPE_EPT_VPID;//EPT + VPID（最优，减少 TLB 刷新次数）
     else if (pVM->hmr0.s.fNestedPaging)
-        pVM->hmr0.s.vmx.enmTlbFlushType = VMXTLBFLUSHTYPE_EPT;
+        pVM->hmr0.s.vmx.enmTlbFlushType = VMXTLBFLUSHTYPE_EPT; //仅 EPT（次优，但仍有硬件加速）。
     else if (pVM->hmr0.s.vmx.fVpid)
-        pVM->hmr0.s.vmx.enmTlbFlushType = VMXTLBFLUSHTYPE_VPID;
+        pVM->hmr0.s.vmx.enmTlbFlushType = VMXTLBFLUSHTYPE_VPID;//仅 VPID（较少使用，通常 EPT 更重要）。
     else
-        pVM->hmr0.s.vmx.enmTlbFlushType = VMXTLBFLUSHTYPE_NONE;
+        pVM->hmr0.s.vmx.enmTlbFlushType = VMXTLBFLUSHTYPE_NONE;//无优化（完全软件刷新，性能最差）。
 
 
     /*
@@ -2827,13 +2952,23 @@ static int hmR0VmxSetupVmcsMiscCtls(PVMCPUCC pVCpu, PVMXVMCSINFO pVmcsInfo)
     }
 #endif
 
+    //安全要求：确保未嵌套时 VMCS Link Pointer 为无效值（NIL_RTHCPHYS）。
     Assert(pVmcsInfo->u64VmcsLinkPtr == NIL_RTHCPHYS);
     int rc = VMXWriteVmcs64(VMX_VMCS64_GUEST_VMCS_LINK_PTR_FULL, NIL_RTHCPHYS);
     AssertRC(rc);
 
+    //自动加载/存储的 MSR 地址：优化 VM-Exit/Entry 时的 MSR 保存恢复。
+    //设置 VMX_VMCS64_GUEST_MSR_LOAD_FULL 等字段，指定 VM-Entry/Exit 时自动保存/恢复的 MSR 列表。
     rc = hmR0VmxSetupVmcsAutoLoadStoreMsrAddrs(pVmcsInfo);
     if (RT_SUCCESS(rc))
     {
+        //CR0/CR4 掩码：强制虚拟机使用的控制寄存器固定位。
+        /*掩码生成逻辑
+           CR0：强制 PE（保护模式）、PG（分页）等位为 1，WP（写保护）等位可配置。
+           CR4：强制 VMXE（VMX 启用）、PAE（物理地址扩展）等位。
+
+         硬件强制：虚拟机运行时若尝试修改掩码位，触发 VM-Exit。
+        */
         uint64_t const u64Cr0Mask = vmxHCGetFixedCr0Mask(pVCpu);
         uint64_t const u64Cr4Mask = vmxHCGetFixedCr4Mask(pVCpu);
 
@@ -2843,6 +2978,7 @@ static int hmR0VmxSetupVmcsMiscCtls(PVMCPUCC pVCpu, PVMXVMCSINFO pVmcsInfo)
         pVmcsInfo->u64Cr0Mask = u64Cr0Mask;
         pVmcsInfo->u64Cr4Mask = u64Cr4Mask;
 
+        //调试控制：LBR（Last Branch Record）功能配置。
         if (pVCpu->CTX_SUFF(pVM)->hmr0.s.vmx.fLbr)
         {
             rc = VMXWriteVmcsNw(VMX_VMCS64_GUEST_DEBUGCTL_FULL, MSR_IA32_DEBUGCTL_LBR);
@@ -2940,13 +3076,39 @@ static DECLCALLBACK(int) hmR0VmxStartVmSelector(PVMXVMCSINFO pVmcsInfo, PVMCPUCC
  * @param   pVmcsInfo       The VMCS info. object.
  * @param   fIsNstGstVmcs   Whether this is a nested-guest VMCS.
  */
+/*
+作用：配置 VMCS（Virtual Machine Control Structure），为虚拟机的硬件辅助执行准备控制环境。
+调用时机：在 vCPU 启动或迁移到新物理 CPU 时调用，属于 Ring-0 层级的硬件虚拟化操作。
+核心任务：
+  初始化 VMCS 的硬件修订标识符。
+  设置三类关键控制字段（Pin-Based、Processor-Based、Miscellaneous）。
+  处理嵌套虚拟化（VMX Shadowing）的特殊配置。
+  同步 VMCS 状态并记录错误信息。
+*/
+/*
+ *VMCS 生命周期管理
+初始化流程：VMCLEAR → VMPTRLD → VMWRITE 确保字段正确配置。
+字段分类：
+  Guest-State Area：保存 vCPU 寄存器状态（如 RIP、RSP）。
+  Host-State Area：定义 VM-Exit 后处理器的恢复状态。
+  Control Fields：控制虚拟化行为（如 CPU_BASED_HLT_EXIT）。
+
+2) 嵌套虚拟化支持‌
+  Shadow VMCS：充当 L1 虚拟机与 L2 虚拟机间的桥梁，减少 VM-Exit 开销。
+  启用条件：PROCBASED_CTLS2_VMCS_SHADOWING 置位，且 VMCS 修订 ID 匹配。
+
+3) 异常与中断处理
+  Exception Bitmap：32 位掩码，每位对应一个异常（如 bit 14 对应 #PF）。
+  Pin-Based Controls：NMI_EXITING 控制非屏蔽中断的虚拟化方式。
+
+ * */
 static int hmR0VmxSetupVmcs(PVMCPUCC pVCpu, PVMXVMCSINFO pVmcsInfo, bool fIsNstGstVmcs)
 {
-    Assert(pVmcsInfo->pvVmcs);
-    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
+    Assert(pVmcsInfo->pvVmcs);// 确保 VMCS 内存区域有效
+    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));// 必须禁用抢占（原子操作）
 
     /* Set the CPU specified revision identifier at the beginning of the VMCS structure. */
-    *(uint32_t *)pVmcsInfo->pvVmcs = RT_BF_GET(g_HmMsrs.u.vmx.u64Basic, VMX_BF_BASIC_VMCS_ID);
+    *(uint32_t *)pVmcsInfo->pvVmcs = RT_BF_GET(g_HmMsrs.u.vmx.u64Basic, VMX_BF_BASIC_VMCS_ID);//从 IA32_VMX_BASIC MSR 获取，标识硬件兼容性版本。
     const char * const pszVmcs     = fIsNstGstVmcs ? "nested-guest VMCS" : "guest VMCS";
 
     LogFlowFunc(("\n"));
@@ -2955,10 +3117,12 @@ static int hmR0VmxSetupVmcs(PVMCPUCC pVCpu, PVMXVMCSINFO pVmcsInfo, bool fIsNstG
      * Initialize the VMCS using VMCLEAR before loading the VMCS.
      * See Intel spec. 31.6 "Preparation And Launching A Virtual Machine".
      */
-    int rc = hmR0VmxClearVmcs(pVmcsInfo);
+    //将 VMCS 置为未激活状态，清除内部缓存数据。
+    int rc = hmR0VmxClearVmcs(pVmcsInfo);// 执行 VMCLEAR 初始化 VMCS
     if (RT_SUCCESS(rc))
     {
-        rc = hmR0VmxLoadVmcs(pVmcsInfo);
+        //将 VMCS 绑定到当前 CPU，后续操作针对此 VMCS。
+        rc = hmR0VmxLoadVmcs(pVmcsInfo); // 执行 VMPTRLD 加载 VMCS
         if (RT_SUCCESS(rc))
         {
             /*
@@ -2966,18 +3130,22 @@ static int hmR0VmxSetupVmcs(PVMCPUCC pVCpu, PVMXVMCSINFO pVmcsInfo, bool fIsNstG
              * The host is always 64-bit since we no longer support 32-bit hosts.
              * Currently we have just a single handler for all guest modes as well, see @bugref{6208#c73}.
              */
-            if (!fIsNstGstVmcs)
+            if (!fIsNstGstVmcs)//非嵌套虚拟化场景
             {
-                rc = hmR0VmxSetupVmcsPinCtls(pVCpu, pVmcsInfo);
+                //处理外部中断（如 NMI）的虚拟化行为。
+                rc = hmR0VmxSetupVmcsPinCtls(pVCpu, pVmcsInfo); // 设置 Pin-Based 控制
                 if (RT_SUCCESS(rc))
                 {
-                    rc = hmR0VmxSetupVmcsProcCtls(pVCpu, pVmcsInfo);
+                    //控制关键指令（如 HLT、MOV DRx）的拦截。
+                    rc = hmR0VmxSetupVmcsProcCtls(pVCpu, pVmcsInfo);// 设置 Processor-Based 控制
                     if (RT_SUCCESS(rc))
                     {
-                        rc = hmR0VmxSetupVmcsMiscCtls(pVCpu, pVmcsInfo);
+                        //配置 CR3 目标值数量、MSR 加载列表等。
+                        rc = hmR0VmxSetupVmcsMiscCtls(pVCpu, pVmcsInfo);// 设置 Miscellaneous 控制
                         if (RT_SUCCESS(rc))
                         {
-                            hmR0VmxSetupVmcsXcptBitmap(pVCpu, pVmcsInfo);
+                            //指定哪些异常触发 VM-Exit（如 #PF）。
+                            hmR0VmxSetupVmcsXcptBitmap(pVCpu, pVmcsInfo);// 配置异常位图
 #ifdef VBOX_WITH_NESTED_HWVIRT_VMX
                             /*
                              * If a shadow VMCS is allocated for the VMCS info. object, initialize the
@@ -3029,7 +3197,8 @@ static int hmR0VmxSetupVmcs(PVMCPUCC pVCpu, PVMXVMCSINFO pVmcsInfo, bool fIsNstG
     /* Sync any CPU internal VMCS data back into our VMCS in memory. */
     if (RT_SUCCESS(rc))
     {
-        rc = hmR0VmxClearVmcs(pVmcsInfo);
+        //VMCLEAR 确保硬件缓存数据写回内存。
+        rc = hmR0VmxClearVmcs(pVmcsInfo);//同步 VMCS 数据回内存
         if (RT_SUCCESS(rc))
         { /* likely */ }
         else
@@ -3040,6 +3209,7 @@ static int hmR0VmxSetupVmcs(PVMCPUCC pVCpu, PVMXVMCSINFO pVmcsInfo, bool fIsNstG
      * Update the last-error record both for failures and success, so we
      * can propagate the status code back to ring-3 for diagnostics.
      */
+    //通过 pVCpu->hm.s.vmx.LastError 传递错误码至用户态。
     hmR0VmxUpdateErrorRecord(pVCpu, rc);
     NOREF(pszVmcs);
     return rc;
@@ -3051,28 +3221,31 @@ static int hmR0VmxSetupVmcs(PVMCPUCC pVCpu, PVMXVMCSINFO pVmcsInfo, bool fIsNstG
  *
  * @returns VBox status code.
  */
+//全局初始化 VMX（Intel VT-x）模块，为后续虚拟机运行准备必要的硬件环境
 VMMR0DECL(int) VMXR0GlobalInit(void)
 {
 #ifdef HMVMX_USE_FUNCTION_TABLE
+    //验证 VM-Exit 处理函数表的完整性（调试模式下）。
     AssertCompile(VMX_EXIT_MAX + 1 == RT_ELEMENTS(g_aVMExitHandlers));
 # ifdef VBOX_STRICT
     for (unsigned i = 0; i < RT_ELEMENTS(g_aVMExitHandlers); i++)
-        Assert(g_aVMExitHandlers[i].pfn);
+        Assert(g_aVMExitHandlers[i].pfn);// 检查每个处理函数指针非空
 # endif
 #endif
 
     /*
      * For detecting whether DR6.RTM is writable or not (done in VMXR0InitVM).
      */
+    //检测调试寄存器 DR6 的可写性，确定 RTM（Restricted Transactional Memory）位的处理策略
     RTTHREADPREEMPTSTATE Preempt = RTTHREADPREEMPTSTATE_INITIALIZER;
     RTThreadPreemptDisable(&Preempt);
-    RTCCUINTXREG const fSavedDr6 = ASMGetDR6();
-    ASMSetDR6(0);
-    RTCCUINTXREG const fZeroDr6  = ASMGetDR6();
-    ASMSetDR6(fSavedDr6);
+    RTCCUINTXREG const fSavedDr6 = ASMGetDR6(); // 保存原始 DR6
+    ASMSetDR6(0);// 尝试清零 DR6
+    RTCCUINTXREG const fZeroDr6  = ASMGetDR6();//读取实际值
+    ASMSetDR6(fSavedDr6);//恢复原始值
     RTThreadPreemptRestore(&Preempt);
 
-    g_fDr6Zeroed = fZeroDr6;
+    g_fDr6Zeroed = fZeroDr6;// 记录 DR6 的可清零位掩码
 
     return VINF_SUCCESS;
 }
@@ -3102,12 +3275,17 @@ VMMR0DECL(void) VMXR0GlobalTerm()
  *                          enable VT-x on the host.
  * @param   pHwvirtMsrs     Pointer to the hardware-virtualization MSRs.
  */
+/*
+  启用 VMX 根模式（若主机未全局启用）。
+  刷新 EPT TLB 以防止残留映射。
+  标记 VPID（Virtual Processor Identifier）需要刷新，确保隔离性。
+*/
 VMMR0DECL(int) VMXR0EnableCpu(PHMPHYSCPU pHostCpu, PVMCC pVM, void *pvCpuPage, RTHCPHYS HCPhysCpuPage, bool fEnabledByHost,
                               PCSUPHWVIRTMSRS pHwvirtMsrs)
 {
     AssertPtr(pHostCpu);
-    AssertPtr(pHwvirtMsrs);
-    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
+    AssertPtr(pHwvirtMsrs); // 确保硬件虚拟化 MSR 指针有效
+    Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD)); // 必须禁用抢占
 
     /* Enable VT-x if it's not already enabled by the host. */
     if (!fEnabledByHost)
@@ -3124,10 +3302,13 @@ VMMR0DECL(int) VMXR0EnableCpu(PHMPHYSCPU pHostCpu, PVMCC pVM, void *pvCpuPage, R
      */
     if (pHwvirtMsrs->u.vmx.u64EptVpidCaps & MSR_IA32_VMX_EPT_VPID_CAP_INVEPT_ALL_CONTEXTS)
     {
+        // 刷新所有 EPT 上下文
         hmR0VmxFlushEpt(NULL /* pVCpu */, NULL /* pVmcsInfo */, VMXTLBFLUSHEPT_ALL_CONTEXTS);
+        //标记无需后续刷新
         pHostCpu->fFlushAsidBeforeUse = false;
     }
     else
+        //如果按VCPU刷新TLB的话，设置标志，不在此处处理
         pHostCpu->fFlushAsidBeforeUse = true;
 
     /* Ensure each VCPU scheduled on this CPU gets a new VPID on resume. See @bugref{6255}. */
@@ -3163,13 +3344,21 @@ VMMR0DECL(int) VMXR0DisableCpu(PHMPHYSCPU pHostCpu, void *pvCpuPage, RTHCPHYS HC
  * @returns VBox status code.
  * @param   pVM             The cross context VM structure.
  */
+/*
+核心任务：
+  分配并初始化 VMX 专用结构（如 VMCS、EPT 页表）。
+  配置调试寄存器（DR6）的拦截策略。
+  传递关键配置信息至 Ring-3（用户态）
+*/
 VMMR0DECL(int) VMXR0InitVM(PVMCC pVM)
 {
     AssertPtr(pVM);
     LogFlowFunc(("pVM=%p\n", pVM));
 
+    // 设置默认的 VMCS 字段值
     hmR0VmxStructsInit(pVM);
-    int rc = hmR0VmxStructsAlloc(pVM);
+    //EPT：通过 hmR0VmxStructsAlloc 分配页表，后续由 VMXR0SetupTaggedTlb 配置刷新策略。
+    int rc = hmR0VmxStructsAlloc(pVM);// 分配内存（VMCS、EPT , VPID等）
     if (RT_FAILURE(rc))
     {
         LogRelFunc(("Failed to allocated VMX structures. rc=%Rrc\n", rc));
@@ -3191,11 +3380,16 @@ VMMR0DECL(int) VMXR0InitVM(PVMCC pVM)
        guest and cause confusion there.  It appears that the DR6.RTM bit can be
        cleared even if TSX-NI is disabled (microcode update / system / whatever). */
 #ifdef VMX_WITH_MAYBE_ALWAYS_INTERCEPT_MOV_DRX
+    //默认策略：若未显式配置（fAlwaysInterceptMovDRxCfg == 0），
+    //根据主机 DR6 的保留位（RA1）决定是否拦截 MOV DRx 指令。
+    //若主机 DR6 的 RA1 位未被清零，需拦截以防止客户机修改保留位。
     if (pVM->hm.s.vmx.fAlwaysInterceptMovDRxCfg == 0)
         pVM->hmr0.s.vmx.fAlwaysInterceptMovDRx = g_fDr6Zeroed != X86_DR6_RA1_MASK;
     else
 #endif
+    //显式配置：若用户指定（fAlwaysInterceptMovDRxCfg > 0），强制启用拦截。
         pVM->hmr0.s.vmx.fAlwaysInterceptMovDRx = pVM->hm.s.vmx.fAlwaysInterceptMovDRxCfg > 0;
+    //通过 hm.s.ForR3 结构传递配置（如 fAlwaysInterceptMovDRx），供用户态组件（如 VBoxSVC）使用。
     pVM->hm.s.ForR3.vmx.fAlwaysInterceptMovDRx = pVM->hmr0.s.vmx.fAlwaysInterceptMovDRx;
 
     return VINF_SUCCESS;
@@ -3213,6 +3407,7 @@ VMMR0DECL(int) VMXR0TermVM(PVMCC pVM)
     AssertPtr(pVM);
     LogFlowFunc(("pVM=%p\n", pVM));
 
+//在支持崩溃转储的调试版本中，清除临时内存（pbScratch）的内容，避免敏感信息泄漏
 #ifdef VBOX_WITH_CRASHDUMP_MAGIC
     if (pVM->hmr0.s.vmx.pbScratch)
         RT_BZERO(pVM->hmr0.s.vmx.pbScratch, X86_PAGE_4K_SIZE);
@@ -3241,6 +3436,7 @@ VMMR0DECL(int) VMXR0SetupVM(PVMCC pVM)
      * without causing a #GP.
      */
     RTCCUINTREG const uHostCr4 = ASMGetCR4();
+    //检查 VMX 是否在 CR4 寄存器中启用
     if (RT_LIKELY(uHostCr4 & X86_CR4_VMXE))
     { /* likely */ }
     else
@@ -3250,6 +3446,7 @@ VMMR0DECL(int) VMXR0SetupVM(PVMCC pVM)
      * Check that nested paging is supported if enabled and copy over the flag to the
      * ring-0 only structure.
      */
+    //验证嵌套分页（Nested Paging/EPT）是否被正确配置
     bool const fNestedPaging = pVM->hm.s.fNestedPagingCfg;
     AssertReturn(   !fNestedPaging
                  || (g_HmMsrs.u.vmx.ProcCtls2.n.allowed1 & VMX_PROC_CTLS2_EPT), /** @todo use a ring-0 copy of ProcCtls2.n.allowed1 */
@@ -3262,6 +3459,7 @@ VMMR0DECL(int) VMXR0SetupVM(PVMCC pVM)
      * always be allocated. We no longer support the highly unlikely case of unrestricted guest
      * without pRealModeTSS, see hmR3InitFinalizeR0Intel().
      */
+    //检查 unrestricted guest 模式（不需要分页/实模式转换）的兼容性
     bool const fUnrestrictedGuest = pVM->hm.s.vmx.fUnrestrictedGuestCfg;
     AssertReturn(   !fUnrestrictedGuest
                 || (   (g_HmMsrs.u.vmx.ProcCtls2.n.allowed1 & VMX_PROC_CTLS2_UNRESTRICTED_GUEST)
@@ -3277,10 +3475,12 @@ VMMR0DECL(int) VMXR0SetupVM(PVMCC pVM)
     pVM->hmr0.s.vmx.fUnrestrictedGuest = fUnrestrictedGuest;
 
     /* Initialize these always, see hmR3InitFinalizeR0().*/
+    //设置 EPT 和 VPID 的 TLB 刷新方式
     pVM->hm.s.ForR3.vmx.enmTlbFlushEpt  = pVM->hmr0.s.vmx.enmTlbFlushEpt  = VMXTLBFLUSHEPT_NONE;
     pVM->hm.s.ForR3.vmx.enmTlbFlushVpid = pVM->hmr0.s.vmx.enmTlbFlushVpid = VMXTLBFLUSHVPID_NONE;
 
     /* Setup the tagged-TLB flush handlers. */
+    //初始化标记 TLB（tagged TLB）处理程序
     int rc = hmR0VmxSetupTaggedTlb(pVM);
     if (RT_FAILURE(rc))
     {
@@ -3289,6 +3489,7 @@ VMMR0DECL(int) VMXR0SetupVM(PVMCC pVM)
     }
 
     /* Determine LBR capabilities. */
+    //初始化标记 TLB（tagged TLB）处理程序
     pVM->hmr0.s.vmx.fLbr = pVM->hm.s.vmx.fLbrCfg;
     if (pVM->hmr0.s.vmx.fLbr)
     {
@@ -3322,6 +3523,7 @@ VMMR0DECL(int) VMXR0SetupVM(PVMCC pVM)
 
         pVCpu->hmr0.s.vmx.pfnStartVm = hmR0VmxStartVmSelector;
 
+        //为每个虚拟 CPU 设置 VMCS（虚拟机控制结构）
         rc = hmR0VmxSetupVmcs(pVCpu, &pVCpu->hmr0.s.vmx.VmcsInfo,  false /* fIsNstGstVmcs */);
         if (RT_SUCCESS(rc))
         {
@@ -3373,6 +3575,15 @@ static uint64_t hmR0VmxExportHostControlRegs(void)
  * @param   pVCpu       The cross context virtual CPU structure.
  * @param   uHostCr4    The host CR4 value.
  */
+//该函数在 VM-entry 前 将宿主机的段寄存器（Segment Registers）和系统表基址（GDTR/IDTR/TR）
+//导出到 VMCS 的 Host-State Area，确保 VM-exit 时能正确恢复宿主机状态。
+/*
+  段寄存器（CS/SS/DS/ES/FS/GS/TR）的选择子和基址。
+  系统描述符表（GDTR/IDTR）的基址和限制。
+  宿主机状态恢复标志的维护（如需要手动恢复的寄存器）。
+*/
+//fRestoreHostFlags |= xxxx; 配置这个标志的意思是,vmx exit的时候，由软件恢复host的这些寄存器
+//这是由 Intel VT-x 硬件行为与宿主机需求之间的差异所决定的。
 static int hmR0VmxExportHostSegmentRegs(PVMCPUCC pVCpu, uint64_t uHostCr4)
 {
     /*
@@ -3383,11 +3594,14 @@ static int hmR0VmxExportHostSegmentRegs(PVMCPUCC pVCpu, uint64_t uHostCr4)
      * This apparently can happen (most likely the FPU changes), deal with it rather than
      * asserting. Was observed booting Solaris 10u10 32-bit guest.
      */
+    //若之前执行客户机代码时污染了宿主机状态（如 FPU 寄存器），需先恢复原始值。
+    //典型问题：
+    //Solaris 客户机可能触发此路径（参考 Bug #7240）。
     if (pVCpu->hmr0.s.vmx.fRestoreHostFlags > VMX_RESTORE_HOST_REQUIRED)
     {
         Log4Func(("Restoring Host State: fRestoreHostFlags=%#RX32 HostCpuId=%u\n", pVCpu->hmr0.s.vmx.fRestoreHostFlags,
                   pVCpu->idCpu));
-        VMXRestoreHostState(pVCpu->hmr0.s.vmx.fRestoreHostFlags, &pVCpu->hmr0.s.vmx.RestoreHost);
+        VMXRestoreHostState(pVCpu->hmr0.s.vmx.fRestoreHostFlags, &pVCpu->hmr0.s.vmx.RestoreHost); // 恢复被客户机污染的宿主机状态
         pVCpu->hmr0.s.vmx.fRestoreHostFlags = 0;
     }
 
@@ -3398,8 +3612,10 @@ static int hmR0VmxExportHostSegmentRegs(PVMCPUCC pVCpu, uint64_t uHostCr4)
      */
     uint32_t fRestoreHostFlags;
 #if RT_INLINE_ASM_EXTERNAL
+    //根据 CR4.FSGSBASE 决定使用 RDFSBASE 指令还是 RDMSR 读取 FS/GS 基址。
     if (uHostCr4 & X86_CR4_FSGSBASE)
     {
+        //若支持 FSGSBASE，设置 VMX_RESTORE_HOST_CAN_USE_WRFSBASE_AND_WRGSBASE 标志，加速后续恢复。
         hmR0VmxExportHostSegmentRegsAsmHlp(&pVCpu->hmr0.s.vmx.RestoreHost, true /*fHaveFsGsBase*/);
         fRestoreHostFlags = VMX_RESTORE_HOST_CAN_USE_WRFSBASE_AND_WRGSBASE;
     }
@@ -3444,10 +3660,18 @@ static int hmR0VmxExportHostSegmentRegs(PVMCPUCC pVCpu, uint64_t uHostCr4)
      * See Intel spec. 26.2.3 "Checks on Host Segment and Descriptor-Table Registers".
      */
     RTSEL const uSelAll = uSelFS | uSelGS | uSelES | uSelDS;
+    //段寄存器合法性校验
+    //Intel 规范要求：
+    //VM-entry 时宿主机段选择子的 RPL（Requested Privilege Level）必须为 0，且不能指向 LDT。
+    /*
+     * 解决方案：
+         非法选择子临时置零，通过 VM-entry设置恢复标志，在 VM-exit 后恢复原始值。
+    */
     if (uSelAll & (X86_SEL_RPL | X86_SEL_LDT))
     {
         if (!(uSelAll & X86_SEL_LDT))
         {
+                // 调整非法选择子（RPL≠0 或 LDT 选择子）
 #define VMXLOCAL_ADJUST_HOST_SEG(a_Seg, a_uVmcsVar) \
                 do { \
                     (a_uVmcsVar) = pVCpu->hmr0.s.vmx.RestoreHost.uHostSel##a_Seg; \
@@ -3457,6 +3681,7 @@ static int hmR0VmxExportHostSegmentRegs(PVMCPUCC pVCpu, uint64_t uHostCr4)
                         (a_uVmcsVar) = 0; \
                     } \
                 } while (0)
+            // 检查 (a_uVmcsVar) = 0 : 临时置零以通过 VM-entry 
             VMXLOCAL_ADJUST_HOST_SEG(DS, uSelDS);
             VMXLOCAL_ADJUST_HOST_SEG(ES, uSelES);
             VMXLOCAL_ADJUST_HOST_SEG(FS, uSelFS);
@@ -3502,6 +3727,13 @@ static int hmR0VmxExportHostSegmentRegs(PVMCPUCC pVCpu, uint64_t uHostCr4)
      * Determine if we need to manually need to restore the GDTR and IDTR limits as VT-x zaps
      * them to the maximum limit (0xffff) on every VM-exit.
      */
+    /*
+     硬件行为：
+       VT-x 在 VM-exit 时强制将 GDTR/IDTR 限制设为 0xFFFF（可能破坏宿主机的精心配置）。
+     兼容性处理：
+       Linux/Solaris 允许 IDTR.LIMIT=0xFFF，其他系统需严格恢复。
+       Windows 依赖精确的 GDTR 限制（如 Patch Guard）。
+     * */
     if (pVCpu->hmr0.s.vmx.RestoreHost.HostGdtr.cb != 0xffff)
         fRestoreHostFlags |= VMX_RESTORE_HOST_GDTR;
 
@@ -3514,6 +3746,7 @@ static int hmR0VmxExportHostSegmentRegs(PVMCPUCC pVCpu, uint64_t uHostCr4)
      * alignment in at least one consumer).  So, we're only allowing the IDTR.LIMIT to be left
      * at 0xffff on hosts where we are sure it won't cause trouble.
      */
+    //如果内存中的IDTR值有效，配置flag，vmx exit的时候，由软件恢复host的这些寄存器
 #if defined(RT_OS_LINUX) || defined(RT_OS_SOLARIS)
     if (pVCpu->hmr0.s.vmx.RestoreHost.HostIdtr.cb <  0x0fff)
 #else
@@ -3644,8 +3877,20 @@ static void hmR0VmxExportHostMsrs(PVMCPUCC pVCpu)
  * @remarks Requires EFER, CR4.
  * @remarks No-long-jump zone!!!
  */
+/*
+  在 VM-entry/exit 时，检查是否需要将 Guest 的 EFER MSR 与 Host 的 EFER MSR 进行交换。
+  主要考虑 嵌套虚拟化（Nested VMX）、长模式（Long Mode）和 分页模式（Paging Mode）的影响。
+*/
+/*
+ 场景                     触发条件
+强制调试                  编译宏 HMVMX_ALWAYS_SWAP_EFER 启用时。
+嵌套虚拟化	              L1 Hypervisor 要求加载/保存 EFER（通过 VMX Entry/Exit Controls）。
+长模式 SYSCALL 兼容性	  Guest 是 64-bit 且 EFER.SCE 位与 Host 不同。
+分页模式 NX 权限	      Guest 使用 PAE/AMD64 分页且 EFER.NXE 位与 Host 不同。
+*/
 static bool hmR0VmxShouldSwapEferMsr(PCVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransient)
 {
+    //用途：在调试或特殊配置时，强制启用 EFER 交换（如排查兼容性问题）。
 #ifdef HMVMX_ALWAYS_SWAP_EFER
     RT_NOREF2(pVCpu, pVmxTransient);
     return true;
@@ -3659,11 +3904,12 @@ static bool hmR0VmxShouldSwapEferMsr(PCVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransie
      * For nested-guests, we shall honor swapping the EFER MSR when requested by
      * the nested-guest.
      */
+    //嵌套虚拟化需要精确控制 EFER 的加载/保存，以维护 L1 和 L2 Hypervisor 的状态隔离。
     if (   pVmxTransient->fIsNestedGuest
         && (   CPUMIsGuestVmxEntryCtlsSet(pCtx, VMX_ENTRY_CTLS_LOAD_EFER_MSR)
             || CPUMIsGuestVmxExitCtlsSet(pCtx, VMX_EXIT_CTLS_SAVE_EFER_MSR)
             || CPUMIsGuestVmxExitCtlsSet(pCtx, VMX_EXIT_CTLS_LOAD_EFER_MSR)))
-        return true;
+        return true;// 嵌套 Hypervisor 要求交换 EFER
 # else
     RT_NOREF(pVmxTransient);
 #endif
@@ -3672,9 +3918,14 @@ static bool hmR0VmxShouldSwapEferMsr(PCVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransie
      * For 64-bit guests, if EFER.SCE bit differs, we need to swap the EFER MSR
      * to ensure that the guest's SYSCALL behaviour isn't broken, see @bugref{7386}.
      */
+/*
+    EFER.SCE 控制 SYSCALL/SYSRET指令的启用（AMD64 特性）。
+    若 Guest 处于长模式（64-bit），且 SCE 位与 Host 不一致，必须交换 EFER 以确保 Guest 的 SYSCALL 行为正确。
+*/
+    //参考 @bugref{7386}（早期 VirtualBox 因未处理 SCE 导致 SYSCALL 失效）
     if (   CPUMIsGuestInLongModeEx(pCtx)
         && (u64GuestEfer & MSR_K6_EFER_SCE) != (u64HostEfer & MSR_K6_EFER_SCE))
-        return true;
+        return true;// Guest 和 Host 的 SYSCALL 配置不同，需交换 EFER
 
     /*
      * If the guest uses PAE and EFER.NXE bit differs, we need to swap the EFER MSR
@@ -3686,6 +3937,8 @@ static bool hmR0VmxShouldSwapEferMsr(PCVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransie
      * Verify that we always intercept CR4.PAE and CR0.PG bits, so we don't need to
      * import CR4 and CR0 from the VMCS here as those bits are always up to date.
      */
+    //分页模式（PAE/NX）下的 EFER.NXE 检查
+    //PAE 分页：Guest 启用了 CR4.PAE 和 CR0.PG（分页）。
     Assert(vmxHCGetFixedCr4Mask(pVCpu) & X86_CR4_PAE);
     Assert(vmxHCGetFixedCr0Mask(pVCpu) & X86_CR0_PG);
     if (   (pCtx->cr4 & X86_CR4_PAE)
@@ -3705,8 +3958,8 @@ static bool hmR0VmxShouldSwapEferMsr(PCVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransie
         if ((u64GuestEfer & MSR_K6_EFER_NXE) != (u64HostEfer & MSR_K6_EFER_NXE))
         {
             /* Verify that the host is NX capable. */
-            Assert(g_CpumHostFeatures.s.fNoExecute);
-            return true;
+            Assert(g_CpumHostFeatures.s.fNoExecute); // 确保 Host 支持 NX
+            return true; // Guest 和 Host 的 NX 配置不同，需交换 EFER
         }
     }
 
@@ -3810,6 +4063,20 @@ static int hmR0VmxExportGuestHwvirtState(PVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTran
  *
  * @remarks No-long-jump zone!!!
  */
+/*
+ *
+  在 VM-entry 前（即 Guest 代码执行前），根据 Guest 和 Hypervisor 的调试状态，
+    配置 VMCS 中的调试寄存器相关字段（如 DR7、MOV DRx 拦截等）。
+  处理 单步调试（TF 标志位）和 嵌套虚拟化（Nested Guest）的特殊情况。
+ * */
+/*
+  在虚拟化环境中，“Hypervisor 调试器激活”是指通过调试工具（如 WinDbg、GDB 等）
+    对运行在 Hypervisor 层的代码进行动态跟踪、断点调试或内存分析的过程。这一机制主要用于开发或安全分析场景，允许开发者深入监控 Hypervisor 和虚拟机的底层行为‌35。以下是其核心要点：
+ 调试目标
+  Hypervisor 层：直接调试虚拟化监控程序（如 VirtualBox 的 VMM、Windows Hyper-V 的 Hypervisor），
+    分析其对 Guest OS 的管理逻辑（如 VM-exit 处理、EPT 配置等）
+  Guest 内核：通过 Hypervisor 调试器间接监控 Guest OS 的内核行为（如内存访问、特权指令执行）
+*/
 static int hmR0VmxExportSharedDebugState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient)
 {
     Assert(!RTThreadPreemptIsEnabled(NIL_RTTHREAD));
@@ -3832,6 +4099,13 @@ static int hmR0VmxExportSharedDebugState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTrans
          * then the nested-guest debug state should be actively loaded on the host so that
          * nested-guest reads its own debug registers without causing VM-exits.
          */
+        // 如果外层和嵌套 Hypervisor 均不拦截 MOV DRx，则主动加载 Guest 的调试状态
+        /*
+         * 背景：在嵌套虚拟化中，Guest 的 MOV DRx 指令可能被外层或内层 Hypervisor 拦截。
+           逻辑：
+             若 两者均不拦截，则直接加载 Guest 的调试寄存器到 Host CPU，避免不必要的 VM-exit。
+             否则依赖 VM-exit 由 VMM 模拟（参考 @bugref{10080} 的修复）。
+         * */
         if (   !(pVmcsInfo->u32ProcCtls & VMX_PROC_CTLS_MOV_DR_EXIT)
             && !CPUMIsGuestDebugStateActive(pVCpu))
             CPUMR0LoadGuestDebugState(pVCpu, true /* include DR6 */);
@@ -3850,9 +4124,12 @@ static int hmR0VmxExportSharedDebugState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTrans
 
     bool     fSteppingDB      = false;
     uint32_t uProcCtls        = pVmcsInfo->u32ProcCtls;
+    // 单步调试（Single-Step）处理
     if (pVCpu->hm.s.fSingleInstruction)
     {
         /* If the CPU supports the monitor trap flag, use it for single stepping in DBGF and avoid intercepting #DB. */
+        // 优先使用 CPU 的 Monitor Trap Flag（MTF）硬件特性
+        // MTF 优先：若 CPU 支持 Monitor Trap Flag，则通过 VMCS 启用，在 Guest 执行一条指令后自动触发 VM-exit。
         if (g_HmMsrs.u.vmx.ProcCtls.n.allowed1 & VMX_PROC_CTLS_MONITOR_TRAP_FLAG)
         {
             uProcCtls |= VMX_PROC_CTLS_MONITOR_TRAP_FLAG;
@@ -3860,6 +4137,7 @@ static int hmR0VmxExportSharedDebugState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTrans
         }
         else
         {
+            // 若无 MTF，则设置 Guest 的 EFLAGS.TF，通过 #DB 异常实现单步调试（需后续清除 TF 防止递归异常）。
             pVCpu->cpum.GstCtx.eflags.u |= X86_EFL_TF;
             pVCpu->hm.s.fCtxChanged |= HM_CHANGED_GUEST_RFLAGS;
             pVCpu->hmr0.s.fClearTrapFlag = true;
@@ -3873,6 +4151,7 @@ static int hmR0VmxExportSharedDebugState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTrans
     bool     fInterceptMovDRx = false;
 #endif
     uint64_t u64GuestDr7;
+    // Hypervisor 调试器激活时，加载 Hypervisor 的 DRx 状态
     if (   fSteppingDB
         || (CPUMGetHyperDR7(pVCpu) & X86_DR7_ENABLED_MASK))
     {
@@ -3904,6 +4183,7 @@ static int hmR0VmxExportSharedDebugState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTrans
         HMVMX_CPUMCTX_ASSERT(pVCpu, CPUMCTX_EXTRN_DR7);
         if (pVCpu->cpum.GstCtx.dr[7] & (X86_DR7_ENABLED_MASK | X86_DR7_GD))
         {
+            // Guest 启用调试寄存器时，加载 Guest 的 DRx 状态
             if (!CPUMIsGuestDebugStateActive(pVCpu))
             {
                 CPUMR0LoadGuestDebugState(pVCpu, true /* include DR6 */);
@@ -3915,6 +4195,7 @@ static int hmR0VmxExportSharedDebugState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTrans
             Assert(!fInterceptMovDRx);
 #endif
         }
+        // 无调试时，延迟加载 DR0-DR3，但必须拦截 MOV DRx 和 #DB
         else if (!CPUMIsGuestDebugStateActive(pVCpu))
         {
             /*
@@ -3931,6 +4212,7 @@ static int hmR0VmxExportSharedDebugState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTrans
         pVCpu->hmr0.s.fUsingHyperDR7 = false;
     }
 
+    //根据 fInterceptMovDRx 决定是否在 VMCS 中启用 MOV DRx 拦截。
     if (fInterceptMovDRx)
         uProcCtls |= VMX_PROC_CTLS_MOV_DR_EXIT;
     else
@@ -3999,6 +4281,23 @@ static int hmR0VmxExportSharedDebugState(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTrans
  *
  * @remarks No-long-jump zone!!!
  */
+//在 VM-entry 前 将客户机的 MSR（Model-Specific Register）状态导出到 VMCS 中，
+//确保客户机执行时能正确访问这些寄存器
+/*
+  主要处理三类 MSR：
+    自动加载/存储的 MSR（当前未实现，保留扩展点）。
+    Sysenter 相关 MSR（SYSENTER_CS/EIP/ESP）。
+    EFER MSR（控制长模式等关键功能）。
+    其他 MSR（如分支记录 LBR、推测控制 SPEC_CTRL）。
+*/
+/*
+自动加载区域（Auto-Load/Store MSR Area）
+工作原理
+  VMCS 中有一个 MSR Load/Store List，可配置一组 MSR 及其值。
+硬件行为：
+  在 VM-entry 时，CPU 自动从该区域加载 MSR 值到物理寄存器。
+  在 VM-exit 时，CPU 自动将物理寄存器的值保存回该区域。
+*/
 static int hmR0VmxExportGuestMsrs(PVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransient)
 {
     AssertPtr(pVCpu);
@@ -4022,16 +4321,23 @@ static int hmR0VmxExportGuestMsrs(PVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransient)
     if (ASMAtomicUoReadU64(&pVCpu->hm.s.fCtxChanged) & HM_CHANGED_VMX_GUEST_AUTO_MSRS)
     {
         /* No auto-load/store MSRs currently. */
+        //当前无实际逻辑，仅为未来扩展预留接口。若需支持动态 MSR 加载（如性能监控 MSR），可在此扩展。
         ASMAtomicUoAndU64(&pVCpu->hm.s.fCtxChanged, ~HM_CHANGED_VMX_GUEST_AUTO_MSRS);
     }
 
     /*
      * Guest Sysenter MSRs.
      */
+    /*
+       通过 VMXWriteVmcsXX 直接写入 VMCS 的 guest 区域。
+       使用 CPUMCTX_EXTRN_SYSENTER_MSRS 确保上下文已加载。
+       清除对应的 fCtxChanged 标志位，避免重复操作。
+    */
     if (ASMAtomicUoReadU64(&pVCpu->hm.s.fCtxChanged) & HM_CHANGED_GUEST_SYSENTER_MSR_MASK)
     {
         HMVMX_CPUMCTX_ASSERT(pVCpu, CPUMCTX_EXTRN_SYSENTER_MSRS);
 
+        /* 分别处理 SYSENTER_CS/EIP/ESP */
         if (ASMAtomicUoReadU64(&pVCpu->hm.s.fCtxChanged) & HM_CHANGED_GUEST_SYSENTER_CS_MSR)
         {
             int rc = VMXWriteVmcs32(VMX_VMCS32_GUEST_SYSENTER_CS, pCtx->SysEnter.cs);
@@ -4076,6 +4382,7 @@ static int hmR0VmxExportGuestMsrs(PVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransient)
              * during VM-entry.
              */
             uint64_t uGuestEferMsr = pCtx->msrEFER;
+            //在非 Unrestricted Guest 模式下，强制 EFER.LME=LMA，避免 VM-entry 因无效状态失败。
             if (!pVM->hmr0.s.vmx.fUnrestrictedGuest)
             {
                 if (!(pCtx->msrEFER & MSR_K6_EFER_LMA))
@@ -4088,6 +4395,7 @@ static int hmR0VmxExportGuestMsrs(PVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransient)
              * If the CPU supports VMCS controls for swapping EFER, use it. Otherwise, we have no option
              * but to use the auto-load store MSR area in the VMCS for swapping EFER. See @bugref{7368}.
              */
+            //若 CPU 支持 VMCS 直接管理 EFER（g_fHmVmxSupportsVmcsEfer），优先使用；否则通过自动加载区域实现。
             if (g_fHmVmxSupportsVmcsEfer)
             {
                 int rc = VMXWriteVmcs64(VMX_VMCS64_GUEST_EFER_FULL, uGuestEferMsr);
@@ -4115,10 +4423,16 @@ static int hmR0VmxExportGuestMsrs(PVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransient)
     /*
      * Other MSRs.
      */
+    /*
+      安全特性：SPEC_CTRL 用于缓解 Spectre 漏洞，需确保客户机值正确加载。
+       调试支持：LBR（Last Branch Record）记录分支历史，用于性能分析或故障诊断。
+       动态管理：通过 hmR0VmxAddAutoLoadStoreMsr 将 MSR 添加到 VMCS 的自动加载区域。
+    */
     if (ASMAtomicUoReadU64(&pVCpu->hm.s.fCtxChanged) & HM_CHANGED_GUEST_OTHER_MSRS)
     {
         /* Speculation Control (R/W). */
         HMVMX_CPUMCTX_ASSERT(pVCpu, HM_CHANGED_GUEST_OTHER_MSRS);
+        /* 推测控制 MSR（如 SPEC_CTRL）*/
         if (pVM->cpum.ro.GuestFeatures.fIbrs)
         {
             int rc = hmR0VmxAddAutoLoadStoreMsr(pVCpu, pVmxTransient, MSR_IA32_SPEC_CTRL, CPUMGetGuestSpecCtrl(pVCpu),
@@ -4126,6 +4440,7 @@ static int hmR0VmxExportGuestMsrs(PVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransient)
             AssertRCReturn(rc, rc);
         }
 
+        /* 分支记录 MSR（LBR）*/
         /* Last Branch Record. */
         if (pVM->hmr0.s.vmx.fLbr)
         {
@@ -4174,12 +4489,25 @@ static int hmR0VmxExportGuestMsrs(PVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransient)
  *
  * @remarks No-long-jump zone!!!
  */
+// 执行 VMX 非根模式（Guest 模式） 的核心接口，
+// 负责通过 VMLAUNCH 或 VMRESUME 指令启动/恢复客户机 CPU 执行。
+/*
+  标记寄存器所有权：声明 Hypervisor 对客户机寄存器状态的管理权。
+  选择启动方式：根据 VMCS 状态决定使用 VMLAUNCH（首次启动）还是 VMRESUME（恢复运行）。
+  调用底层 VMX 指令：通过函数指针 pfnStartVm 触发硬件虚拟化操作。
+*/
 DECLINLINE(int) hmR0VmxRunGuest(PVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransient)
 {
     /* Mark that HM is the keeper of all guest-CPU registers now that we're going to execute guest code. */
+    //标记所有客户机寄存器由 Hypervisor 管理（避免冗余加载）。
+    //明确 Hypervisor 是寄存器状态的“维护者”。
+    //fExtrn 标志位：
+      //VirtualBox 通过此标志避免不必要的 VMCS 字段写入。例如，若某寄存器未被修改（!CPUMCTX_EXTRN_xxx），则跳过对应的 VMWRITE 操作。
+    //确保在进入客户机前，所有寄存器状态已从内存加载到 VMCS 中，且后续由 Hypervisor 负责同步。
     pVCpu->cpum.GstCtx.fExtrn |= HMVMX_CPUMCTX_EXTRN_ALL | CPUMCTX_EXTRN_KEEPER_HM;
 
     PVMXVMCSINFO pVmcsInfo = pVmxTransient->pVmcsInfo;
+    //VMRESUME 或 VMLAUNCH
     bool const   fResumeVM = RT_BOOL(pVmcsInfo->fVmcsState == VMX_V_VMCS_LAUNCH_STATE_LAUNCHED);
 #ifdef VBOX_WITH_STATISTICS
     if (fResumeVM)
@@ -4187,6 +4515,7 @@ DECLINLINE(int) hmR0VmxRunGuest(PVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransient)
     else
         STAM_COUNTER_INC(&pVCpu->hm.s.StatVmxVmLaunch);
 #endif
+    //hmR0VmxStartVm64
     int rc = pVCpu->hmr0.s.vmx.pfnStartVm(pVmcsInfo, pVCpu, fResumeVM);
     AssertMsg(rc <= VINF_SUCCESS, ("%Rrc\n", rc));
     return rc;
@@ -4201,6 +4530,17 @@ DECLINLINE(int) hmR0VmxRunGuest(PVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransient)
  * @param   pVmxTransient   The VMX-transient structure (only
  *                          exitReason updated).
  */
+//在虚拟机切换（World Switch）失败时，记录详细的错误信息，
+//并输出与 VMX 相关的硬件状态，用于调试和分析。
+/*
+典型应用场景
+  VM-entry 失败调试
+    当客户机启动失败时，通过日志分析 u32InstrError 和 u32ExitReason 定位问题根源（如客户机状态无效、MSR 加载失败）。
+  硬件兼容性验证
+    检查 VMCS 字段是否被正确支持（如缺少 VPID 支持时跳过相关字段）。
+  Hypervisor 开发
+    开发者可通过该函数快速验证 VMX 配置是否符合 Intel 手册规范。
+*/
 static void hmR0VmxReportWorldSwitchError(PVMCPUCC pVCpu, int rcVMRun, PVMXTRANSIENT pVmxTransient)
 {
     Assert(pVCpu);
@@ -4210,17 +4550,21 @@ static void hmR0VmxReportWorldSwitchError(PVMCPUCC pVCpu, int rcVMRun, PVMXTRANS
     Log4Func(("VM-entry failure: %Rrc\n", rcVMRun));
     switch (rcVMRun)
     {
-        case VERR_VMX_INVALID_VMXON_PTR:
+        case VERR_VMX_INVALID_VMXON_PTR: //表示 VMXON 指针无效（硬件初始化问题）。
             AssertFailed();
             break;
         case VINF_SUCCESS:                  /* VMLAUNCH/VMRESUME succeeded but VM-entry failed... yeah, true story. */
         case VERR_VMX_UNABLE_TO_START_VM:   /* VMLAUNCH/VMRESUME itself failed. */
         {
+            //读取 VMCS 退出原因 
+            //u32ExitReason 的高 16 位标识具体事件类型（如外部中断、EPT 违规等）。
             int rc = VMXReadVmcs32(VMX_VMCS32_RO_EXIT_REASON, &pVCpu->hm.s.vmx.LastError.u32ExitReason);
             rc    |= VMXReadVmcs32(VMX_VMCS32_RO_VM_INSTR_ERROR, &pVCpu->hm.s.vmx.LastError.u32InstrError);
             AssertRC(rc);
+            //获取退出时的附加信息（如退出资格 Exit Qualification）。
             vmxHCReadToTransientSlow<HMVMX_READ_EXIT_QUALIFICATION>(pVCpu, pVmxTransient);
 
+            //记录发生错误的 CPU ID
             pVCpu->hm.s.vmx.LastError.idEnteredCpu = pVCpu->hmr0.s.idEnteredCpu;
             /* LastError.idCurrentCpu was already updated in hmR0VmxPreRunGuestCommitted().
                Cannot do it here as we may have been long preempted. */
@@ -4231,6 +4575,8 @@ static void hmR0VmxReportWorldSwitchError(PVMCPUCC pVCpu, int rcVMRun, PVMXTRANS
                      pVmxTransient->uExitReason));
                 Log4(("Exit Qualification %#RX64\n", pVmxTransient->uExitQual));
                 Log4(("InstrError         %#RX32\n", pVCpu->hm.s.vmx.LastError.u32InstrError));
+                //通过 g_apszVmxInstrErrors 数组将 u32InstrError 转换为可读字符串
+                //（如错误码 7 对应 "Invalid guest state"）。
                 if (pVCpu->hm.s.vmx.LastError.u32InstrError <= HMVMX_INSTR_ERROR_MAX)
                     Log4(("InstrError Desc.  \"%s\"\n", g_apszVmxInstrErrors[pVCpu->hm.s.vmx.LastError.u32InstrError]));
                 else
@@ -4238,6 +4584,17 @@ static void hmR0VmxReportWorldSwitchError(PVMCPUCC pVCpu, int rcVMRun, PVMXTRANS
                 Log4(("Entered host CPU   %u\n", pVCpu->hm.s.vmx.LastError.idEnteredCpu));
                 Log4(("Current host CPU   %u\n", pVCpu->hm.s.vmx.LastError.idCurrentCpu));
 
+                /*
+                 VMCS 控制字段
+                   检查所有关键 VMCS 字段（如 CTRL_PIN_EXEC、CTRL_PROC_EXEC），确保其值符合 Intel VT-x 规范。
+                 宿主/客户机状态
+                   宿主状态：CR0/CR3/CR4、段寄存器（CS/DS/ES等）、GDTR/IDTR、RIP/RSP。
+                   客户机状态：RIP、RSP、RFLAGS。
+                 段描述符验证
+                   通过 ASMGetGDTR 读取 GDT 表，验证宿主段选择器（如 VMX_VMCS16_HOST_CS_SEL）是否指向合法的描述符。
+                 MSR 寄存器
+                   输出 MSR_K6_EFER、MSR_K8_CSTAR 等寄存器值，分析 CPU 扩展功能状态。
+                */ 
                 static struct
                 {
                     /** Name of the field to log. */
@@ -4311,6 +4668,8 @@ static void hmR0VmxReportWorldSwitchError(PVMCPUCC pVCpu, int rcVMRun, PVMXTRANS
                         PVMCC pVM = pVCpu->CTX_SUFF(pVM);
                         switch (uVmcsField)
                         {
+                            //某些字段（如 VMX_VMCS64_CTRL_EPTP_FULL）需要硬件支持（如嵌套分页），
+                            //通过 pVM->hmr0.s.fNestedPaging 判断是否生效。
                             case VMX_VMCS64_CTRL_EPTP_FULL:  fSupported = pVM->hmr0.s.fNestedPaging;    break;
                             case VMX_VMCS16_VPID:            fSupported = pVM->hmr0.s.vmx.fVpid;          break;
                             case VMX_VMCS32_CTRL_PROC_EXEC2:
@@ -4324,6 +4683,7 @@ static void hmR0VmxReportWorldSwitchError(PVMCPUCC pVCpu, int rcVMRun, PVMXTRANS
                     if (fSupported)
                     {
                         uint8_t const uWidth = RT_BF_GET(uVmcsField, VMX_BF_VMCSFIELD_WIDTH);
+                        //根据 VMCS 字段的宽度（16/32/64位）调用对应的 VMXReadVmcsXX 函数读取。
                         switch (uWidth)
                         {
                             case VMX_VMCSFIELD_WIDTH_16BIT:
@@ -4404,6 +4764,19 @@ static void hmR0VmxReportWorldSwitchError(PVMCPUCC pVCpu, int rcVMRun, PVMXTRANS
  *
  * @remarks No-long-jump zone!!!
  */
+//更新 TSC（Time Stamp Counter）偏移和 配置 VMX 抢占定时器（Preemption Timer），
+//确保客户机时间管理正确且高效。
+/*
+  计算客户机 TSC 偏移（uTscOffset），用于 时间虚拟化（避免客户机直接读取宿主机 TSC）。
+  根据情况决定是否启用 RDTSC 退出（VM-Exit on RDTSC）。
+*/
+
+/*
+   TSC偏移作用：让客户机 RDTSC 读取 (宿主 TSC + uTscOffset)，避免修改客户机代码。
+   RDTSC 退出控制：
+     如果 能使用 TSC 偏移，则禁用 RDTSC 退出（性能优化）。
+     否则强制客户机 RDTSC 触发 VM-Exit，由 VMM 模拟返回虚拟时间。
+*/
 static void hmR0VmxUpdateTscOffsettingAndPreemptTimer(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient, RTCPUID idCurrentCpu)
 {
     bool         fOffsettedTsc;
@@ -4411,7 +4784,17 @@ static void hmR0VmxUpdateTscOffsettingAndPreemptTimer(PVMCPUCC pVCpu, PVMXTRANSI
     uint64_t     uTscOffset;
     PVMCC        pVM = pVCpu->CTX_SUFF(pVM);
 
-    if (pVM->hmr0.s.vmx.fUsePreemptTimer)
+    /*
+       抢占定时器作用：在指定的 TSC ticks 后强制触发 VM-Exit，确保客户机不会独占 CPU。
+       性能优化：
+         如果 仍在同一 CPU 核心且 deadline 未过期，则复用上次计算结果。
+         否则调用 TMCpuTickGetDeadlineAndTscOffset 重新计算。
+       范围限制：
+         上限 15.625ms（避免长时间不调度）。
+         下限 30μs（避免频繁抢占）。
+         通过 cPreemptTimerShift 调整精度（右移减少值）。
+    */
+    if (pVM->hmr0.s.vmx.fUsePreemptTimer)// 检查是否启用抢占定时器
     {
         /* The TMCpuTickGetDeadlineAndTscOffset function is expensive (calling it on
            every entry slowed down the bs2-test1 CPUID testcase by ~33% (on an 10980xe). */
@@ -4419,24 +4802,26 @@ static void hmR0VmxUpdateTscOffsettingAndPreemptTimer(PVMCPUCC pVCpu, PVMXTRANSI
         if (   idCurrentCpu == pVCpu->hmr0.s.idLastCpu
             && TMVirtualSyncIsCurrentDeadlineVersion(pVM, pVCpu->hmr0.s.vmx.uTscDeadlineVersion))
         {
+            // 复用上次计算的 deadline（性能优化）
             STAM_REL_COUNTER_INC(&pVCpu->hm.s.StatVmxPreemptionReusingDeadline);
             fOffsettedTsc = TMCpuTickCanUseRealTSC(pVM, pVCpu, &uTscOffset, &fParavirtTsc);
-            cTicksToDeadline = pVCpu->hmr0.s.vmx.uTscDeadline - SUPReadTsc();
+            cTicksToDeadline = pVCpu->hmr0.s.vmx.uTscDeadline - SUPReadTsc(); // 剩余 ticks
             if ((int64_t)cTicksToDeadline > 0)
             { /* hopefully */ }
             else
             {
                 STAM_REL_COUNTER_INC(&pVCpu->hm.s.StatVmxPreemptionReusingDeadlineExpired);
-                cTicksToDeadline = 0;
+                cTicksToDeadline = 0; // 已过期，立即触发抢占
             }
         }
         else
         {
+            // 重新计算 deadline 和 TSC 偏移
             STAM_REL_COUNTER_INC(&pVCpu->hm.s.StatVmxPreemptionRecalcingDeadline);
             cTicksToDeadline = TMCpuTickGetDeadlineAndTscOffset(pVM, pVCpu, &uTscOffset, &fOffsettedTsc, &fParavirtTsc,
                                                                 &pVCpu->hmr0.s.vmx.uTscDeadline,
                                                                 &pVCpu->hmr0.s.vmx.uTscDeadlineVersion);
-            pVCpu->hmr0.s.vmx.uTscDeadline += cTicksToDeadline;
+            pVCpu->hmr0.s.vmx.uTscDeadline += cTicksToDeadline;// 更新 deadline
             if (cTicksToDeadline >= 128)
             { /* hopefully */ }
             else
@@ -4445,21 +4830,25 @@ static void hmR0VmxUpdateTscOffsettingAndPreemptTimer(PVMCPUCC pVCpu, PVMXTRANSI
 
         /* Make sure the returned values have sane upper and lower boundaries. */
         uint64_t const u64CpuHz = SUPGetCpuHzFromGipBySetIndex(g_pSUPGlobalInfoPage, pVCpu->iHostCpuSet);
+        // 上限
         cTicksToDeadline   = RT_MIN(cTicksToDeadline, u64CpuHz / 64);      /* 1/64th of a second,  15.625ms. */ /** @todo r=bird: Once real+virtual timers move to separate thread, we can raise the upper limit (16ms isn't much). ASSUMES working poke cpu function. */
+        // 下限
         cTicksToDeadline   = RT_MAX(cTicksToDeadline, u64CpuHz / 32678);   /* 1/32768th of a second,  ~30us. */
+        // 调整精度
         cTicksToDeadline >>= pVM->hm.s.vmx.cPreemptTimerShift;
 
         /** @todo r=ramshankar: We need to find a way to integrate nested-guest
          *        preemption timers here. We probably need to clamp the preemption timer,
          *        after converting the timer value to the host. */
         uint32_t const cPreemptionTickCount = (uint32_t)RT_MIN(cTicksToDeadline, UINT32_MAX - 16);
+        //写入 VMCS 抢占定时器字段
         int rc = VMXWriteVmcs32(VMX_VMCS32_PREEMPT_TIMER_VALUE, cPreemptionTickCount);
         AssertRC(rc);
     }
     else
         fOffsettedTsc = TMCpuTickCanUseRealTSC(pVM, pVCpu, &uTscOffset, &fParavirtTsc);
 
-    if (fParavirtTsc)
+    if (fParavirtTsc)// 检查是否使用半虚拟化 TSC（如 Hyper-V/KVM）
     {
         /* Currently neither Hyper-V nor KVM need to update their paravirt. TSC
            information before every VM-entry, hence disable it for performance sake. */
@@ -4467,20 +4856,22 @@ static void hmR0VmxUpdateTscOffsettingAndPreemptTimer(PVMCPUCC pVCpu, PVMXTRANSI
         int rc = GIMR0UpdateParavirtTsc(pVM, 0 /* u64Offset */);
         AssertRC(rc);
 #endif
+        // 注：当前未实际更新半虚拟化 TSC 偏移（性能优化）
         STAM_COUNTER_INC(&pVCpu->hm.s.StatTscParavirt);
     }
 
     if (   fOffsettedTsc
         && RT_LIKELY(!pVCpu->hmr0.s.fDebugWantRdTscExit))
     {
-        if (pVmxTransient->fIsNestedGuest)
+        if (pVmxTransient->fIsNestedGuest)// 嵌套虚拟化情况
             uTscOffset = CPUMApplyNestedGuestTscOffset(pVCpu, uTscOffset);
-        hmR0VmxSetTscOffsetVmcs(pVmxTransient->pVmcsInfo, uTscOffset);
-        hmR0VmxRemoveProcCtlsVmcs(pVCpu, pVmxTransient, VMX_PROC_CTLS_RDTSC_EXIT);
+        hmR0VmxSetTscOffsetVmcs(pVmxTransient->pVmcsInfo, uTscOffset); // 写入 VMCS
+        hmR0VmxRemoveProcCtlsVmcs(pVCpu, pVmxTransient, VMX_PROC_CTLS_RDTSC_EXIT);// 禁用 RDTSC 退出
     }
     else
     {
         /* We can't use TSC-offsetting (non-fixed TSC, warp drive active etc.), VM-exit on RDTSC(P). */
+        // 无法使用 TSC 偏移（如非固定 TSC 或时间扭曲激活），需启用 RDTSC 退出
         hmR0VmxSetProcCtlsVmcs(pVmxTransient, VMX_PROC_CTLS_RDTSC_EXIT);
     }
 }
