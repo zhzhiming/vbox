@@ -750,8 +750,20 @@ PGMMODEDATASHW const g_aPgmShadowModeData[PGM_SHADOW_MODE_DATA_ARRAY_SIZE] =
 /**
  * The guest+shadow mode data array.
  */
+//用于处理分页模式切换的函数指针数组
 PGMMODEDATABTH const g_aPgmBothModeData[PGM_BOTH_MODE_DATA_ARRAY_SIZE] =
 {
+    //根据运行环境（RING3/非RING3）和调试模式（VBOX_STRICT）定义了4种不同的宏实现
+    //在非RING3调试模式下包含AssertCR3验证函数，其他情况则省略
+    /*
+      SyncCR3 - CR3寄存器同步
+      MapCR3/UnmapCR3 - 页表映射控制
+      Trap0eHandler - 缺页异常处理
+      AssertCR3 - 调试验证（仅VBOX_STRICT）
+
+      Nm:通过连接模式前缀（如PGM_BTH_NAME_32BIT_REAL）与操作名（如InvalidatePage）构建完整函数名
+        例如Nm(InvalidatePage)可能展开为pgmR3InvalidatePage32BitReal这样的具体实
+    */
 #if   !defined(IN_RING3) && !defined(VBOX_STRICT)
 # define PGMMODEDATABTH_NULL_ENTRY()    { UINT32_MAX, UINT32_MAX, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
 # define PGMMODEDATABTH_ENTRY(uShwT, uGstT, Nm) \
@@ -776,6 +788,11 @@ PGMMODEDATABTH const g_aPgmBothModeData[PGM_BOTH_MODE_DATA_ARRAY_SIZE] =
 # error "Misconfig."
 #endif
 
+    /*
+       按硬件支持的4种分页模式组织（32-bit/PAE/AMD64/Nested）
+       每种模式支持特定的客户机模式组合（REAL/PROT/32BIT/PAE等）
+       非法组合用NULL_ENTRY标记（如32-bit主机不支持PAE客户机）
+    */
     /* 32-bit shadow paging mode: */
     PGMMODEDATABTH_NULL_ENTRY(), /* 0 */
     PGMMODEDATABTH_ENTRY(PGM_TYPE_32BIT, PGM_TYPE_REAL,  PGM_BTH_NAME_32BIT_REAL),
@@ -1649,6 +1666,18 @@ DECLINLINE(int) pgmShwGetLongModePDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, PX86PML4
  * @param   ppPdpt      Receives address of pdpt
  * @param   ppPD        Receives address of page directory
  */
+//根据 GCPtr 定位到 EPT PML4 条目（Intel 四层分页结构的顶层）
+/*
+  检查 PML4E 是否存在：若条目无效（无物理页或不可读），调用 pgmPoolAlloc 分配新的 ‌PDPT 页
+  原子更新 PML4E：将新分配的页表地址和权限（EPT_E_READ | EPT_E_WRITE | EPT_E_EXECUTE）写入 PML4E。
+  缓存管理：若条目已存在，通过 pgmPoolCacheUsed 标记页表为“已使用”，避免被过早回收。
+*/
+/*
+此函数在以下情况下被调用：
+   EPT Violation 处理‌：当客户机访问未映射的虚拟地址时，触发 EPT 异常，需动态构建页表。
+   预填充页表‌：在虚拟机启动或内存热插拔时，预先分配必要的页表结构。
+   写时复制（COW）‌：修改只读页时，需为新页创建独立的页表项。
+*/
 static int pgmShwGetEPTPDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, PEPTPDPT *ppPdpt, PEPTPD *ppPD)
 {
     PVMCC          pVM   = pVCpu->CTX_SUFF(pVM);
@@ -1668,7 +1697,7 @@ static int pgmShwGetEPTPDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, PEPTPDPT *ppPdpt, 
     PPGMPOOLPAGE pShwPage;
     {
         const unsigned iPml4 = (GCPtr >> EPT_PML4_SHIFT) & EPT_PML4_MASK;
-        PEPTPML4E pPml4e = &pPml4->a[iPml4];
+        PEPTPML4E pPml4e = &pPml4->a[iPml4];//在 PDPT 中找到对应 GCPtr 的 PDPTE（页目录指针表项）
         EPTPML4E Pml4e;
         Pml4e.u = pPml4e->u;
         if (!(Pml4e.u & (EPT_E_PG_MASK | EPT_E_READ)))
@@ -1676,10 +1705,11 @@ static int pgmShwGetEPTPDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, PEPTPDPT *ppPdpt, 
             RTGCPTR64 GCPml4 = (RTGCPTR64)iPml4 << EPT_PML4_SHIFT;
             rc = pgmPoolAlloc(pVM, GCPml4, PGMPOOLKIND_EPT_PDPT_FOR_PHYS, PGMPOOLACCESS_DONTCARE, PGM_A20_IS_ENABLED(pVCpu),
                               pVCpu->pgm.s.CTX_SUFF(pShwPageCR3)->idx, iPml4, false /*fLockPage*/,
-                              &pShwPage);
+                              &pShwPage);//检查 PML4E 是否存在：若条目无效（无物理页或不可读），调用 pgmPoolAlloc 分配新的 PDPT 页
             AssertRCReturn(rc, rc);
 
             /* Hook up the new PDPT now. */
+            //原子更新 PML4E：将新分配的页表地址和权限（EPT_E_READ | EPT_E_WRITE | EPT_E_EXECUTE）写入 PML4E。
             ASMAtomicWriteU64(&pPml4e->u, pShwPage->Core.Key | EPT_E_READ | EPT_E_WRITE | EPT_E_EXECUTE);
         }
         else
@@ -1687,6 +1717,7 @@ static int pgmShwGetEPTPDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, PEPTPDPT *ppPdpt, 
             pShwPage = pgmPoolGetPage(pPool, pPml4e->u & EPT_PML4E_PG_MASK);
             AssertReturn(pShwPage, VERR_PGM_POOL_GET_PAGE_FAILED);
 
+            //若条目已存在，通过 pgmPoolCacheUsed 标记页表为“已使用”，避免被过早回收。
             pgmPoolCacheUsed(pPool, pShwPage);
 
             /* Hook up the cached PDPT if needed (probably not given 512*512 PTs to sync). */
@@ -1700,6 +1731,7 @@ static int pgmShwGetEPTPDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, PEPTPDPT *ppPdpt, 
     /*
      * PDPT level.
      */
+    //在 PDPT 中找到对应 GCPtr 的 PDPTE（页目录指针表项）
     const unsigned iPdPt = (GCPtr >> EPT_PDPT_SHIFT) & EPT_PDPT_MASK;
     PEPTPDPT  pPdpt = (PEPTPDPT)PGMPOOL_PAGE_2_PTR_V2(pVM, pVCpu, pShwPage);
     PEPTPDPTE pPdpe = &pPdpt->a[iPdPt];
@@ -1715,7 +1747,7 @@ static int pgmShwGetEPTPDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, PEPTPDPT *ppPdpt, 
         RTGCPTR64 const GCPdPt = GCPtr & ~(RT_BIT_64(EPT_PDPT_SHIFT) - 1);
         rc = pgmPoolAlloc(pVM, GCPdPt, PGMPOOLKIND_EPT_PD_FOR_PHYS, PGMPOOLACCESS_DONTCARE, PGM_A20_IS_ENABLED(pVCpu),
                           pShwPage->idx, iPdPt, false /*fLockPage*/,
-                          &pShwPage);
+                          &pShwPage);//若 PDPTE 无效，分配新的 PD 页
         AssertRCReturn(rc, rc);
 
         /* Hook up the new PD now. */
@@ -4069,11 +4101,13 @@ VMMDECL(int) PGMRegisterStringFormatTypes(void)
  * This should be called at module unload time or in some other manner that
  * ensure that it's called exactly one time.
  */
+//注销字符串格式类型的函数实现
 VMMDECL(void) PGMDeregisterStringFormatTypes(void)
 {
+    //仅在非R0模式或启用日志(LOG_ENABLED)时执行注销操作
 #if !defined(IN_R0) || defined(LOG_ENABLED)
     for (unsigned i = 0; i < RT_ELEMENTS(g_aPgmFormatTypes); i++)
-        RTStrFormatTypeDeregister(g_aPgmFormatTypes[i].szType);
+        RTStrFormatTypeDeregister(g_aPgmFormatTypes[i].szType);//调用RTStrFormatTypeDeregister逐个注销已注册的字符串格式类型
 #endif
 }
 
@@ -4092,8 +4126,10 @@ VMMDECL(void) PGMDeregisterStringFormatTypes(void)
  * @param   cr3     The current guest CR3 register value.
  * @param   cr4     The current guest CR4 register value.
  */
+//处理CR3寄存器更新
 VMMDECL(unsigned) PGMAssertCR3(PVMCC pVM, PVMCPUCC pVCpu, uint64_t cr3, uint64_t cr4)
 {
+    //使用STAM_PROFILE_START/STOP宏记录CR3同步操作的耗时统计,统计信息存储在pVCpu->pgm.s.Stats结构体中
     STAM_PROFILE_START(&pVCpu->pgm.s.Stats.CTX_MID_Z(Stat,SyncCR3), a);
 
     uintptr_t const idxBth = pVCpu->pgm.s.idxBothModeData;
@@ -4101,6 +4137,8 @@ VMMDECL(unsigned) PGMAssertCR3(PVMCC pVM, PVMCPUCC pVCpu, uint64_t cr3, uint64_t
     AssertReturn(g_aPgmBothModeData[idxBth].pfnAssertCR3, -VERR_PGM_MODE_IPE);
 
     PGM_LOCK_VOID(pVM);
+    //调用模式特定的CR3断言函数（pfnAssertCR3）
+    //操作地址空间范围为0x0到~(RTGCPTR)0（全地址空间）
     unsigned cErrors = g_aPgmBothModeData[idxBth].pfnAssertCR3(pVCpu, cr3, cr4, 0, ~(RTGCPTR)0);
     PGM_UNLOCK(pVM);
 
@@ -4119,13 +4157,15 @@ VMMDECL(unsigned) PGMAssertCR3(PVMCC pVM, PVMCPUCC pVCpu, uint64_t cr3, uint64_t
  * @remarks This can be called as part of VM-entry so we might be in the midst of
  *          switching to VMX non-root mode.
  */
+//设置客户机 EPT（Extended Page Table）基地址指针
 VMM_INT_DECL(void) PGMSetGuestEptPtr(PVMCPUCC pVCpu, uint64_t uEptPtr)
 {
     PVMCC pVM = pVCpu->CTX_SUFF(pVM);
     PGM_LOCK_VOID(pVM);
-    pVCpu->pgm.s.uEptPtr = uEptPtr;
-    pVCpu->pgm.s.pGstEptPml4R3 = 0;
-    pVCpu->pgm.s.pGstEptPml4R0 = 0;
+    pVCpu->pgm.s.uEptPtr = uEptPtr;//存储 EPT PML4 表的物理地址（Intel SDM 定义的格式），用于硬件分页（VMX_EPT_POINTER）
+    //并清空缓存的客户机 EPT PML4 表指针（R3 和 R0 模式）
+    pVCpu->pgm.s.pGstEptPml4R3 = 0;//缓存用户态（R3）可访问的客户机 EPT PML4 表虚拟地址,用于 Guest 用户进程的地址转换（GPA→HPA）
+    pVCpu->pgm.s.pGstEptPml4R0 = 0;//缓存内核态（R0）可访问的客户机 EPT PML4 表虚拟地址,用于 Guest 内核或特权指令的地址转换
     PGM_UNLOCK(pVM);
 }
 

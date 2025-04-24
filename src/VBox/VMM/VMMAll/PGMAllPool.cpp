@@ -4213,6 +4213,14 @@ void pgmPoolTrackPhysExtFreeList(PVMCC pVM, uint16_t iPhysExt)
  * @param   iPte        Page table entry
  *
  */
+//主要处理 多个影子页表项（PTE）共享同一物理页的情况
+//核心功能：将新的 影子页表索引（iShwPT）和 PTE 索引（iPte）插入到物理页的跟踪扩展链中。
+/*
+  pVM：虚拟机实例指针。
+  iPhysExt：当前物理页扩展链的起始索引。
+  iShwPT：新引用的影子页表索引。
+  iPte：新引用的页表项索引（PTE 偏移）。
+*/
 static uint16_t pgmPoolTrackPhysExtInsert(PVMCC pVM, uint16_t iPhysExt, uint16_t iShwPT, uint16_t iPte)
 {
     PGM_LOCK_ASSERT_OWNER(pVM);
@@ -4222,6 +4230,9 @@ static uint16_t pgmPoolTrackPhysExtInsert(PVMCC pVM, uint16_t iPhysExt, uint16_t
     /*
      * Special common cases.
      */
+    //快速路径处理（常见情况）
+    //优化目标：优先填充当前扩展结构（PGMPOOLPHYSEXT）的空闲槽位（aidx[1] 和 aidx[2]），避免链表遍历。
+    //性能影响：大多数情况下（引用数 ≤ 3），直接操作当前结构，无额外内存分配。
     if (paPhysExts[iPhysExt].aidx[1] == NIL_PGMPOOL_IDX)
     {
         paPhysExts[iPhysExt].aidx[1] = iShwPT;
@@ -4244,7 +4255,8 @@ static uint16_t pgmPoolTrackPhysExtInsert(PVMCC pVM, uint16_t iPhysExt, uint16_t
      * General treatment.
      */
     const uint16_t iPhysExtStart = iPhysExt;
-    unsigned cMax = 15;
+    unsigned cMax = 15;//计数器 cMax 限制最大遍历深度（15），防止无限循环。
+    //链表遍历：若当前扩展结构已满（aidx[0..2] 均非空），则通过 iNext 指针遍历链表，寻找空闲槽位。
     for (;;)
     {
         Assert(iPhysExt < pPool->cMaxPhysExts);
@@ -4262,7 +4274,7 @@ static uint16_t pgmPoolTrackPhysExtInsert(PVMCC pVM, uint16_t iPhysExt, uint16_t
             STAM_COUNTER_INC(&pVM->pgm.s.Stats.StatTrackOverflows);
             pgmPoolTrackPhysExtFreeList(pVM, iPhysExtStart);
             LogFlow(("pgmPoolTrackPhysExtInsert: overflow (1) iShwPT=%d\n", iShwPT));
-            return PGMPOOL_TD_MAKE(PGMPOOL_TD_CREFS_PHYSEXT, PGMPOOL_TD_IDX_OVERFLOWED);
+            return PGMPOOL_TD_MAKE(PGMPOOL_TD_CREFS_PHYSEXT, PGMPOOL_TD_IDX_OVERFLOWED);//链表过长（超过 15 个节点）或内存不足。
         }
 
         /* advance */
@@ -4274,13 +4286,13 @@ static uint16_t pgmPoolTrackPhysExtInsert(PVMCC pVM, uint16_t iPhysExt, uint16_t
     /*
      * Add another extent to the list.
      */
-    PPGMPOOLPHYSEXT pNew = pgmPoolTrackPhysExtAlloc(pVM, &iPhysExt);
+    PPGMPOOLPHYSEXT pNew = pgmPoolTrackPhysExtAlloc(pVM, &iPhysExt);//当链表无空闲槽位时，动态扩展链表
     if (!pNew)
     {
         STAM_COUNTER_INC(&pVM->pgm.s.Stats.StatTrackNoExtentsLeft);
         pgmPoolTrackPhysExtFreeList(pVM, iPhysExtStart);
         LogFlow(("pgmPoolTrackPhysExtInsert: pgmPoolTrackPhysExtAlloc failed iShwPT=%d\n", iShwPT));
-        return PGMPOOL_TD_MAKE(PGMPOOL_TD_CREFS_PHYSEXT, PGMPOOL_TD_IDX_OVERFLOWED);
+        return PGMPOOL_TD_MAKE(PGMPOOL_TD_CREFS_PHYSEXT, PGMPOOL_TD_IDX_OVERFLOWED); //扩展结构池（pPool->paPhysExts）无空闲节点时，同样标记为溢出。
     }
     pNew->iNext = iPhysExtStart;
     pNew->aidx[0] = iShwPT;
@@ -4301,6 +4313,15 @@ static uint16_t pgmPoolTrackPhysExtInsert(PVMCC pVM, uint16_t iPhysExt, uint16_t
  * @param   iShwPT      The shadow page table index.
  * @param   iPte        Page table entry
  */
+//用于扩展物理页跟踪引用, 主要用于处理共享物理页被多个页表项（PTE）引用的情况
+//当多个影子页表项（PTE）映射到同一个 Guest 物理页时，维护其引用关系链。
+/*
+  pVM：虚拟机实例指针。
+  pPhysPage：Guest 物理页描述符（PPGMPAGE）。
+  u16：当前跟踪描述符（PGMPOOL_TD_MAKE 生成的 16 位标记）。
+  iShwPT：引用该页的 影子页表索引。
+  iPte：引用该页的 页表项索引（PTE 偏移）。
+*/
 uint16_t pgmPoolTrackPhysExtAddref(PVMCC pVM, PPGMPAGE pPhysPage, uint16_t u16, uint16_t iShwPT, uint16_t iPte)
 {
     PGM_LOCK_VOID(pVM);
@@ -4309,31 +4330,32 @@ uint16_t pgmPoolTrackPhysExtAddref(PVMCC pVM, PPGMPAGE pPhysPage, uint16_t u16, 
         /*
          * Convert to extent list.
          */
-        Assert(PGMPOOL_TD_GET_CREFS(u16) == 1);
+        Assert(PGMPOOL_TD_GET_CREFS(u16) == 1); // 确保当前是单引用
         uint16_t iPhysExt;
-        PPGMPOOLPHYSEXT pPhysExt = pgmPoolTrackPhysExtAlloc(pVM, &iPhysExt);
+        PPGMPOOLPHYSEXT pPhysExt = pgmPoolTrackPhysExtAlloc(pVM, &iPhysExt); //分配一个物理页扩展跟踪结构（PGMPOOLPHYSEXT）。
+        //将原引用和新引用存入扩展结构。
         if (pPhysExt)
         {
             LogFlow(("pgmPoolTrackPhysExtAddref: new extent: %d:{%d, %d}\n", iPhysExt, PGMPOOL_TD_GET_IDX(u16), iShwPT));
             STAM_COUNTER_INC(&pVM->pgm.s.Stats.StatTrackAliased);
-            pPhysExt->aidx[0] = PGMPOOL_TD_GET_IDX(u16);
-            pPhysExt->apte[0] = PGM_PAGE_GET_PTE_INDEX(pPhysPage);
-            pPhysExt->aidx[1] = iShwPT;
-            pPhysExt->apte[1] = iPte;
-            u16 = PGMPOOL_TD_MAKE(PGMPOOL_TD_CREFS_PHYSEXT, iPhysExt);
+            pPhysExt->aidx[0] = PGMPOOL_TD_GET_IDX(u16); // 原影子页表索引
+            pPhysExt->apte[0] = PGM_PAGE_GET_PTE_INDEX(pPhysPage); // 原PTE索引
+            pPhysExt->aidx[1] = iShwPT;// 新影子页表索引
+            pPhysExt->apte[1] = iPte;// 新PTE索引
+            u16 = PGMPOOL_TD_MAKE(PGMPOOL_TD_CREFS_PHYSEXT, iPhysExt);// 更新标记为扩展链
         }
         else
-            u16 = PGMPOOL_TD_MAKE(PGMPOOL_TD_CREFS_PHYSEXT, PGMPOOL_TD_IDX_OVERFLOWED);
+            u16 = PGMPOOL_TD_MAKE(PGMPOOL_TD_CREFS_PHYSEXT, PGMPOOL_TD_IDX_OVERFLOWED); // 分配失败标记
     }
     else if (u16 != PGMPOOL_TD_MAKE(PGMPOOL_TD_CREFS_PHYSEXT, PGMPOOL_TD_IDX_OVERFLOWED))
     {
         /*
          * Insert into the extent list.
          */
-        u16 = pgmPoolTrackPhysExtInsert(pVM, PGMPOOL_TD_GET_IDX(u16), iShwPT, iPte);
+        u16 = pgmPoolTrackPhysExtInsert(pVM, PGMPOOL_TD_GET_IDX(u16), iShwPT, iPte);// 将新引用插入到扩展链中。
     }
     else
-        STAM_COUNTER_INC(&pVM->pgm.s.Stats.StatTrackAliasedLots);
+        STAM_COUNTER_INC(&pVM->pgm.s.Stats.StatTrackAliasedLots);// 统计溢出次数
     PGM_UNLOCK(pVM);
     return u16;
 }

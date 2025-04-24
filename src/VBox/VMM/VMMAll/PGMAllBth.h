@@ -274,6 +274,7 @@ static VBOXSTRICTRC PGM_BTH_NAME(Trap0eHandlerDoAccessHandlers)(PVMCPUCC pVCpu, 
 # endif
                                                                 )
 {
+    //PGM_WITH_PAGING true 表示 Guest 和 Shadow 均使用软件分页
 # if !PGM_WITH_PAGING(PGM_GST_TYPE, PGM_SHW_TYPE)
     GSTPDE const    PdeSrcDummy = { X86_PDE_P | X86_PDE_US | X86_PDE_RW | X86_PDE_A };
 # endif
@@ -287,10 +288,10 @@ static VBOXSTRICTRC PGM_BTH_NAME(Trap0eHandlerDoAccessHandlers)(PVMCPUCC pVCpu, 
          * Physical page access handler.
          */
 # if PGM_WITH_PAGING(PGM_GST_TYPE, PGM_SHW_TYPE)
-        // EPT/NPT 模式下的处理逻辑
+        // 普通分页模式（影子页表）下的处理逻辑
         const RTGCPHYS  GCPhysFault = pWalk->GCPhys;
 # else
-        // 普通分页模式（影子页表）下的处理逻辑
+        // EPT/NPT 模式下的处理逻辑
         const RTGCPHYS  GCPhysFault = PGM_A20_APPLY(pVCpu, (RTGCPHYS)pvFault);
 # endif
         PPGMPHYSHANDLER pCur;
@@ -301,6 +302,7 @@ static VBOXSTRICTRC PGM_BTH_NAME(Trap0eHandlerDoAccessHandlers)(PVMCPUCC pVCpu, 
             //获取处理程序类型（如PGMPHYSHANDLERKIND_WRITE）。
             PCPGMPHYSHANDLERTYPEINT const pCurType = PGMPHYSHANDLER_GET_TYPE(pVM, pCur);
 
+            //default 1
 #  ifdef PGM_SYNC_N_PAGES
             /*
              * If the region is write protected and we got a page not present fault, then sync
@@ -1837,6 +1839,7 @@ DECLINLINE(void) PGM_BTH_NAME(SyncPageWorkerTrackDeref)(PVMCPUCC pVCpu, PPGMPOOL
  * @param   pPage       Pointer to the guest page. this will be modified.
  * @param   iPTDst      The index into the shadow table.
  */
+// 跟踪脏页引用计数的关键内联函数，主要处理 EPT/影子页表模式下对 Guest 物理页的访问跟踪。
 DECLINLINE(void) PGM_BTH_NAME(SyncPageWorkerTrackAddref)(PVMCPUCC pVCpu, PPGMPOOLPAGE pShwPage, uint16_t u16,
                                                          PPGMPAGE pPage, const unsigned iPTDst)
 {
@@ -1845,25 +1848,25 @@ DECLINLINE(void) PGM_BTH_NAME(SyncPageWorkerTrackAddref)(PVMCPUCC pVCpu, PPGMPOO
     /*
      * Just deal with the simple first time here.
      */
-    if (!u16)
+    if (!u16)//首次访问标记：若页未被跟踪（u16=0），初始化脏页跟踪结构。
     {
-        STAM_COUNTER_INC(&pVM->pgm.s.Stats.StatTrackVirgin);
-        u16 = PGMPOOL_TD_MAKE(1, pShwPage->idx);
+        STAM_COUNTER_INC(&pVM->pgm.s.Stats.StatTrackVirgin);//StatTrackVirgin 计数器记录首次被跟踪的页数。
+        u16 = PGMPOOL_TD_MAKE(1, pShwPage->idx);//生成跟踪标记，包含引用计数（1）和影子页表页索引
         /* Save the page table index. */
-        PGM_PAGE_SET_PTE_INDEX(pVM, pPage, iPTDst);
+        PGM_PAGE_SET_PTE_INDEX(pVM, pPage, iPTDst);//保存 PTE 索引到 Guest 物理页描述符，用于快速定位。
     }
     else
-        u16 = pgmPoolTrackPhysExtAddref(pVM, pPage, u16, pShwPage->idx, iPTDst);
+        u16 = pgmPoolTrackPhysExtAddref(pVM, pPage, u16, pShwPage->idx, iPTDst);//处理已有跟踪标记的页，增加引用计数并可能扩展跟踪链（如多级页表共享同一物理页）
 
     /* write back */
     Log2(("SyncPageWorkerTrackAddRef: u16=%#x->%#x  iPTDst=%#x pPage=%p\n", u16, PGM_PAGE_GET_TRACKING(pPage), iPTDst, pPage));
-    PGM_PAGE_SET_TRACKING(pVM, pPage, u16);
+    PGM_PAGE_SET_TRACKING(pVM, pPage, u16);// 更新跟踪标记到页描述符
 
     /* update statistics. */
-    pVM->pgm.s.CTX_SUFF(pPool)->cPresent++;
-    pShwPage->cPresent++;
+    pVM->pgm.s.CTX_SUFF(pPool)->cPresent++;// 全局脏页计数增加
+    pShwPage->cPresent++;                  // 当前页表页的脏页计数增加
     if (pShwPage->iFirstPresent > iPTDst)
-        pShwPage->iFirstPresent = iPTDst;
+        pShwPage->iFirstPresent = iPTDst;  // 更新首个脏页项索引
 }
 
 
@@ -1995,6 +1998,7 @@ static void PGM_BTH_NAME(SyncPageWorker)(PVMCPUCC pVCpu, PSHWPTE pPteDst, RTGCPH
          * Find the ram range.
          */
         PPGMPAGE pPage;
+        // 获取 Guest 物理页信息
         int rc = pgmPhysGetPageEx(pVM, GCPhysPage, &pPage);
         if (RT_SUCCESS(rc))
         {
@@ -2027,6 +2031,8 @@ static void PGM_BTH_NAME(SyncPageWorker)(PVMCPUCC pVCpu, PSHWPTE pPteDst, RTGCPH
                      )
                )
             {
+                //若页面类型为 RAM 且需可写（如未分配或共享页），强制将其标记为可写。
+                //目的：确保后续映射操作的有效性。
                 rc = pgmPhysPageMakeWritable(pVM, pPage, GCPhysPage);
                 AssertRC(rc);
             }
@@ -2039,8 +2045,10 @@ static void PGM_BTH_NAME(SyncPageWorker)(PVMCPUCC pVCpu, PSHWPTE pPteDst, RTGCPH
 # if PGM_WITH_PAGING(PGM_GST_TYPE, PGM_SHW_TYPE)
             uint64_t fGstShwPteFlags = GST_GET_PTE_SHW_FLAGS(pVCpu, PteSrc);
 # else
+            //Guest PTE 标志
             uint64_t fGstShwPteFlags = X86_PTE_P | X86_PTE_RW | X86_PTE_US | X86_PTE_A | X86_PTE_D;
 # endif
+            //若页面无活跃处理器（如 MMIO 处理程序）
             if (!PGM_PAGE_HAS_ACTIVE_HANDLERS(pPage) || PGM_PAGE_IS_HNDL_PHYS_NOT_IN_HM(pPage))
             {
 # if PGM_WITH_PAGING(PGM_GST_TYPE, PGM_SHW_TYPE)
@@ -2058,10 +2066,17 @@ static void PGM_BTH_NAME(SyncPageWorker)(PVMCPUCC pVCpu, PSHWPTE pPteDst, RTGCPH
                  * If the page is not flagged as dirty and is writable, then make it read-only, so we can set the dirty bit
                  * when the page is modified.
                  */
+                /*
+                 * 若 Guest PTE 可写但未标记脏（!(PteSrc.u & X86_PTE_D)）：
+                     降级 Shadow PTE 为只读（SHW_PTE_SET_RO）。
+                     启用脏页跟踪标志（PGM_PTFLAGS_TRACK_DIRTY）。
+                     触发机制：后续写操作将引发 EPT Violation，由 Hypervisor 更新脏位。
+                 * */
                 else if (!(PteSrc.u & X86_PTE_D) && (PdeSrc.u & PteSrc.u & X86_PTE_RW))
                 {
                     AssertCompile(X86_PTE_RW == X86_PDE_RW);
                     STAM_COUNTER_INC(&pVCpu->pgm.s.Stats.CTX_MID_Z(Stat,DirtyPage));
+
                     SHW_PTE_SET(PteDst,
                                   fGstShwPteFlags
                                 | PGM_PAGE_GET_HCPHYS(pPage)
@@ -2073,6 +2088,8 @@ static void PGM_BTH_NAME(SyncPageWorker)(PVMCPUCC pVCpu, PSHWPTE pPteDst, RTGCPH
                 {
                     STAM_COUNTER_INC(&pVCpu->pgm.s.Stats.CTX_MID_Z(Stat,DirtyPageSkipped));
 # if PGM_SHW_TYPE == PGM_TYPE_EPT
+                    //直接组合 Guest PTE 标志（fGstShwPteFlags）和 Host 物理地址（PGM_PAGE_GET_HCPHYS）
+                    //设置 EPT 权限（读/写/执行）和内存类型（Write-Back）。
                     PteDst.u = PGM_PAGE_GET_HCPHYS(pPage)
                              | EPT_E_READ | EPT_E_WRITE | EPT_E_EXECUTE | EPT_E_MEMTYPE_WB | EPT_E_IGNORE_PAT;
 # else
@@ -2100,6 +2117,14 @@ static void PGM_BTH_NAME(SyncPageWorker)(PVMCPUCC pVCpu, PSHWPTE pPteDst, RTGCPH
             /*
              * Keep user track up to date.
              */
+            /*
+             * 新增映射：
+                 若 Shadow PTE 之前无效（!SHW_PTE_IS_P(*pPteDst)），调用 SyncPageWorkerTrackAddref 增加引用。
+               更新映射：
+                 若物理地址变化（SHW_PTE_GET_HCPHYS(*pPteDst) != SHW_PTE_GET_HCPHYS(PteDst)）：
+                 先解除旧引用（SyncPageWorkerTrackDeref）。
+                 再添加新引用（SyncPageWorkerTrackAddref）。
+             * */
             if (SHW_PTE_IS_P(PteDst))
             {
                 if (!SHW_PTE_IS_P(*pPteDst))
@@ -2124,6 +2149,7 @@ static void PGM_BTH_NAME(SyncPageWorker)(PVMCPUCC pVCpu, PSHWPTE pPteDst, RTGCPH
             if (!(PteSrc.u & X86_PTE_G))
                 pShwPage->fSeenNonGlobal = true;
 # endif
+            //原子更新 Shadow PTE
             SHW_PTE_ATOMIC_SET2(*pPteDst, PteDst);
             return;
         }
@@ -2147,6 +2173,11 @@ static void PGM_BTH_NAME(SyncPageWorker)(PVMCPUCC pVCpu, PSHWPTE pPteDst, RTGCPH
         Log2(("SyncPageWorker: deref! *pPteDst=%RX64\n", SHW_PTE_LOG64(*pPteDst)));
         PGM_BTH_NAME(SyncPageWorkerTrackDeref)(pVCpu, pShwPage, SHW_PTE_GET_HCPHYS(*pPteDst), iPTDst, GCPhysOldPage);
     }
+
+    /*
+     若 Guest PTE 无效或页面不存在，清空 Shadow PTE（SHW_PTE_ATOMIC_SET(*pPteDst, 0)）。
+     解除旧引用（SyncPageWorkerTrackDeref）。
+    */
     SHW_PTE_ATOMIC_SET(*pPteDst, 0);
 }
 
@@ -2536,6 +2567,9 @@ static int PGM_BTH_NAME(SyncPage)(PVMCPUCC pVCpu, GSTPDE PdeSrc, RTGCPTR GCPtrPa
     PEPTPD          pPDDst;
     EPTPDE          PdeDst;
 
+
+    //根据 GCPtrPage 定位 EPT 页目录中的目标 PDE。
+    //EPT PML4 → EPT PDPT → EPT PD → EPT PT，pgmShwGetEPTPDPtr 逐级遍历获取 PD 指针。
     int rc = pgmShwGetEPTPDPtr(pVCpu, GCPtrPage, NULL, &pPDDst);
     if (rc != VINF_SUCCESS)
     {
@@ -2546,14 +2580,16 @@ static int PGM_BTH_NAME(SyncPage)(PVMCPUCC pVCpu, GSTPDE PdeSrc, RTGCPTR GCPtrPa
     PdeDst = pPDDst->a[iPDDst];
 #   endif
     /* In the guest SMP case we could have blocked while another VCPU reused this page table. */
+    //可能因其他 VCPU 修改了 EPT，需返回成功让 Guest 重新执行指令，重新触发异常以获取最新状态。
     if (!SHW_PDE_IS_P(PdeDst))
     {
         AssertMsg(pVM->cCpus > 1, ("Unexpected missing PDE %RX64\n", (uint64_t)PdeDst.u));
         Log(("CPU%d: SyncPage: Pde at %RGv changed behind our back!\n", pVCpu->idCpu, GCPtrPage));
-        return VINF_SUCCESS;    /* force the instruction to be executed again. */
+        return VINF_SUCCESS;    /* force the instruction to be executed again. */// 触发指令重试
     }
 
     /* Can happen in the guest SMP case; other VCPU activated this PDE while we were blocking to handle the page fault. */
+    //若 PDE 指向 2MB 大页，跳过同步（大页权限需全局调整，或由其他逻辑处理）。
     if (SHW_PDE_IS_BIG(PdeDst))
     {
         Assert(pVM->pgm.s.fNestedPaging);
@@ -2585,14 +2621,39 @@ static int PGM_BTH_NAME(SyncPage)(PVMCPUCC pVCpu, GSTPDE PdeSrc, RTGCPTR GCPtrPa
             iPTDst = 0;
         else
             iPTDst -= PGM_SYNC_NR_PAGES / 2;
+        /*
+         * 优化逻辑：
+           围绕故障页（GCPtrPage）批量同步相邻 PTE（如 PGM_SYNC_NR_PAGES=64），减少 VM Exit 次数。
+           A20 修正：通过 PGM_A20_APPLY 处理地址回绕，确保 GPA 正确性。
+           内存不足处理：若 VM_FF_PGM_NO_MEMORY 置位，终止批量同步。
+        */
         for (; iPTDst < iPTDstEnd; iPTDst++)
         {
             if (!SHW_PTE_IS_P(pPTDst->a[iPTDst]))
             {
+                /*
+                 *
+                 * .A20 地址线修正
+                    触发场景：
+                       Guest 运行在实模式时，第21位地址线（A20）可能被禁用，需通过 PGM_A20_APPLY 屏蔽高位（如 & 0xffdfffff）。
+                       RTGCPHYS GCPhys = 0x100000; // Guest 尝试访问 1MB 以上的地址
+                       if (PGM_A20_APPLY(pVCpu, GCPhys) != GCPhys) {
+                           // A20 被禁用，地址回绕到 0x00000
+                       }
+
+                    EPT 模式必需：
+                       GPA 由硬件直接计算，需显式处理 A20，而影子页表由软件模拟，隐式处理。
+                */
+                
                 RTGCPTR GCPtrCurPage = PGM_A20_APPLY(pVCpu, (GCPtrPage & ~(RTGCPTR)(SHW_PT_MASK << SHW_PT_SHIFT))
                                                           | (iPTDst << GUEST_PAGE_SHIFT));
-
-                PGM_BTH_NAME(SyncPageWorker)(pVCpu, &pPTDst->a[iPTDst], GCPtrCurPage, pShwPage, iPTDst);
+                /*
+                  核心操作：
+                     分配物理页：若目标 PTE 未映射（P=0），分配 HPA 并更新 EPT。
+                     权限调整：根据处理程序类型（如写保护）设置 PTE 的 RW/X 位。
+                     脏页追踪：若启用（SHW_PTE_IS_TRACK_DIRTY），标记页为脏以便后续处理。
+                */
+                PGM_BTH_NAME(SyncPageWorker)(pVCpu, &pPTDst->a[iPTDst], GCPtrCurPage, pShwPage, iPTDst); // 同步PTE
                 Log2(("SyncPage: 4K+ %RGv PteSrc:{P=1 RW=1 U=1} PteDst=%08llx%s\n",
                       GCPtrCurPage,
                       SHW_PTE_LOG64(pPTDst->a[iPTDst]),
@@ -2613,7 +2674,7 @@ static int PGM_BTH_NAME(SyncPage)(PVMCPUCC pVCpu, GSTPDE PdeSrc, RTGCPTR GCPtrPa
         RTGCPTR         GCPtrCurPage = PGM_A20_APPLY(pVCpu, (GCPtrPage & ~(RTGCPTR)(SHW_PT_MASK << SHW_PT_SHIFT))
                                                           | (iPTDst << GUEST_PAGE_SHIFT));
 
-        PGM_BTH_NAME(SyncPageWorker)(pVCpu, &pPTDst->a[iPTDst], GCPtrCurPage, pShwPage, iPTDst);
+        PGM_BTH_NAME(SyncPageWorker)(pVCpu, &pPTDst->a[iPTDst], GCPtrCurPage, pShwPage, iPTDst);// 同步PTE
 
         Log2(("SyncPage: 4K  %RGv PteSrc:{P=1 RW=1 U=1}PteDst=%08llx%s\n",
               GCPtrPage,
@@ -3276,8 +3337,10 @@ static int PGM_BTH_NAME(CheckDirtyPageFault)(PVMCPUCC pVCpu, uint32_t uErr, PSHW
     /*
      * Handle big page.
      */
+    //Guest 使用大页（X86_PDE_PS 位已置）且启用了 PSE（GST_IS_PSE_ACTIVE）。
     if ((pPdeSrc->u & X86_PDE_PS) && GST_IS_PSE_ACTIVE(pVCpu))
     {
+        //Shadow PDE 同时存在（X86_PDE_P）且被标记为脏页追踪（PGM_PDFLAGS_TRACK_DIRTY）。
         if ((pPdeDst->u & (X86_PDE_P | PGM_PDFLAGS_TRACK_DIRTY)) == (X86_PDE_P | PGM_PDFLAGS_TRACK_DIRTY))
         {
             STAM_COUNTER_INC(&pVCpu->pgm.s.Stats.CTX_MID_Z(Stat,DirtyPageTrap));
@@ -3285,17 +3348,21 @@ static int PGM_BTH_NAME(CheckDirtyPageFault)(PVMCPUCC pVCpu, uint32_t uErr, PSHW
 
             /* Note: No need to invalidate this entry on other VCPUs as a stale TLB entry will not harm; write access will simply
              *       fault again and take this path to only invalidate the entry (see below). */
+            // 清除脏页追踪标志，设置 RW 位并刷新 TLB
             SHWPDE PdeDst = *pPdeDst;
             PdeDst.u &= ~(SHWUINT)PGM_PDFLAGS_TRACK_DIRTY;
             PdeDst.u |= X86_PDE_RW | X86_PDE_A;
+            //原子更新 Shadow PDE
             SHW_PDE_ATOMIC_SET2(*pPdeDst, PdeDst);
+            //刷新大页对应的 TLB 条目
             PGM_INVL_BIG_PG(pVCpu, GCPtrPage);
-            return VINF_PGM_HANDLED_DIRTY_BIT_FAULT;    /* restarts the instruction. */
+            return VINF_PGM_HANDLED_DIRTY_BIT_FAULT;    /* restarts the instruction. */// 重启 Guest 指令
         }
 
 # ifdef IN_RING0
         /* Check for stale TLB entry; only applies to the SMP guest case. */
         if (   pVM->cCpus > 1
+        //Shadow PDE 存在、可写且已访问（X86_PDE_P | X86_PDE_RW | X86_PDE_A）。
             && (pPdeDst->u & (X86_PDE_P | X86_PDE_RW | X86_PDE_A)) == (X86_PDE_P | X86_PDE_RW | X86_PDE_A))
         {
             PPGMPOOLPAGE    pShwPage = pgmPoolGetPage(pPool, pPdeDst->u & SHW_PDE_PG_MASK);
@@ -3303,6 +3370,7 @@ static int PGM_BTH_NAME(CheckDirtyPageFault)(PVMCPUCC pVCpu, uint32_t uErr, PSHW
             {
                 PSHWPT      pPTDst   = (PSHWPT)PGMPOOL_PAGE_2_PTR_V2(pVM, pVCpu, pShwPage);
                 PSHWPTE     pPteDst  = &pPTDst->a[(GCPtrPage >> SHW_PT_SHIFT) & SHW_PT_MASK];
+                //若对应 Shadow PTE 仍可写（SHW_PTE_IS_P_RW），说明其他 CPU 的 TLB 缓存了旧的可写条目，需刷新该页的 TLB（PGM_INVL_PG）。
                 if (SHW_PTE_IS_P_RW(*pPteDst))
                 {
                     /* Stale TLB entry. */
