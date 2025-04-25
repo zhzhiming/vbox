@@ -983,7 +983,7 @@ VMM_INT_DECL(VBOXSTRICTRC) EMInterpretInstruction(PVMCPUCC pVCpu)
     VBOXSTRICTRC rc = IEMExecOneBypassEx(pVCpu, NULL /*pcbWritten*/);
     if (RT_UNLIKELY(   rc == VERR_IEM_ASPECT_NOT_IMPLEMENTED
                     || rc == VERR_IEM_INSTR_NOT_IMPLEMENTED))
-        rc = VERR_EM_INTERPRETER;
+        rc = VERR_EM_INTERPRETER;//模拟失败，需切换至原始模拟模式
     if (rc != VINF_SUCCESS)
         Log(("EMInterpretInstruction: returns %Rrc\n", VBOXSTRICTRC_VAL(rc)));
 

@@ -981,6 +981,14 @@ DECLINLINE(uint64_t) pgmGetCr3MaskForMode(PGMMODE enmMode, PGMSLAT enmSlatMode)
  * @param   pVCpu   The cross context virtual CPU structure.
  * @param   uCr3    The raw guest CR3 value.
  */
+//处理客户机CR3寄存器掩码操作
+//硬件兼容性：通过掩码过滤确保CR3值符合CPU规范，避免触发无效页表错误
+/*
+函数通过enmGuestMode和enmGuestSlatMode区分以下场景：
+  传统分页（32位）‌：CR3低12位保留，掩码为0xFFFFF000
+  PAE分页：CR3低5位保留（指向PDPT），掩码为0xFFFFFFFFFFFFFFE0
+  EPT/NPT：掩码可能包含更多保留位（如AMD的NPT特性）
+*/
 DECLINLINE(RTGCPHYS) pgmGetGuestMaskedCr3(PVMCPUCC pVCpu, uint64_t uCr3)
 {
     uint64_t const fCr3Mask  = pgmGetCr3MaskForMode(pVCpu->pgm.s.enmGuestMode, pVCpu->pgm.s.enmGuestSlatMode);
@@ -1000,6 +1008,7 @@ DECLINLINE(RTGCPHYS) pgmGetGuestMaskedCr3(PVMCPUCC pVCpu, uint64_t uCr3)
  * @param   pCtx        Pointer to the register context for the CPU.
  * @param   pvFault     The fault address.
  */
+//客户机页错误（Page Fault，#PF，异常号0x0E）‌的核心处理器，负责协调硬件辅助虚拟化（如EPT/NPT）与软件模拟的交互
 VMMDECL(int) PGMTrap0eHandler(PVMCPUCC pVCpu, RTGCUINT uErr, PCPUMCTX pCtx, RTGCPTR pvFault)
 {
     PVMCC pVM = pVCpu->CTX_SUFF(pVM);
@@ -1009,6 +1018,7 @@ VMMDECL(int) PGMTrap0eHandler(PVMCPUCC pVCpu, RTGCUINT uErr, PCPUMCTX pCtx, RTGC
     STAM_STATS({ pVCpu->pgmr0.s.pStatTrap0eAttributionR0 = NULL; } );
 
 
+    //通过STAM_COUNTER记录不同触发原因（如写保护、保留位触发、NXE等）的页错误次数
 # ifdef VBOX_WITH_STATISTICS
     /*
      * Error code stats.
@@ -1056,7 +1066,7 @@ VMMDECL(int) PGMTrap0eHandler(PVMCPUCC pVCpu, RTGCUINT uErr, PCPUMCTX pCtx, RTGC
     AssertReturn(idxBth < RT_ELEMENTS(g_aPgmBothModeData), VERR_PGM_MODE_IPE);
     AssertReturn(g_aPgmBothModeData[idxBth].pfnTrap0eHandler, VERR_PGM_MODE_IPE);
     bool fLockTaken = false;
-    int rc = g_aPgmBothModeData[idxBth].pfnTrap0eHandler(pVCpu, uErr, pCtx, pvFault, &fLockTaken);
+    int rc = g_aPgmBothModeData[idxBth].pfnTrap0eHandler(pVCpu, uErr, pCtx, pvFault, &fLockTaken);//通过STAM_COUNTER记录不同触发原因（如写保护、保留位触发、NXE等）的页错误次数4。
     if (fLockTaken)
     {
         PGM_LOCK_ASSERT_OWNER(pVM);
@@ -1069,18 +1079,18 @@ VMMDECL(int) PGMTrap0eHandler(PVMCPUCC pVCpu, RTGCUINT uErr, PCPUMCTX pCtx, RTGC
      */
     if (rc != VINF_SUCCESS)
     {
-        if (rc == VINF_PGM_SYNCPAGE_MODIFIED_PDE)
+        if (rc == VINF_PGM_SYNCPAGE_MODIFIED_PDE)// PDE被修改，需同步
             rc = VINF_SUCCESS;
 
         /* Note: hack alert for difficult to reproduce problem. */
-        if (    rc == VERR_PAGE_NOT_PRESENT                 /* SMP only ; disassembly might fail. */
+        if (    rc == VERR_PAGE_NOT_PRESENT                 /* SMP only ; disassembly might fail. */// 页表缺失（SMP竞争）
             ||  rc == VERR_PAGE_TABLE_NOT_PRESENT           /* seen with UNI & SMP */
             ||  rc == VERR_PAGE_DIRECTORY_PTR_NOT_PRESENT   /* seen with SMP */
             ||  rc == VERR_PAGE_MAP_LEVEL4_NOT_PRESENT)     /* precaution */
         {
             Log(("WARNING: Unexpected VERR_PAGE_TABLE_NOT_PRESENT (%d) for page fault at %RGv error code %x (rip=%RGv)\n", rc, pvFault, uErr, pCtx->rip));
             /* Some kind of inconsistency in the SMP case; it's safe to just execute the instruction again; not sure about single VCPU VMs though. */
-            rc = VINF_SUCCESS;
+            rc = VINF_SUCCESS;// 安全重试
         }
     }
 
@@ -1136,13 +1146,19 @@ VMMDECL(int) PGMPrefetchPage(PVMCPUCC pVCpu, RTGCPTR GCPtrPage)
  * @todo    Flush page or page directory only if necessary!
  * @todo    VBOXSTRICTRC
  */
+//典型应用场景
+  //内存热更新：客户机修改页表权限（如mprotect）后触发TLB失效
+  //EPT/NPT同步：硬件虚拟化环境下，客户机页表变更需同步至主机EPT/NPT
+  //设备模拟：MMIO区域映射变更时确保地址翻译一致性
+
+//Guest Context Pointe） RTGCPTR
 VMMDECL(int) PGMInvalidatePage(PVMCPUCC pVCpu, RTGCPTR GCPtrPage)
 {
     PVMCC pVM = pVCpu->CTX_SUFF(pVM);
     int rc;
     Log3(("PGMInvalidatePage: GCPtrPage=%RGv\n", GCPtrPage));
 
-    IEMTlbInvalidatePage(pVCpu, GCPtrPage);
+    IEMTlbInvalidatePage(pVCpu, GCPtrPage);//清除指定虚拟地址（GCPtrPage）的TLB缓存条目
 
     /*
      * Call paging mode specific worker.
@@ -1152,7 +1168,7 @@ VMMDECL(int) PGMInvalidatePage(PVMCPUCC pVCpu, RTGCPTR GCPtrPage)
 
     uintptr_t const idxBth = pVCpu->pgm.s.idxBothModeData;
     AssertReturnStmt(idxBth < RT_ELEMENTS(g_aPgmBothModeData), PGM_UNLOCK(pVM), VERR_PGM_MODE_IPE);
-    AssertReturnStmt(g_aPgmBothModeData[idxBth].pfnInvalidatePage, PGM_UNLOCK(pVM), VERR_PGM_MODE_IPE);
+    AssertReturnStmt(g_aPgmBothModeData[idxBth].pfnInvalidatePage, PGM_UNLOCK(pVM), VERR_PGM_MODE_IPE);//调用当前分页模式对应的pfnInvalidatePage回调函数，更新影子页表或EPT/NPT结构
     rc = g_aPgmBothModeData[idxBth].pfnInvalidatePage(pVCpu, GCPtrPage);
 
     PGM_UNLOCK(pVM);
@@ -1176,6 +1192,15 @@ VMMDECL(int) PGMInvalidatePage(PVMCPUCC pVCpu, RTGCPTR GCPtrPage)
  * @param   pVCpu       The cross context virtual CPU structure.
  * @param   pvFault     Fault address.
  */
+/*
+  特权指令模拟：如客户机执行CPUID或WRMSR时触发VMExit，由该函数处理
+  内存访问异常：当客户机访问未映射内存时，尝试通过模拟修复页表, or MMIO
+  调试支持：记录异常指令地址以辅助问题诊断
+
+VINF_SUCCESS	               指令成功模拟执行
+VERR_EM_INTERPRETER	           模拟失败，需切换至原始模拟模式
+VINF_EM_RAW_EMULATE_INSTR	   触发原始模拟流程（如二进制翻译或硬件辅助虚拟化）
+*/
 VMMDECL(VBOXSTRICTRC) PGMInterpretInstruction(PVMCPUCC pVCpu, RTGCPTR pvFault)
 {
     RT_NOREF(pvFault);
@@ -1228,12 +1253,19 @@ VMMDECL(int) PGMShwGetPage(PVMCPUCC pVCpu, RTGCPTR GCPtr, uint64_t *pfFlags, PRT
  * @param   fOpFlags    A combination of the PGM_MK_PK_XXX flags.
  * @remark  You must use PGMMapModifyPage() for pages in a mapping.
  */
+//通过fFlags和fMask参数动态更新页表项（PTE）的权限标志
+/*
+典型应用场景
+  内存虚拟化：在影子页表中动态调整客户机页表权限（如模拟缺页异常）
+  设备模拟：为MMIO区域设置特殊权限（PGM_MK_PG_IS_MMIO2）
+
+ * */
 DECLINLINE(int) pdmShwModifyPage(PVMCPUCC pVCpu, RTGCPTR GCPtr, uint64_t fFlags, uint64_t fMask, uint32_t fOpFlags)
 {
     AssertMsg(!(fFlags & X86_PTE_PAE_PG_MASK), ("fFlags=%#llx\n", fFlags));
     Assert(!(fOpFlags & ~(PGM_MK_PG_IS_MMIO2 | PGM_MK_PG_IS_WRITE_FAULT)));
 
-    GCPtr &= ~(RTGCPTR)GUEST_PAGE_OFFSET_MASK; /** @todo this ain't necessary, right... */
+    GCPtr &= ~(RTGCPTR)GUEST_PAGE_OFFSET_MASK; /** @todo this ain't necessary, right... *///确保客户机虚拟地址按页对齐
 
     PVMCC pVM = pVCpu->CTX_SUFF(pVM);
     PGM_LOCK_VOID(pVM);
@@ -1314,35 +1346,36 @@ VMMDECL(int) PGMShwMakePageNotPresent(PVMCPUCC pVCpu, RTGCPTR GCPtr, uint32_t fO
  *                      We ASSUME 4KB pages backing the big page here!
  * @param   fOpFlags    A combination of the PGM_MK_PG_XXX flags.
  */
-int pgmShwMakePageSupervisorAndWritable(PVMCPUCC pVCpu, RTGCPTR GCPtr, bool fBigPage, uint32_t fOpFlags)
+//将指定内存页标记为超级用户可写（Supervisor + Writable）
+int pgmshwmakepagesupervisorandwritable(pvmcpucc pvcpu, rtgcptr gcptr, bool fbigpage, uint32_t fopflags)
 {
-    int rc = pdmShwModifyPage(pVCpu, GCPtr, X86_PTE_RW, ~(uint64_t)X86_PTE_US, fOpFlags);
-    if (rc == VINF_SUCCESS && fBigPage)
+    int rc = pdmshwmodifypage(pvcpu, gcptr, x86_pte_rw, ~(uint64_t)x86_pte_us, fopflags);//设置页表项的X86_PTE_RW（可写）标志位，同时清除X86_PTE_US（用户态访问）标志
+    if (rc == vinf_success && fbigpage)
     {
         /* this is a bit ugly... */
-        switch (pVCpu->pgm.s.enmShadowMode)
+        switch (pvcpu->pgm.s.enmshadowmode)
         {
-            case PGMMODE_32_BIT:
+            case pgmmode_32_bit:
             {
-                PX86PDE pPde = pgmShwGet32BitPDEPtr(pVCpu, GCPtr);
-                AssertReturn(pPde, VERR_INTERNAL_ERROR_3);
-                Log(("pgmShwMakePageSupervisorAndWritable: PDE=%#llx", pPde->u));
-                pPde->u |= X86_PDE_RW;
-                Log(("-> PDE=%#llx (32)\n", pPde->u));
+                px86pde ppde = pgmshwget32bitpdeptr(pvcpu, gcptr);
+                assertreturn(ppde, verr_internal_error_3);
+                log(("pgmshwmakepagesupervisorandwritable: pde=%#llx", ppde->u));
+                ppde->u |= x86_pde_rw;
+                log(("-> pde=%#llx (32)\n", ppde->u));
                 break;
             }
-            case PGMMODE_PAE:
-            case PGMMODE_PAE_NX:
+            case pgmmode_pae:
+            case pgmmode_pae_nx:
             {
-                PX86PDEPAE pPde = pgmShwGetPaePDEPtr(pVCpu, GCPtr);
-                AssertReturn(pPde, VERR_INTERNAL_ERROR_3);
-                Log(("pgmShwMakePageSupervisorAndWritable: PDE=%#llx", pPde->u));
-                pPde->u |= X86_PDE_RW;
-                Log(("-> PDE=%#llx (PAE)\n", pPde->u));
+                px86pdepae ppde = pgmshwgetpaepdeptr(pvcpu, gcptr);
+                assertreturn(ppde, verr_internal_error_3);
+                log(("pgmshwmakepagesupervisorandwritable: pde=%#llx", ppde->u));
+                ppde->u |= x86_pde_rw;
+                log(("-> pde=%#llx (pae)\n", ppde->u));
                 break;
             }
             default:
-                AssertFailedReturn(VERR_INTERNAL_ERROR_4);
+                assertfailedreturn(verr_internal_error_4);
         }
     }
     return rc;
@@ -1485,6 +1518,12 @@ DECLINLINE(int) pgmShwGetPaePoolPagePD(PVMCPUCC pVCpu, RTGCPTR GCPtr, PPGMPOOLPA
  * @param   uGstPdpe    Guest PDPT entry (valid).
  * @param   ppPD        Receives address of page directory
  */
+//确保客户机（Guest）的页表结构在影子页表（Shadow Page Table）或嵌套分页（Nested Paging）模式下正确映射
+/*
+  遍历客户机 PML4（最高级页表），检查或分配对应的影子页表项。
+  处理 PDPT（第二级页表），确保其正确映射到主机（Host）物理内存。
+  返回最终的页目录指针（ppPD），供后续页表操作使用。
+*/
 static int pgmShwSyncLongModePDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, X86PGPAEUINT uGstPml4e, X86PGPAEUINT uGstPdpe, PX86PDPAE *ppPD)
 {
     PVMCC          pVM           = pVCpu->CTX_SUFF(pVM);
@@ -1500,14 +1539,14 @@ static int pgmShwSyncLongModePDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, X86PGPAEUINT
     PPGMPOOLPAGE pShwPage;
     {
         const unsigned     iPml4  = (GCPtr >> X86_PML4_SHIFT) & X86_PML4_MASK;
-        PX86PML4E          pPml4e = pgmShwGetLongModePML4EPtr(pVCpu, iPml4);
+        PX86PML4E          pPml4e = pgmShwGetLongModePML4EPtr(pVCpu, iPml4);//获取客户机 PML4 表项。
         AssertReturn(pPml4e, VERR_PGM_PML4_MAPPING);
         X86PGPAEUINT const uPml4e = pPml4e->u;
 
         /* Allocate page directory pointer table if not present. */
         if (uPml4e & (X86_PML4E_P | X86_PML4E_PG_MASK))
         {
-            pShwPage = pgmPoolGetPage(pPool, uPml4e & X86_PML4E_PG_MASK);
+            pShwPage = pgmPoolGetPage(pPool, uPml4e & X86_PML4E_PG_MASK);//若 PML4 表项有效（X86_PML4E_P 标志位已设置），则从页池（pPool）中获取对应的影子页表页
             AssertReturn(pShwPage, VERR_PGM_POOL_GET_PAGE_FAILED);
 
             pgmPoolCacheUsed(pPool, pShwPage);
@@ -1541,7 +1580,7 @@ static int pgmShwSyncLongModePDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, X86PGPAEUINT
             /* Create a reference back to the PDPT by using the index in its shadow page. */
             rc = pgmPoolAlloc(pVM, GCPml4, enmKind, PGMPOOLACCESS_DONTCARE, PGM_A20_IS_ENABLED(pVCpu),
                               pVCpu->pgm.s.CTX_SUFF(pShwPageCR3)->idx, iPml4, false /*fLockPage*/,
-                              &pShwPage);
+                              &pShwPage);//若无效（如首次访问），则调用 pgmPoolAlloc 动态分配新的页池项：
             AssertRCReturn(rc, rc);
 
             /* Hook it up. */
@@ -1554,13 +1593,14 @@ static int pgmShwSyncLongModePDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, X86PGPAEUINT
      * PDPT.
      */
     const unsigned     iPdPt = (GCPtr >> X86_PDPT_SHIFT) & X86_PDPT_MASK_AMD64;
-    PX86PDPT           pPdpt = (PX86PDPT)PGMPOOL_PAGE_2_PTR_V2(pVM, pVCpu, pShwPage);
+    PX86PDPT           pPdpt = (PX86PDPT)PGMPOOL_PAGE_2_PTR_V2(pVM, pVCpu, pShwPage);//将页池页转换为可操作的主机虚拟地址。
     PX86PDPE           pPdpe = &pPdpt->a[iPdPt];
     X86PGPAEUINT const uPdpe = pPdpe->u;
 
     /* Allocate page directory if not present. */
-    if (uPdpe & (X86_PDPE_P | X86_PDPE_PG_MASK))
+    if (uPdpe & (X86_PDPE_P | X86_PDPE_PG_MASK))//检查 PDPT 表项是否有效（X86_PDPE_P 标志位）
     {
+        //若有效，直接从页池获取影子页表页。
         pShwPage = pgmPoolGetPage(pPool, uPdpe & X86_PDPE_PG_MASK);
         AssertReturn(pShwPage, VERR_PGM_POOL_GET_PAGE_FAILED);
 
@@ -1593,7 +1633,7 @@ static int pgmShwSyncLongModePDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, X86PGPAEUINT
         /* Create a reference back to the PDPT by using the index in its shadow page. */
         rc = pgmPoolAlloc(pVM, GCPdPt, enmKind, PGMPOOLACCESS_DONTCARE, PGM_A20_IS_ENABLED(pVCpu),
                           pShwPage->idx, iPdPt, false /*fLockPage*/,
-                          &pShwPage);
+                          &pShwPage);//若无效，分配新页并更新表项：
         AssertRCReturn(rc, rc);
 
         /* Hook it up. */
@@ -1601,7 +1641,7 @@ static int pgmShwSyncLongModePDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, X86PGPAEUINT
                           pShwPage->Core.Key | (uGstPdpe & pVCpu->pgm.s.fGstAmd64ShadowedPdpeMask) | (uPdpe & PGM_PDPT_FLAGS));
     }
 
-    *ppPD = (PX86PDPAE)PGMPOOL_PAGE_2_PTR_V2(pVM, pVCpu, pShwPage);
+    *ppPD = (PX86PDPAE)PGMPOOL_PAGE_2_PTR_V2(pVM, pVCpu, pShwPage);// 页目录指针（PD）的主机虚拟地址
     return VINF_SUCCESS;
 }
 
@@ -1616,6 +1656,25 @@ static int pgmShwSyncLongModePDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, X86PGPAEUINT
  * @param   ppPdpt      Receives the address of the page directory pointer table.
  * @param   ppPD        Receives the address of the page directory.
  */
+//用于在64位模式下获取指定虚拟地址对应的页目录指针
+/// 64位分页结构
+//GCPtr -> PML4 -> PDPT -> PD -> PT -> 物理页
+//设计借鉴了Linux内核的页表管理思想，但针对虚拟化场景做了特殊优化
+/*
+  typedef struct PGM_POOL_PAGE {
+      uint32_t        idx;          // 页池索引
+      RTGCPHYS        GCPhys;       // 客户机物理地址
+      void           *pvPage;       // 主机虚拟地址指针
+      uint16_t        cPresent;     // 当前引用计数
+  } PGM_POOL_PAGE;
+
+  当启用EPT时，CPU通过硬件自动完成GPA→ HPA转换，通常不需要软件干预页表遍历过程
+  但某些特殊场景（如模拟MMIO设备或调试功能）仍可能调用该函数获取客户机页表信息
+
+  返回VERR_PGM_POOL_GET_PAGE_FAILED错误码后，上层调用者会触发：
+      pgmPoolAllocDirtyPage强制刷新页池缓存
+      pgmR3PoolGrow扩展页池容量（默认上限为16MB）
+*/
 DECLINLINE(int) pgmShwGetLongModePDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, PX86PML4E *ppPml4e, PX86PDPT *ppPdpt, PX86PDPAE *ppPD)
 {
     PVMCC pVM = pVCpu->CTX_SUFF(pVM);
@@ -1624,8 +1683,8 @@ DECLINLINE(int) pgmShwGetLongModePDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, PX86PML4
     /*
      * PML4
      */
-    const unsigned  iPml4 = (GCPtr >> X86_PML4_SHIFT) & X86_PML4_MASK;
-    PCX86PML4E      pPml4e = pgmShwGetLongModePML4EPtr(pVCpu, iPml4);
+    const unsigned  iPml4 = (GCPtr >> X86_PML4_SHIFT) & X86_PML4_MASK;//从虚拟地址中提取PML4索引（39-47位）
+    PCX86PML4E      pPml4e = pgmShwGetLongModePML4EPtr(pVCpu, iPml4);//获取PML4E指针
     AssertReturn(pPml4e, VERR_PGM_PML4_MAPPING);
     if (ppPml4e)
         *ppPml4e = (PX86PML4E)pPml4e;
@@ -1641,8 +1700,8 @@ DECLINLINE(int) pgmShwGetLongModePDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, PX86PML4
     /*
      * PDPT
      */
-    const unsigned      iPdPt = (GCPtr >> X86_PDPT_SHIFT) & X86_PDPT_MASK_AMD64;
-    PCX86PDPT           pPdpt = *ppPdpt = (PX86PDPT)PGMPOOL_PAGE_2_PTR_V2(pVM, pVCpu, pShwPage);
+    const unsigned      iPdPt = (GCPtr >> X86_PDPT_SHIFT) & X86_PDPT_MASK_AMD64;//从虚拟地址中提取PDPT索引（30-38位）
+    PCX86PDPT           pPdpt = *ppPdpt = (PX86PDPT)PGMPOOL_PAGE_2_PTR_V2(pVM, pVCpu, pShwPage);//通过页池（pPool）获取对应的PDPT指针
     X86PGPAEUINT const  uPdpe = pPdpt->a[iPdPt].u;
     if (!(uPdpe & X86_PDPE_P)) /** @todo other code is check for NULL page frame number! */
         return VERR_PAGE_DIRECTORY_PTR_NOT_PRESENT;
@@ -1650,7 +1709,8 @@ DECLINLINE(int) pgmShwGetLongModePDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, PX86PML4
     pShwPage = pgmPoolGetPage(pPool, uPdpe & X86_PDPE_PG_MASK);
     AssertReturn(pShwPage, VERR_PGM_POOL_GET_PAGE_FAILED);
 
-    *ppPD = (PX86PDPAE)PGMPOOL_PAGE_2_PTR_V2(pVM, pVCpu, pShwPage);
+    // 将页池页转换为实际指针
+    *ppPD = (PX86PDPAE)PGMPOOL_PAGE_2_PTR_V2(pVM, pVCpu, pShwPage);//通过页池获取最终的页目录指针（PD）
     Log4(("pgmShwGetLongModePDPtr %RGv -> *ppPD=%p PDE=%p/%RX64\n", GCPtr, *ppPD, &(*ppPD)->a[(GCPtr >> X86_PD_PAE_SHIFT) & X86_PD_PAE_MASK], (*ppPD)->a[(GCPtr >> X86_PD_PAE_SHIFT) & X86_PD_PAE_MASK].u));
     return VINF_SUCCESS;
 }
@@ -1674,9 +1734,9 @@ DECLINLINE(int) pgmShwGetLongModePDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, PX86PML4
 */
 /*
 此函数在以下情况下被调用：
-   EPT Violation 处理‌：当客户机访问未映射的虚拟地址时，触发 EPT 异常，需动态构建页表。
-   预填充页表‌：在虚拟机启动或内存热插拔时，预先分配必要的页表结构。
-   写时复制（COW）‌：修改只读页时，需为新页创建独立的页表项。
+   EPT Violation 处理：当客户机访问未映射的虚拟地址时，触发 EPT 异常，需动态构建页表。
+   预填充页表：在虚拟机启动或内存热插拔时，预先分配必要的页表结构。
+   写时复制（COW）：修改只读页时，需为新页创建独立的页表项。
 */
 static int pgmShwGetEPTPDPtr(PVMCPUCC pVCpu, RTGCPTR64 GCPtr, PEPTPDPT *ppPdpt, PEPTPD *ppPD)
 {
@@ -1984,16 +2044,27 @@ VMMDECL(int) PGMGstGetPage(PVMCPUCC pVCpu, RTGCPTR GCPtr, PPGMPTWALK pWalk)
  * @param   pWalk       Where to store the page walk information.
  * @thread  EMT(pVCpu)
  */
+//快速查询客户机页表项（Page Table Entry）
+/*
+  应用场景：
+    客户机内存访问模拟（如 #PF 异常处理）
+    虚拟化层（VMM）需要获取客户机页表属性（如可写性、可执行性）时
+
+  GCPtr	    RTGCPTR	        客户机虚拟地址，需查询的目标地址
+  fFlags	uint32_t	    查询标志（如 PGMQPAGE_F_WRITE、PGMQPAGE_F_EXECUTE），控制页表项校验逻辑
+  pWalk	    PPGMPTWALKFAST	输出参数，存储页表遍历结果（如物理地址、页属性)
+
+*/
 VMM_INT_DECL(int) PGMGstQueryPageFast(PVMCPUCC pVCpu, RTGCPTR GCPtr, uint32_t fFlags, PPGMPTWALKFAST pWalk)
 {
     VMCPU_ASSERT_EMT(pVCpu);
     Assert(pWalk);
     Assert(!(fFlags & ~(PGMQPAGE_F_VALID_MASK)));
-    Assert(!(fFlags & PGMQPAGE_F_EXECUTE) || !(fFlags & PGMQPAGE_F_WRITE));
-    uintptr_t idx = pVCpu->pgm.s.idxGuestModeData;
+    Assert(!(fFlags & PGMQPAGE_F_EXECUTE) || !(fFlags & PGMQPAGE_F_WRITE));//不可同时请求 EXECUTE 和 WRITE 权限
+    uintptr_t idx = pVCpu->pgm.s.idxGuestModeData;// 获取当前客户机页表模式索引
     AssertReturn(idx < RT_ELEMENTS(g_aPgmGuestModeData), VERR_PGM_MODE_IPE);
     AssertReturn(g_aPgmGuestModeData[idx].pfnGetPage, VERR_PGM_MODE_IPE);
-    return g_aPgmGuestModeData[idx].pfnQueryPageFast(pVCpu, GCPtr, fFlags, pWalk);
+    return g_aPgmGuestModeData[idx].pfnQueryPageFast(pVCpu, GCPtr, fFlags, pWalk);//完成实际页表遍历
 }
 
 
@@ -2005,15 +2076,18 @@ VMM_INT_DECL(int) PGMGstQueryPageFast(PVMCPUCC pVCpu, RTGCPTR GCPtr, uint32_t fF
  * @param   GCPhysCr3       The guest CR3 value.
  * @param   pHCPtrGuestCr3  Where to store the mapped memory.
  */
+//映射客户机 CR3 寄存器指向的页表到 Host 虚拟地址空间
 DECLINLINE(int) pgmGstMapCr3(PVMCPUCC pVCpu, RTGCPHYS GCPhysCr3, PRTHCPTR pHCPtrGuestCr3)
 {
     /** @todo this needs some reworking wrt. locking?  */
     PVMCC pVM = pVCpu->CTX_SUFF(pVM);
     PGM_LOCK_VOID(pVM);
-    PPGMPAGE pPageCr3 = pgmPhysGetPage(pVM, GCPhysCr3);
+    PPGMPAGE pPageCr3 = pgmPhysGetPage(pVM, GCPhysCr3);//根据客户机物理地址 GCPhysCr3 查找对应的 页表项（PPGMPAGE）
     AssertReturnStmt(pPageCr3, PGM_UNLOCK(pVM), VERR_PGM_INVALID_CR3_ADDR);
 
     RTHCPTR HCPtrGuestCr3;
+    //将客户机物理地址 GCPhysCr3 映射到 Host 的虚拟地址 HCPtrGuestCr3
+    //可能涉及 页表遍历、EPT/NPT 转换、内存映射等操作。
     int rc = pgmPhysGCPhys2CCPtrInternalDepr(pVM, pPageCr3, GCPhysCr3, (void **)&HCPtrGuestCr3);
     PGM_UNLOCK(pVM);
 
@@ -2148,7 +2222,11 @@ static int pgmGstSlatWalk(PVMCPUCC pVCpu, RTGCPHYS GCPhysNested, bool fIsLinearA
  * @returns VBox status code.
  * @retval  VINF_SUCCESS on success.
  * @retval  VERR_PAGE_TABLE_NOT_PRESENT on failure.  Check pWalk for details.
- * @retval  VERR_PGM_NOT_USED_IN_MODE if not paging isn't enabled. @a pWalk is
+ * @retval  VERR_PGM_NOT_USED_IN_MODE if not paging isn't enabled. @a pW局部性优化‌：针对‌连续虚拟地址访问‌（如数组遍历），跳过重复的页表查询13。
+‌减少 VM-Exit‌：在虚拟化环境中避免因页表遍历频繁触发宿主干预16。
+‌(2) 关键优化点‌
+‌相邻页快速路径‌：
+若新地址 GCPtr 与上一次成功遍历地址相差 GUEST_PAGE_SIZE，且页表项标志位（如 RW/US/NX）未变化，直接复用上一 PTE 或 PDEalk is
  *          not valid, except enmType is PGMPTWALKGSTTYPE_INVALID.
  *
  * @param   pVCpu       The cross context virtual CPU structure of the calling EMT.
@@ -2158,13 +2236,41 @@ static int pgmGstSlatWalk(PVMCPUCC pVCpu, RTGCPHYS GCPhysNested, bool fIsLinearA
  *                      codes as well.
  * @param   pGstWalk    The guest-mode specific walk information.
  */
+//客户机页表遍历
+//用于在特定条件下快速跳过完整的页表遍历（Page Table Walk），直接获取下一个页表项的映射关系
+/*
+正常页表遍历流程‌
+    (1) 基本概念‌
+      作用：将虚拟地址（VA）转换为物理地址（PA），涉及多级页表逐层查询
+      硬件协作：MMU 自动完成地址转换，但页表内容需由操作系统维护
+    (2) 典型步骤（以 x86-64 为例）
+      顶级页表查询：
+      通过 CR3 寄存器定位 PML4（Page Map Level 4）表，根据虚拟地址高 9 位索引条目
+      下层页表遍历：
+      依次查询 PDPT（Page Directory Pointer Table）、PD（Page Directory）、PT（Page Table），每级使用虚拟地址的对应 9 位索引
+      物理地址合成：
+      最终 PTE（Page Table Entry）提供物理页基址，与虚拟地址偏移量组合成完整 PA6。
+    (3) 性能瓶颈
+      多次内存访问：每级页表查询需访问内存，导致 4 次内存读取（4 级页表）
+      TLB 未命中惩罚：若地址未缓存于 TLB，完整遍历将显著增加延迟
+
+局部性优化：针对连续虚拟地址访问（如数组遍历），跳过重复的页表查询
+  减少 VM-Exit：在虚拟化环境中避免因页表遍历频繁触发宿主干预16。
+关键优化点
+  相邻页快速路径：
+    若新地址 GCPtr 与上一次成功遍历地址相差 GUEST_PAGE_SIZE，且页表项标志位（如 RW/US/NX）未变化，直接复用上一 PTE 或 PDE
+*/
 int pgmGstPtWalkNext(PVMCPUCC pVCpu, RTGCPTR GCPtr, PPGMPTWALK pWalk, PPGMPTWALKGST pGstWalk)
 {
     /*
      * We can only handle successfully walks.
      * We also limit ourselves to the next page.
      */
+    //上一次遍历成功（fSucceeded）
     if (   pWalk->fSucceeded
+        //当客户机连续访问相邻页（GCPtr 与上一次遍历地址 pWalk->GCPtr 相差 GUEST_PAGE_SIZE）时，
+        //尝试 跳过完整页表遍历，直接复用或微调已有的页表项（PTE/PDE）信息
+        //减少因频繁页表遍历导致的 VM-Exit和 TLB 刷新开销，提升虚拟化性能
         && GCPtr - pWalk->GCPtr == GUEST_PAGE_SIZE)
     {
         Assert(pWalk->uLevel == 0);
@@ -2173,6 +2279,7 @@ int pgmGstPtWalkNext(PVMCPUCC pVCpu, RTGCPTR GCPtr, PPGMPTWALK pWalk, PPGMPTWALK
             /*
              * AMD64
              */
+            //普通 4KB 页
             if (!pWalk->fGigantPage && !pWalk->fBigPage)
             {
                 /*
@@ -2190,6 +2297,7 @@ int pgmGstPtWalkNext(PVMCPUCC pVCpu, RTGCPTR GCPtr, PPGMPTWALK pWalk, PPGMPTWALK
                     {
                         X86PTEPAE Pte;
                         Pte.u = pGstWalk->u.Amd64.pPte[1].u;
+
                         if (   (Pte.u & fPteSame) == (pGstWalk->u.Amd64.Pte.u & fPteSame)
                             && !(Pte.u & (pVCpu)->pgm.s.fGstAmd64MbzPteMask))
                         {
@@ -2208,10 +2316,13 @@ int pgmGstPtWalkNext(PVMCPUCC pVCpu, RTGCPTR GCPtr, PPGMPTWALK pWalk, PPGMPTWALK
                     {
                         X86PDEPAE Pde;
                         Pde.u = pGstWalk->u.Amd64.pPde[1].u;
+                        //比较新旧 PDE 的标志位（如 RW/US/NX），若一致则直接复用下一 PTE
                         if (   (Pde.u & fPdeSame) == (pGstWalk->u.Amd64.Pde.u & fPdeSame)
+                            //提取 PDE 中所有被must be zero掩码覆盖的位，若结果非零说明客户机非法设置了保留位
                             && !(Pde.u & (pVCpu)->pgm.s.fGstAmd64MbzPdeMask))
                         {
                             /* Get the new PTE and check out the first entry. */
+                            //此处可以理解成复用了PDE,来获取 PTE
                             int rc = PGM_GCPHYS_2_PTR_BY_VMCPU(pVCpu, PGM_A20_APPLY(pVCpu, (Pde.u & X86_PDE_PAE_PG_MASK)),
                                                                &pGstWalk->u.Amd64.pPt);
                             if (RT_SUCCESS(rc))
@@ -2222,11 +2333,12 @@ int pgmGstPtWalkNext(PVMCPUCC pVCpu, RTGCPTR GCPtr, PPGMPTWALK pWalk, PPGMPTWALK
                                 if (   (Pte.u & fPteSame) == (pGstWalk->u.Amd64.Pte.u & fPteSame)
                                     && !(Pte.u & (pVCpu)->pgm.s.fGstAmd64MbzPteMask))
                                 {
+                                    //更新 GCPhys（客户机物理地址）和 PTE 指针
                                     pWalk->GCPtr  = GCPtr;
                                     pWalk->GCPhys = Pte.u & X86_PTE_PAE_PG_MASK;
                                     pGstWalk->u.Amd64.Pte.u = Pte.u;
                                     pGstWalk->u.Amd64.Pde.u = Pde.u;
-                                    pGstWalk->u.Amd64.pPde++;
+                                    pGstWalk->u.Amd64.pPde++;// 指向下一个 PdE
                                     return VINF_SUCCESS;
                                 }
                             }
@@ -2288,14 +2400,15 @@ VMMDECL(int)  PGMGstModifyPage(PVMCPUCC pVCpu, RTGCPTR GCPtr, size_t cb, uint64_
     /*
      * Adjust input.
      */
+    //强制将操作地址和大小对齐到客户机页大小（如 4KB）
     cb     += GCPtr & GUEST_PAGE_OFFSET_MASK;
-    cb      = RT_ALIGN_Z(cb, GUEST_PAGE_SIZE);
-    GCPtr  &= ~(RTGCPTR)GUEST_PAGE_OFFSET_MASK;
+    cb      = RT_ALIGN_Z(cb, GUEST_PAGE_SIZE); 
+    GCPtr  &= ~(RTGCPTR)GUEST_PAGE_OFFSET_MASK; 
 
     /*
      * Call worker.
      */
-    uintptr_t idx = pVCpu->pgm.s.idxGuestModeData;
+    uintptr_t idx = pVCpu->pgm.s.idxGuestModeData;// 获取当前客户机分页模式索引
     AssertReturn(idx < RT_ELEMENTS(g_aPgmGuestModeData), VERR_PGM_MODE_IPE);
     AssertReturn(g_aPgmGuestModeData[idx].pfnModifyPage, VERR_PGM_MODE_IPE);
     int rc = g_aPgmGuestModeData[idx].pfnModifyPage(pVCpu, GCPtr, cb, fFlags, fMask);
@@ -2474,17 +2587,24 @@ int pgmGstLazyMapPaePD(PVMCPUCC pVCpu, uint32_t iPdpt, PX86PDPAE *ppPd)
  * @param   ppPml4      Where to return the pointer to the mapping.  This will
  *                      always be set.
  */
+//动态映射客户机的 PML4 页表（x86-64 分页架构的顶级页表），避免在客户机启动时预映射所有页表，节省内存开销
+/*
+ 触发场景:
+   当客户机首次访问 CR3 寄存器指向的 PML4 页表时，由缺页异常或页表遍历逻辑调用
+*/
 int pgmGstLazyMapPml4(PVMCPUCC pVCpu, PX86PML4 *ppPml4)
 {
-    Assert(!pVCpu->pgm.s.CTX_SUFF(pGstAmd64Pml4));
+    Assert(!pVCpu->pgm.s.CTX_SUFF(pGstAmd64Pml4)); // 确保 PML4 未映射
     PVMCC       pVM = pVCpu->CTX_SUFF(pVM);
     PGM_LOCK_VOID(pVM);
 
-    RTGCPHYS    GCPhysCR3 = pgmGetGuestMaskedCr3(pVCpu, pVCpu->pgm.s.GCPhysCR3);
+    RTGCPHYS    GCPhysCR3 = pgmGetGuestMaskedCr3(pVCpu, pVCpu->pgm.s.GCPhysCR3); //获取 CR3 物理地址
     PPGMPAGE    pPage;
-    int rc = pgmPhysGetPageEx(pVM, GCPhysCR3, &pPage);
+    //检查 PML4 页是否存在于客户机物理内存中
+    int rc = pgmPhysGetPageEx(pVM, GCPhysCR3, &pPage); // 查询物理页描述符
     if (RT_SUCCESS(rc))
     {
+        //将客户机物理地址（GCPhysCR3）转换为 Host 的虚拟地址（ppPml4），支持跨环（R0/R3）访问
         rc = pgmPhysGCPhys2CCPtrInternalDepr(pVM, pPage, GCPhysCR3, (void **)ppPml4);
         if (RT_SUCCESS(rc))
         {
@@ -2635,6 +2755,24 @@ static int pgmGstSlatTranslateCr3(PVMCPUCC pVCpu, uint64_t uCr3, PRTGCPHYS pGCPh
  * @param   cr3             The new cr3.
  * @param   fGlobal         Indicates whether this is a global flush or not.
  */
+//处理 TLB刷新的函数 PGMFlushTLB，
+//主要用于在客户机（Guest）修改 CR3 寄存器或执行 TLB 刷新指令（如 INVLPG）时更新虚拟机的页表缓存
+/*
+  触发场景：
+    客户机执行 MOV CR3, reg（切换页表基址）
+    客户机执行 INVLPG（局部 TLB 刷新）
+    嵌套分页（Nested Paging/EPT）下的 SLAT（Second-Level Address Translation）转换失败
+
+EPT 模式下是否需要主动调用 PGMFlushTLB？
+  通常不需要：
+    EPT 由硬件自动维护 Guest 的 TLB，Guest 执行 INVLPG 或 MOV CR3 时，CPU 会通过 ‌EPT-violation‌ 自动触发 TLB 刷新16。
+  例外情况：
+    若 Host 修改了 ‌EPT 页表结构‌（如动态调整内存映射），需主动调用 PGMFlushTLB 同步 Guest TLB36。
+
+  函数 PGMFlushTLB 在 EPT 下的行为
+  底层实现：
+    通过设置 VMCPU_FF_PGM_SYNC_CR3 标志，触发后续的 EPT 页表同步或 VM-Exit 处理
+*/
 VMMDECL(int) PGMFlushTLB(PVMCPUCC pVCpu, uint64_t cr3, bool fGlobal)
 {
     STAM_PROFILE_START(&pVCpu->pgm.s.Stats.CTX_MID_Z(Stat,FlushTLB), a);
@@ -2646,15 +2784,17 @@ VMMDECL(int) PGMFlushTLB(PVMCPUCC pVCpu, uint64_t cr3, bool fGlobal)
      * Always flag the necessary updates; necessary for hardware acceleration
      */
     /** @todo optimize this, it shouldn't always be necessary. */
-    VMCPU_FF_SET(pVCpu, VMCPU_FF_PGM_SYNC_CR3_NON_GLOBAL);
+    VMCPU_FF_SET(pVCpu, VMCPU_FF_PGM_SYNC_CR3_NON_GLOBAL);// 标记需要同步 CR3
+    //true：全局 TLB 刷新（如 CR3 写入）
+    //false：局部 TLB 刷新（如 INVLPG 指令）
     if (fGlobal)
-        VMCPU_FF_SET(pVCpu, VMCPU_FF_PGM_SYNC_CR3);
+        VMCPU_FF_SET(pVCpu, VMCPU_FF_PGM_SYNC_CR3);// 全局刷新标记
 
     /*
      * Remap the CR3 content and adjust the monitoring if CR3 was actually changed.
      */
     RTGCPHYS const GCPhysOldCR3 = pVCpu->pgm.s.GCPhysCR3;
-    RTGCPHYS       GCPhysCR3    = pgmGetGuestMaskedCr3(pVCpu, cr3);
+    RTGCPHYS       GCPhysCR3    = pgmGetGuestMaskedCr3(pVCpu, cr3);// 获取客户机 CR3 的物理地址
 #ifdef VBOX_WITH_NESTED_HWVIRT_VMX_EPT
     if (   pVCpu->pgm.s.enmGuestSlatMode == PGMSLAT_EPT
         && PGMMODE_WITH_PAGING(pVCpu->pgm.s.enmGuestMode))
@@ -2685,6 +2825,7 @@ VMMDECL(int) PGMFlushTLB(PVMCPUCC pVCpu, uint64_t cr3, bool fGlobal)
         AssertReturn(g_aPgmBothModeData[idxBth].pfnMapCR3, VERR_PGM_MODE_IPE);
 
         pVCpu->pgm.s.GCPhysCR3 = GCPhysCR3;
+        // 调用 pfnMapCR3 更新页表映射
         rc = g_aPgmBothModeData[idxBth].pfnMapCR3(pVCpu, GCPhysCR3);
         if (RT_LIKELY(rc == VINF_SUCCESS))
         { }
@@ -2727,9 +2868,9 @@ VMMDECL(int) PGMFlushTLB(PVMCPUCC pVCpu, uint64_t cr3, bool fGlobal)
     }
 
     if (!fGlobal)
-        IEMTlbInvalidateAll(pVCpu);
+        IEMTlbInvalidateAll(pVCpu);// 局部刷新（当前 VCPU), DUMMY in host EPT
     else
-        IEMTlbInvalidateAllGlobal(pVCpu);
+        IEMTlbInvalidateAllGlobal(pVCpu);// 全局刷新（所有 VCPU）
     STAM_PROFILE_STOP(&pVCpu->pgm.s.Stats.CTX_MID_Z(Stat,FlushTLB), a);
     return rc;
 }
@@ -2752,6 +2893,7 @@ VMMDECL(int) PGMFlushTLB(PVMCPUCC pVCpu, uint64_t cr3, bool fGlobal)
  * @param   pVCpu           The cross context virtual CPU structure.
  * @param   cr3             The new CR3.
  */
+//中处理客户机 CR3 寄存器更新的函数
 VMMDECL(int) PGMUpdateCR3(PVMCPUCC pVCpu, uint64_t cr3)
 {
     VMCPU_ASSERT_EMT(pVCpu);
@@ -2762,8 +2904,8 @@ VMMDECL(int) PGMUpdateCR3(PVMCPUCC pVCpu, uint64_t cr3)
     /*
      * Remap the CR3 content and adjust the monitoring if CR3 was actually changed.
      */
-    RTGCPHYS const GCPhysOldCR3 = pVCpu->pgm.s.GCPhysCR3;
-    RTGCPHYS       GCPhysCR3    = pgmGetGuestMaskedCr3(pVCpu, cr3);
+    RTGCPHYS const GCPhysOldCR3 = pVCpu->pgm.s.GCPhysCR3;//获取旧的 CR3 物理地址
+    RTGCPHYS       GCPhysCR3    = pgmGetGuestMaskedCr3(pVCpu, cr3);//通过 pgmGetGuestMaskedCr3 获取新的 CR3 物理地址
 #ifdef VBOX_WITH_NESTED_HWVIRT_VMX_EPT
     if (pVCpu->pgm.s.enmGuestSlatMode == PGMSLAT_EPT)
     {
@@ -2787,7 +2929,7 @@ VMMDECL(int) PGMUpdateCR3(PVMCPUCC pVCpu, uint64_t cr3)
 
     LogFlowFunc(("cr3=%RX64 old=%RX64\n", cr3, GCPhysOldCR3));
     int rc = VINF_SUCCESS;
-    if (GCPhysOldCR3 != GCPhysCR3)
+    if (GCPhysOldCR3 != GCPhysCR3)//比较新旧 CR3 值，如果不同则调用相应的映射函数（pfnMapCR3）
     {
         uintptr_t const idxBth = pVCpu->pgm.s.idxBothModeData;
         AssertReturn(idxBth < RT_ELEMENTS(g_aPgmBothModeData), VERR_PGM_MODE_IPE);
@@ -2804,7 +2946,7 @@ VMMDECL(int) PGMUpdateCR3(PVMCPUCC pVCpu, uint64_t cr3)
     else if (PGMMODE_IS_PAE(pVCpu->pgm.s.enmGuestMode))
         pgmGstFlushPaePdpes(pVCpu);
 
-    VMCPU_FF_CLEAR(pVCpu, VMCPU_FF_HM_UPDATE_CR3);
+    VMCPU_FF_CLEAR(pVCpu, VMCPU_FF_HM_UPDATE_CR3);//清除标志位
     return rc;
 }
 
@@ -3236,6 +3378,7 @@ DECLINLINE(unsigned) pgmModeToType(PGMMODE pgmMode)
  * @param   enmHostMode     The host mode.
  * @param   enmShadowMode   The current shadow mode.
  */
+//计算 影子页表（Shadow Page Table）模式
 static PGMMODE pgmCalcShadowMode(PVMCC pVM, PGMMODE enmGuestMode, SUPPAGINGMODE enmHostMode, PGMMODE enmShadowMode)
 {
     switch (enmGuestMode)
@@ -3432,6 +3575,8 @@ static PGMMODE pgmCalcShadowMode(PVMCC pVM, PGMMODE enmGuestMode, SUPPAGINGMODE 
  *                          the current mode.
  * @param   fForce          Whether to force a shadow paging mode change.
  */
+// 切换虚拟机的分页模式（Guest Paging Mode）及其关联的 影子分页模式
+// maybe not used in host EPT
 VMM_INT_DECL(int) PGMHCChangeMode(PVMCC pVM, PVMCPUCC pVCpu, PGMMODE enmGuestMode, bool fForce)
 {
     Log(("PGMHCChangeMode: Guest mode: %s -> %s\n", PGMGetModeName(pVCpu->pgm.s.enmGuestMode), PGMGetModeName(enmGuestMode)));
@@ -3656,6 +3801,7 @@ VMM_INT_DECL(int) PGMHCChangeMode(PVMCC pVM, PVMCPUCC pVCpu, PGMMODE enmGuestMod
  * @param   pVCpu       The cross context virtual CPU structure of the calling EMT.
  * @thread  EMT
  */
+//处理CR0.WP（Write Protection）位启用的逻辑，主要用于解决NetWare操作系统在特定场景下的兼容性问题
 VMMDECL(void) PGMCr0WpEnabled(PVMCPUCC pVCpu)
 {
     /*
@@ -3812,15 +3958,21 @@ VMM_INT_DECL(RTGCPHYS) PGMGetGuestCR3Phys(PVMCPU pVCpu)
  *                      which EFER changed.
  * @param   fNxe        The new NXE state.
  */
+//处理NXE（No-Execute Enable）位变更的核心函数，用于动态更新CPU分页管理相关的掩码设置
+//客户机OS切换NX设置：例如Linux通过CR4.NXE启用/禁用NX保护时，VirtualBox通过此函数同步状态。
 VMM_INT_DECL(void) PGMNotifyNxeChanged(PVMCPU pVCpu, bool fNxe)
 {
 /** @todo VMCPU_ASSERT_EMT_OR_NOT_RUNNING(pVCpu); */
     Log(("PGMNotifyNxeChanged: fNxe=%RTbool\n", fNxe));
 
     pVCpu->pgm.s.fNoExecuteEnabled = fNxe;
+    //根据fNxe参数更新pVCpu->pgm.s.fNoExecuteEnabled标志位，控制全局的NX（No-Execute）功能开关。
+    //影响后续内存访问的权限检查（是否允许代码执行）。
     if (fNxe)
     {
         /*pVCpu->pgm.s.fGst32BitMbzBigPdeMask - N/A */
+        //无NX位支持（注释中标记为N/A）。
+        //更新PTE（Page Table Entry）、PDE（Page Directory Entry）、2MB大页PDE的掩码。
         pVCpu->pgm.s.fGstPaeMbzPteMask       &= ~X86_PTE_PAE_NX;
         pVCpu->pgm.s.fGstPaeMbzPdeMask       &= ~X86_PDE_PAE_NX;
         pVCpu->pgm.s.fGstPaeMbzBigPdeMask    &= ~X86_PDE2M_PAE_NX;
@@ -3828,10 +3980,11 @@ VMM_INT_DECL(void) PGMNotifyNxeChanged(PVMCPU pVCpu, bool fNxe)
         pVCpu->pgm.s.fGstAmd64MbzPteMask     &= ~X86_PTE_PAE_NX;
         pVCpu->pgm.s.fGstAmd64MbzPdeMask     &= ~X86_PDE_PAE_NX;
         pVCpu->pgm.s.fGstAmd64MbzBigPdeMask  &= ~X86_PDE2M_PAE_NX;
-        pVCpu->pgm.s.fGstAmd64MbzPdpeMask    &= ~X86_PDPE_LM_NX;
+        pVCpu->pgm.s.fGstAmd64MbzPdpeMask    &= ~X86_PDPE_LM_NX;//额外处理PDPE（Page Directory Pointer Entry）、PML4E（Page Map Level 4 Entry）的掩码。
         pVCpu->pgm.s.fGstAmd64MbzBigPdpeMask &= ~X86_PDPE_LM_NX;
         pVCpu->pgm.s.fGstAmd64MbzPml4eMask   &= ~X86_PML4E_NX;
 
+        //同步更新影子页表（Shadowed）的掩码，确保虚拟化层与客户机OS的NX状态一致。
         pVCpu->pgm.s.fGst64ShadowedPteMask        |= X86_PTE_PAE_NX;
         pVCpu->pgm.s.fGst64ShadowedPdeMask        |= X86_PDE_PAE_NX;
         pVCpu->pgm.s.fGst64ShadowedBigPdeMask     |= X86_PDE2M_PAE_NX;
@@ -3842,6 +3995,7 @@ VMM_INT_DECL(void) PGMNotifyNxeChanged(PVMCPU pVCpu, bool fNxe)
     else
     {
         /*pVCpu->pgm.s.fGst32BitMbzBigPdeMask - N/A */
+        //恢复MBZ掩码中的NX位
         pVCpu->pgm.s.fGstPaeMbzPteMask       |= X86_PTE_PAE_NX;
         pVCpu->pgm.s.fGstPaeMbzPdeMask       |= X86_PDE_PAE_NX;
         pVCpu->pgm.s.fGstPaeMbzBigPdeMask    |= X86_PDE2M_PAE_NX;
@@ -3853,6 +4007,7 @@ VMM_INT_DECL(void) PGMNotifyNxeChanged(PVMCPU pVCpu, bool fNxe)
         pVCpu->pgm.s.fGstAmd64MbzBigPdpeMask |= X86_PDPE_LM_NX;
         pVCpu->pgm.s.fGstAmd64MbzPml4eMask   |= X86_PML4E_NX;
 
+        //在影子页表中禁用NX位
         pVCpu->pgm.s.fGst64ShadowedPteMask        &= ~X86_PTE_PAE_NX;
         pVCpu->pgm.s.fGst64ShadowedPdeMask        &= ~X86_PDE_PAE_NX;
         pVCpu->pgm.s.fGst64ShadowedBigPdeMask     &= ~X86_PDE2M_PAE_NX;
