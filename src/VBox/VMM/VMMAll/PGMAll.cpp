@@ -4067,17 +4067,19 @@ VMMDECL(int) PGMSetLargePageUsage(PVMCC pVM, bool fUseLargePages)
  * @param   SRC_POS     The source position of the caller (RT_SRC_POS).
  */
 #if defined(VBOX_STRICT) || defined(DOXYGEN_RUNNING)
+//调用 PDMCritSectEnterDebug 进入临界区，附加调试信息（如调用地址和源码位置）
 int pgmLockDebug(PVMCC pVM, bool fVoid, RT_SRC_POS_DECL)
 #else
 int pgmLock(PVMCC pVM, bool fVoid)
 #endif
 {
 #if defined(VBOX_STRICT)
+	//传入调用地址（ASMReturnAddress()）和源码位置，用于死锁分析。
     int rc = PDMCritSectEnterDebug(pVM, &pVM->pgm.s.CritSectX, VINF_SUCCESS, (uintptr_t)ASMReturnAddress(), RT_SRC_POS_ARGS);
 #else
     int rc = PDMCritSectEnter(pVM, &pVM->pgm.s.CritSectX, VINF_SUCCESS);
 #endif
-    if (RT_SUCCESS(rc))
+    if (RT_SUCCESS(rc))//成功加锁
         return rc;
     if (fVoid)
         PDM_CRITSECT_RELEASE_ASSERT_RC(pVM, &pVM->pgm.s.CritSectX, rc);
@@ -4092,11 +4094,13 @@ int pgmLock(PVMCC pVM, bool fVoid)
  *
  * @param   pVM         The cross context VM structure.
  */
+//释放内存管理锁
 void pgmUnlock(PVMCC pVM)
 {
     uint32_t cDeprecatedPageLocks = pVM->pgm.s.cDeprecatedPageLocks;
     pVM->pgm.s.cDeprecatedPageLocks = 0;
     int rc = PDMCritSectLeave(pVM, &pVM->pgm.s.CritSectX);
+	//线程在嵌套状态下仍可访问临界资源，其他线程无法抢占锁
     if (rc == VINF_SEM_NESTED)
         pVM->pgm.s.cDeprecatedPageLocks = cDeprecatedPageLocks;
 }

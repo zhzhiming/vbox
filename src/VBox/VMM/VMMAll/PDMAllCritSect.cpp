@@ -445,20 +445,26 @@ static int pdmR3R0CritSectEnterContended(PVMCC pVM, PVMCPU pVCpu, PPDMCRITSECT p
  * @param   rcBusy              The status code to return when we're in RC or R0
  * @param   pSrcPos             The source position of the lock operation.
  */
+//快速路径（无竞争）→ 自旋等待 → 慢速路径（阻塞/调度）。
 DECL_FORCE_INLINE(int) pdmCritSectEnter(PVMCC pVM, PPDMCRITSECT pCritSect, int rcBusy, PCRTLOCKVALSRCPOS pSrcPos)
 {
+	// 嵌套深度上限检查（防递归过深）
     Assert(pCritSect->s.Core.cNestings < 8);  /* useful to catch incorrect locking */
+	// 嵌套深度非负检查
     Assert(pCritSect->s.Core.cNestings >= 0);
 #if defined(VBOX_STRICT) && defined(IN_RING0)
     /* Hope we're not messing with critical sections while in the no-block
        zone, that would complicate things a lot. */
     PVMCPUCC pVCpuAssert = VMMGetCpu(pVM);
+	//确保当前线程是虚拟 CPU（EMT）线程且允许调用 Ring-3（用户态），
+	//避免在不可阻塞的上下文中操作临界区。
     Assert(pVCpuAssert && VMMRZCallRing3IsEnabled(pVCpuAssert));
 #endif
 
     /*
      * If the critical section has already been destroyed, then inform the caller.
      */
+	//通过 u32Magic 字段验证临界区未被销毁（内存安全）。
     AssertMsgReturn(pCritSect->s.Core.u32Magic == RTCRITSECT_MAGIC,
                     ("%p %RX32\n", pCritSect, pCritSect->s.Core.u32Magic),
                     VERR_SEM_DESTROYED);
@@ -467,22 +473,29 @@ DECL_FORCE_INLINE(int) pdmCritSectEnter(PVMCC pVM, PPDMCRITSECT pCritSect, int r
      * See if we're lucky.
      */
     /* NOP ... */
+	//若临界区标记为 NOP（无实际锁操作），直接跳过竞争逻辑。
     if (!(pCritSect->s.Core.fFlags & RTCRITSECT_FLAGS_NOP))
     { /* We're more likely to end up here with real critsects than a NOP one. */ }
     else
         return VINF_SUCCESS;
 
+	//获取当前线程的 Native ID，并验证其为有效的 EMT 线程。
     RTNATIVETHREAD hNativeSelf = pdmCritSectGetNativeSelf(pVM, pCritSect);
     AssertReturn(hNativeSelf != NIL_RTNATIVETHREAD, VERR_VM_THREAD_NOT_EMT);
     /* ... not owned ... */
+	//原子操作：通过 CAS（Compare-And-Swap）尝试将 cLockers 从 -1（未锁定）改为 0（锁定中）。
     if (ASMAtomicCmpXchgS32(&pCritSect->s.Core.cLockers, 0, -1))
+		//成功时：调用 pdmCritSectEnterFirst 初始化锁状态（设置所有者线程、嵌套计数等）。
         return pdmCritSectEnterFirst(pCritSect, hNativeSelf, pSrcPos);
 
     /* ... or nested. */
+	//当当前线程（hNativeSelf）已经是锁的持有者（NativeThreadOwner）时，
+	//直接增加嵌套计数（cNestings）并返回 VINF_SUCCESS
     if (pCritSect->s.Core.NativeThreadOwner == hNativeSelf)
     {
         Assert(pCritSect->s.Core.cNestings >= 1);
 # ifdef PDMCRITSECT_WITH_LESS_ATOMIC_STUFF
+		//调试模式禁用部分原子操作
         pCritSect->s.Core.cNestings += 1;
 # else
         ASMAtomicIncS32(&pCritSect->s.Core.cNestings);
@@ -497,12 +510,15 @@ DECL_FORCE_INLINE(int) pdmCritSectEnter(PVMCC pVM, PPDMCRITSECT pCritSect, int r
      */
     /** @todo Move this to cfgm variables since it doesn't make sense to spin on UNI
      *        cpu systems. */
+	//自旋等待（轻度竞争）, CAS fail
+	//自旋次数可配置，避免不必要的上下文切换。
     int32_t cSpinsLeft = CTX_SUFF(PDMCRITSECT_SPIN_COUNT_);
+	//在有限次数（PDMCRITSECT_SPIN_COUNT_）内尝试 CAS 操作，避免立即进入慢速路径。
     while (cSpinsLeft-- > 0)
     {
         if (ASMAtomicCmpXchgS32(&pCritSect->s.Core.cLockers, 0, -1))
             return pdmCritSectEnterFirst(pCritSect, hNativeSelf, pSrcPos);
-        ASMNopPause();
+        ASMNopPause(); //ASMNopPause 减少自旋时的 CPU 争用。
         /** @todo Should use monitor/mwait on e.g. &cLockers here, possibly with a
            cli'ed pendingpreemption check up front using sti w/ instruction fusing
            for avoiding races. Hmm ... This is assuming the other party is actually
@@ -510,11 +526,13 @@ DECL_FORCE_INLINE(int) pdmCritSectEnter(PVMCC pVM, PPDMCRITSECT pCritSect, int r
            wanted. */
     }
 
+	//慢速路径（高竞争场景）
 #ifdef IN_RING3
     /*
      * Take the slow path.
      */
     NOREF(rcBusy);
+	//处理方式：直接调用通用竞争处理函数，可能触发线程阻塞或调度。
     return pdmR3R0CritSectEnterContended(pVM, NULL, pCritSect, hNativeSelf, pSrcPos, rcBusy);
 
 #elif defined(IN_RING0)
@@ -533,13 +551,16 @@ DECL_FORCE_INLINE(int) pdmCritSectEnter(PVMCC pVM, PPDMCRITSECT pCritSect, int r
     if (pVCpu)
     {
         VMMR0EMTBLOCKCTX Ctx;
+		//准备阻塞：通过 VMMR0EmtPrepareToBlock 检查是否允许阻塞（如不在 VT-x/AMD-V 不可中断区域）。
         int rc = VMMR0EmtPrepareToBlock(pVCpu, rcBusy, __FUNCTION__, pCritSect, &Ctx);
         if (rc == VINF_SUCCESS)
         {
             Assert(RTThreadPreemptIsEnabled(NIL_RTTHREAD));
 
+			//竞争处理：调用 pdmR3R0CritSectEnterContended 进入慢速路径
             rc = pdmR3R0CritSectEnterContended(pVM, pVCpu, pCritSect, hNativeSelf, pSrcPos, rcBusy);
 
+			//恢复上下文：阻塞后恢复 EMT 线程状态。
             VMMR0EmtResumeAfterBlocking(pVCpu, &Ctx);
         }
         else

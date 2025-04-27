@@ -5184,7 +5184,8 @@ pgmPhyIemGCphys2PtrNoLockReturnReadOnly(PVMCC pVM, PVMCPUCC pVCpu, uint64_t uTlb
 
 
 /** Helper for PGMPhysIemGCPhys2PtrNoLock. */
-//其核心特点是绕过全局锁, GCPhys->*ppb
+//其核心特点是绕过全局锁, address GCPhys->*ppb
+//用户态直接计算地址，避免陷入内核（仅在 NEM 模式或 TLB 未命中时需查询）。
 DECL_FORCE_INLINE(int)
 pgmPhyIemGCphys2PtrNoLockReturnReadWrite(PVMCC pVM, PVMCPUCC pVCpu, uint64_t uTlbPhysRev, RTGCPHYS GCPhys, PCPGMPAGE pPageCopy,
                                          PPGMRAMRANGE pRam, PPGMPAGE pPage, R3R0PTRTYPE(uint8_t *) *ppb, uint64_t *pfTlb)
@@ -5197,6 +5198,11 @@ pgmPhyIemGCphys2PtrNoLockReturnReadWrite(PVMCC pVM, PVMCPUCC pVCpu, uint64_t uTl
     //用户态直接计算地址，避免陷入内核（仅在 NEM 模式或 TLB 未命中时需查询）。
 #ifdef IN_RING3
     //NEM
+	/*
+	 * pRam->pbR3 是 Host 虚拟地址（HVA）的基址（由 VirtualBox 在 Ring 3 分配）。
+       加上偏移后，得到 Guest 物理地址（GPA）对应的 Host 虚拟地址（HVA）。
+	   仅适用于 固定映射的内存区域
+	 * */
     if (PGM_IS_IN_NEM_MODE(pVM))
         *ppb = &pRam->pbR3[(RTGCPHYS)(uintptr_t)(pPage - &pRam->aPages[0]) << GUEST_PAGE_SHIFT]; //直接通过 RAM 范围偏移计算主机地址
     else
@@ -5522,6 +5528,9 @@ IEM 负责在 非硬件加速路径（如单步调试、复杂指令模拟）中
   回退到软件路径：仅在硬件加速不可用（如嵌套虚拟化、调试模式）时，才会切换到 IEM 路径
 
   可以理解成，在硬件加速的情况下，对于硬件加速处理不了的指令，我们需要IEM的介入
+
+  遇到未实现指令时触发#UD异常，通过iemRaiseXcptOrInt函数转入软件模拟流程5
+  对复杂指令集（如AVX512）会优先检查VMCS中的执行控制位，若硬件不支持则直接路由到IEM
 
 硬件加速与 IEM 的分工
 场景	                    处理方式	    示例
