@@ -86,6 +86,10 @@ CTX_SUFF(PVMCPU)    g_PdbTypeHack10 = NULL;
 DECLEXPORT(uint32_t) PdbTypeHack(PVM pVM, PVMCPU pVCpu, PPDMCRITSECT pCs1, PPDMCRITSECTRW pCs2);
 }
 
+//主要用于调试和类型检查
+//确保相关头文件已被正确
+//该函数典型出现在VirtualBox的调试相关代码中，主要用于开发阶段的类型系统验证
+//类似的调试技术也常见于其他虚拟化软件如QEMU的MMIO/PIO处理代码中
 DECLEXPORT(uint32_t) PdbTypeHack(PVM pVM, PVMCPU pVCpu, PPDMCRITSECT pCs1, PPDMCRITSECTRW pCs2)
 {
     /* Just some dummy operations accessing each type. Probably not necessary, but
