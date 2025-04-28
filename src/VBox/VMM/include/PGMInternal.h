@@ -2642,6 +2642,10 @@ typedef PGMPTWALKGST const *PCPGMPTWALKGST;
 /** @name Paging mode macros
  * @{
  */
+/*
+DECLCALLBACK	int   __stdcall pgmHandler	跨模块回调（如Guest到Host调用）
+VMMDECL	        int  __fastcall pgmHandler	VMM内部高频函数调用
+ * */
 #ifdef IN_RING3
 # define PGM_CTX(a,b)                   a##R3##b
 # define PGM_CTX_STR(a,b)               a "R3" b
@@ -2669,6 +2673,8 @@ typedef PGMPTWALKGST const *PCPGMPTWALKGST;
 #define PGM_GST_NAME_AMD64(name)                        PGM_CTX(pgm,GstAMD64##name)
 #define PGM_GST_NAME_RC_AMD64_STR(name)                 "pgmRCGstAMD64" #name
 #define PGM_GST_NAME_R0_AMD64_STR(name)                 "pgmR0GstAMD64" #name
+//假设R0,AMD64下，PGM_GST_DECL(int, pgmHandler)展开为 VMMDECL(int) pgmHandler_AMD64(...);
+//假设R0,REAL下， PGM_GST_DECL(int, pgmHandler)展开为 VMMDECL(int) pgmHandler_REAL(...);
 #define PGM_GST_DECL(type, name)                        PGM_CTX_DECL(type) PGM_GST_NAME(name)
 
 #define PGM_GST_SLAT_NAME_EPT(name)                     PGM_CTX(pgm,GstSlatEpt##name)

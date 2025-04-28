@@ -981,6 +981,13 @@ static bool cpumIsEcxRelevantForCpuIdLeaf(uint32_t uLeaf, uint32_t *pcSubLeaves,
  * @param   pcLeaves            Where to return the size of the array on
  *                              success.
  */
+/*
+ * CPUMCpuIdCollectLeavesX86 函数用于收集 x86/x64 CPU 的 CPUID 叶子信息，生成一个结构化的 CPUMCPUIDLEAF 数组。其核心逻辑包括：
+    枚举候选叶子范围：通过预定义的 s_aCandidates 数组探测可能的 CPUID 叶子。
+    子叶扩展检测：处理需要 ECX 作为子叶号的复杂叶子（如 0x0d 扩展状态枚举）。
+    特殊标志标记：识别包含 APIC ID或 APIC 功能位的叶子，用于虚拟化场景的精确模拟。
+    多厂商兼容：适配 Intel、AMD、Hygon 等厂商的 CPUID 行为差异。
+ * */
 VMMDECL(int) CPUMCpuIdCollectLeavesX86(PCPUMCPUIDLEAF *ppaLeaves, uint32_t *pcLeaves)
 {
     *ppaLeaves = NULL;
@@ -989,6 +996,7 @@ VMMDECL(int) CPUMCpuIdCollectLeavesX86(PCPUMCPUIDLEAF *ppaLeaves, uint32_t *pcLe
     /*
      * Try out various candidates. This must be sorted!
      */
+    //基础范围：以 0xN0000000（N=0~F）覆盖标准及扩展功能（如 0x0=基本功能，0x80000000=扩展功能）。
     static struct { uint32_t uMsr; bool fSpecial; } const s_aCandidates[] =
     {
         { UINT32_C(0x00000000), false },
@@ -1016,7 +1024,7 @@ VMMDECL(int) CPUMCpuIdCollectLeavesX86(PCPUMCPUIDLEAF *ppaLeaves, uint32_t *pcLe
     {
         uint32_t uLeaf = s_aCandidates[iOuter].uMsr;
         uint32_t uEax, uEbx, uEcx, uEdx;
-        ASMCpuIdExSlow(uLeaf, 0, 0, 0, &uEax, &uEbx, &uEcx, &uEdx);
+        ASMCpuIdExSlow(uLeaf, 0, 0, 0, &uEax, &uEbx, &uEcx, &uEdx);//通过 CPUID(eax=uLeaf).eax 返回的最大叶子号确定该范围的合法叶子数。
 
         /*
          * Does EAX look like a typical leaf count value?
@@ -1025,8 +1033,8 @@ VMMDECL(int) CPUMCpuIdCollectLeavesX86(PCPUMCPUIDLEAF *ppaLeaves, uint32_t *pcLe
             && uEax - uLeaf < UINT32_C(0xff)) /* Adjust 0xff limit when exceeded by real HW. */
         {
             /* Yes, dump them. */
-            uint32_t cLeaves = uEax - uLeaf + 1;
-            while (cLeaves-- > 0)
+            uint32_t cLeaves = uEax - uLeaf + 1; // 计算该范围的叶子数量
+            while (cLeaves-- > 0)// 逐个收集
             {
                 ASMCpuIdExSlow(uLeaf, 0, 0, 0, &uEax, &uEbx, &uEcx, &uEdx);
 
@@ -1035,10 +1043,10 @@ VMMDECL(int) CPUMCpuIdCollectLeavesX86(PCPUMCPUIDLEAF *ppaLeaves, uint32_t *pcLe
                 /* There are currently three known leaves containing an APIC ID
                    that needs EMT specific attention */
                 if (uLeaf == 1)
-                    fFlags |= CPUMCPUIDLEAF_F_CONTAINS_APIC_ID;
+                    fFlags |= CPUMCPUIDLEAF_F_CONTAINS_APIC_ID;//Leaf 1：EBX[31:24] 包含初始 APIC ID。
                 else if (uLeaf == 0xb && uEcx != 0)
-                    fFlags |= CPUMCPUIDLEAF_F_CONTAINS_APIC_ID;
-                else if (   uLeaf == UINT32_C(0x8000001e)
+                    fFlags |= CPUMCPUIDLEAF_F_CONTAINS_APIC_ID;//Leaf 0xB（扩展拓扑）：ECX≠0 时，EDX 包含 x2APIC ID。
+                else if (   uLeaf == UINT32_C(0x8000001e)//Leaf 0x8000001E（AMD 拓扑）：特定于 AMD/Hygon CPU 的 APIC ID 字段。
                          && (   uEax
                              || uEbx
                              || uEdx
@@ -1059,10 +1067,12 @@ VMMDECL(int) CPUMCpuIdCollectLeavesX86(PCPUMCPUIDLEAF *ppaLeaves, uint32_t *pcLe
                    resulting in false positives with things like the APIC ID. */
                 uint32_t cSubLeaves;
                 bool fFinalEcxUnchanged;
+                //三次调用 cpumIsEcxRelevantForCpuIdLeaf 确保子叶数量稳定。
                 if (   cpumIsEcxRelevantForCpuIdLeaf(uLeaf, &cSubLeaves, &fFinalEcxUnchanged)
                     && cpumIsEcxRelevantForCpuIdLeaf(uLeaf, &cSubLeaves, &fFinalEcxUnchanged)
                     && cpumIsEcxRelevantForCpuIdLeaf(uLeaf, &cSubLeaves, &fFinalEcxUnchanged))
                 {
+                    //：若子叶数异常（如 0xd 叶子超过 68），记录详细日志辅助调试。
                     if (cSubLeaves > (uLeaf == 0xd ? 68U : 16U))
                     {
                         /* This shouldn't happen.  But in case it does, file all
@@ -1090,9 +1100,10 @@ VMMDECL(int) CPUMCpuIdCollectLeavesX86(PCPUMCPUIDLEAF *ppaLeaves, uint32_t *pcLe
 
                     for (uint32_t uSubLeaf = 0; uSubLeaf < cSubLeaves; uSubLeaf++)
                     {
+                        // 获取子叶数据
                         ASMCpuIdExSlow(uLeaf, 0, uSubLeaf, 0, &uEax, &uEbx, &uEcx, &uEdx);
                         int rc = cpumCollectCpuIdInfoAddOne(ppaLeaves, pcLeaves,
-                                                            uLeaf, uSubLeaf, UINT32_MAX, uEax, uEbx, uEcx, uEdx, fFlags);
+                                                            uLeaf, uSubLeaf, UINT32_MAX, uEax, uEbx, uEcx, uEdx, fFlags); // 添加至数组
                         if (RT_FAILURE(rc))
                             return rc;
                     }
@@ -1112,6 +1123,7 @@ VMMDECL(int) CPUMCpuIdCollectLeavesX86(PCPUMCPUIDLEAF *ppaLeaves, uint32_t *pcLe
          * Special CPUIDs needs special handling as they don't follow the
          * leaf count principle used above.
          */
+        //特殊叶子：0x8ffffffe 和 0x8fffffff 可能是 ‌Hypervisor 独占叶子‌（如 KVM/VirtualBox 的透传信息）
         else if (s_aCandidates[iOuter].fSpecial)
         {
             bool fKeep = false;
@@ -1238,20 +1250,25 @@ static PCCPUMCPUIDLEAF cpumCpuIdFindLeaf(PCCPUMCPUIDLEAF paLeaves, uint32_t cLea
 }
 
 
-static PCCPUMCPUIDLEAF cpumCpuIdFindLeafEx(PCCPUMCPUIDLEAF paLeaves, uint32_t cLeaves, uint32_t uLeaf, uint32_t uSubLeaf)
+static PCCPUMCPUIDLEAF cpumCpuIdFindLeafEx(PCCPUMCPUIDLEAF paLeaves, // CPUID 叶子数组
+        uint32_t cLeaves, // 数组长度
+        uint32_t uLeaf, // 目标 Leaf (EAX)
+        uint32_t uSubLeaf)// 目标 Sub-leaf (ECX)
 {
+     // 1. 查找主 Leaf
     PCCPUMCPUIDLEAF pLeaf = cpumCpuIdFindLeaf(paLeaves, cLeaves, uLeaf);
     if (   !pLeaf
         || pLeaf->uSubLeaf != (uSubLeaf & pLeaf->fSubLeafMask))
-        return pLeaf;
+        return pLeaf; // 无匹配或 Sub-leaf 不匹配
 
     /* Linear sub-leaf search. Lazy as usual. */
-    cLeaves -= pLeaf - paLeaves;
+    // 2. 线性遍历子 Leaf
+    cLeaves -= pLeaf - paLeaves;// 剩余元素数
     while (   cLeaves-- > 0
            && pLeaf->uLeaf == uLeaf)
     {
         if (pLeaf->uSubLeaf == (uSubLeaf & pLeaf->fSubLeafMask))
-            return pLeaf;
+            return pLeaf;// 匹配成功
         pLeaf++;
     }
 
@@ -1259,6 +1276,17 @@ static PCCPUMCPUIDLEAF cpumCpuIdFindLeafEx(PCCPUMCPUIDLEAF paLeaves, uint32_t cL
 }
 
 
+/*
+ * 该函数将 VMX 能力 MSR 转换为结构化特性标志，主要完成：
+  基础能力检测：True Controls 支持、VMCS 字段类型等
+  执行控制映射：Pin/Processor-Based Controls 的 50+ 项功能标志转换
+  嵌套特性处理：Secondary/Tertiary Controls 的级联检测
+  虚拟化关键能力：EPT/VPID/APICv 等扩展特性标记
+
+  此函数解析 Intel VT-x 的虚拟化能力，包括 VM-execution controls（虚拟机执行控制）、
+  VM-exit controls（虚拟机退出控制）、
+  VM-entry controls（虚拟机入口控制）等关键特性，为虚拟化平台提供精确的硬件支持信息。
+ * */
 static void cpumExplodeVmxFeatures(PCVMXMSRS pVmxMsrs, PCPUMFEATURES pFeatures)
 {
     Assert(pVmxMsrs);
@@ -1266,69 +1294,73 @@ static void cpumExplodeVmxFeatures(PCVMXMSRS pVmxMsrs, PCPUMFEATURES pFeatures)
     Assert(pFeatures->fVmx);
 
     /* Basic information. */
+    //True Controls 检测：通过 VMX_BASIC[55] 判断是否支持精细控制
     bool const fVmxTrueMsrs = RT_BOOL(pVmxMsrs->u64Basic & VMX_BF_BASIC_TRUE_CTLS_MASK);
     {
         uint64_t const u64Basic = pVmxMsrs->u64Basic;
-        pFeatures->fVmxInsOutInfo            = RT_BF_GET(u64Basic, VMX_BF_BASIC_VMCS_INS_OUTS);
+        pFeatures->fVmxInsOutInfo            = RT_BF_GET(u64Basic, VMX_BF_BASIC_VMCS_INS_OUTS);//提取 VMCS 中 INSTRUCTION-INFO 字段的宽度，用于后续指令模拟的解析。
     }
 
     /* Pin-based VM-execution controls. */
     {
         uint32_t const fPinCtls = fVmxTrueMsrs ? pVmxMsrs->TruePinCtls.n.allowed1 : pVmxMsrs->PinCtls.n.allowed1;
-        pFeatures->fVmxExtIntExit            = RT_BOOL(fPinCtls & VMX_PIN_CTLS_EXT_INT_EXIT);
-        pFeatures->fVmxNmiExit               = RT_BOOL(fPinCtls & VMX_PIN_CTLS_NMI_EXIT);
-        pFeatures->fVmxVirtNmi               = RT_BOOL(fPinCtls & VMX_PIN_CTLS_VIRT_NMI);
-        pFeatures->fVmxPreemptTimer          = RT_BOOL(fPinCtls & VMX_PIN_CTLS_PREEMPT_TIMER);
-        pFeatures->fVmxPostedInt             = RT_BOOL(fPinCtls & VMX_PIN_CTLS_POSTED_INT);
+        pFeatures->fVmxExtIntExit            = RT_BOOL(fPinCtls & VMX_PIN_CTLS_EXT_INT_EXIT);//是否在外部中断时触发 VM-Exit。
+        pFeatures->fVmxNmiExit               = RT_BOOL(fPinCtls & VMX_PIN_CTLS_NMI_EXIT);//是否在 NMI 时触发 VM-Exit
+        pFeatures->fVmxVirtNmi               = RT_BOOL(fPinCtls & VMX_PIN_CTLS_VIRT_NMI);//PIN_CTLS[5]	虚拟 NMI 处理，（通过 VMX 拦截物理 NMI）。
+        pFeatures->fVmxPreemptTimer          = RT_BOOL(fPinCtls & VMX_PIN_CTLS_PREEMPT_TIMER);//PIN_CTLS[6]虚拟化抢占计时器，是否支持基于 TSC 的虚拟机抢占。
+        pFeatures->fVmxPostedInt             = RT_BOOL(fPinCtls & VMX_PIN_CTLS_POSTED_INT);// Posted中断支持,减少中断处理的VM-Exit开销。是否支持通过 APIC 的 Posted 中断机制。
     }
 
     /* Processor-based VM-execution controls. */
     {
+        //根据 True Controls 选择对应的 MSR 结构（TruePinCtls 或 PinCtls），并提取 allowed1 字段。
         uint32_t const fProcCtls = fVmxTrueMsrs ? pVmxMsrs->TrueProcCtls.n.allowed1 : pVmxMsrs->ProcCtls.n.allowed1;
         pFeatures->fVmxIntWindowExit         = RT_BOOL(fProcCtls & VMX_PROC_CTLS_INT_WINDOW_EXIT);
-        pFeatures->fVmxTscOffsetting         = RT_BOOL(fProcCtls & VMX_PROC_CTLS_USE_TSC_OFFSETTING);
-        pFeatures->fVmxHltExit               = RT_BOOL(fProcCtls & VMX_PROC_CTLS_HLT_EXIT);
+        pFeatures->fVmxTscOffsetting         = RT_BOOL(fProcCtls & VMX_PROC_CTLS_USE_TSC_OFFSETTING);//是否支持为 Guest 调整 TSC 值。
+        pFeatures->fVmxHltExit               = RT_BOOL(fProcCtls & VMX_PROC_CTLS_HLT_EXIT);//是否在 HLT 指令时触发 VM-Exit
         pFeatures->fVmxInvlpgExit            = RT_BOOL(fProcCtls & VMX_PROC_CTLS_INVLPG_EXIT);
         pFeatures->fVmxMwaitExit             = RT_BOOL(fProcCtls & VMX_PROC_CTLS_MWAIT_EXIT);
         pFeatures->fVmxRdpmcExit             = RT_BOOL(fProcCtls & VMX_PROC_CTLS_RDPMC_EXIT);
         pFeatures->fVmxRdtscExit             = RT_BOOL(fProcCtls & VMX_PROC_CTLS_RDTSC_EXIT);
-        pFeatures->fVmxCr3LoadExit           = RT_BOOL(fProcCtls & VMX_PROC_CTLS_CR3_LOAD_EXIT);
-        pFeatures->fVmxCr3StoreExit          = RT_BOOL(fProcCtls & VMX_PROC_CTLS_CR3_STORE_EXIT);
+        pFeatures->fVmxCr3LoadExit           = RT_BOOL(fProcCtls & VMX_PROC_CTLS_CR3_LOAD_EXIT);//是否监控 Guest 的 CR3 寄存器访问。
+        pFeatures->fVmxCr3StoreExit          = RT_BOOL(fProcCtls & VMX_PROC_CTLS_CR3_STORE_EXIT);//是否监控 Guest 的 CR3 寄存器访问。
         pFeatures->fVmxTertiaryExecCtls      = RT_BOOL(fProcCtls & VMX_PROC_CTLS_USE_TERTIARY_CTLS);
         pFeatures->fVmxCr8LoadExit           = RT_BOOL(fProcCtls & VMX_PROC_CTLS_CR8_LOAD_EXIT);
         pFeatures->fVmxCr8StoreExit          = RT_BOOL(fProcCtls & VMX_PROC_CTLS_CR8_STORE_EXIT);
-        pFeatures->fVmxUseTprShadow          = RT_BOOL(fProcCtls & VMX_PROC_CTLS_USE_TPR_SHADOW);
+        pFeatures->fVmxUseTprShadow          = RT_BOOL(fProcCtls & VMX_PROC_CTLS_USE_TPR_SHADOW);//使用 TPR 影子寄存器优化 APIC 虚拟化性能。
         pFeatures->fVmxNmiWindowExit         = RT_BOOL(fProcCtls & VMX_PROC_CTLS_NMI_WINDOW_EXIT);
         pFeatures->fVmxMovDRxExit            = RT_BOOL(fProcCtls & VMX_PROC_CTLS_MOV_DR_EXIT);
         pFeatures->fVmxUncondIoExit          = RT_BOOL(fProcCtls & VMX_PROC_CTLS_UNCOND_IO_EXIT);
-        pFeatures->fVmxUseIoBitmaps          = RT_BOOL(fProcCtls & VMX_PROC_CTLS_USE_IO_BITMAPS);
+        pFeatures->fVmxUseIoBitmaps          = RT_BOOL(fProcCtls & VMX_PROC_CTLS_USE_IO_BITMAPS);//是否使用位图优化 IO 指令拦截。
         pFeatures->fVmxMonitorTrapFlag       = RT_BOOL(fProcCtls & VMX_PROC_CTLS_MONITOR_TRAP_FLAG);
-        pFeatures->fVmxUseMsrBitmaps         = RT_BOOL(fProcCtls & VMX_PROC_CTLS_USE_MSR_BITMAPS);
+        pFeatures->fVmxUseMsrBitmaps         = RT_BOOL(fProcCtls & VMX_PROC_CTLS_USE_MSR_BITMAPS);//是否使用位图优化 MSR 访问拦截。
         pFeatures->fVmxMonitorExit           = RT_BOOL(fProcCtls & VMX_PROC_CTLS_MONITOR_EXIT);
         pFeatures->fVmxPauseExit             = RT_BOOL(fProcCtls & VMX_PROC_CTLS_PAUSE_EXIT);
-        pFeatures->fVmxSecondaryExecCtls     = RT_BOOL(fProcCtls & VMX_PROC_CTLS_USE_SECONDARY_CTLS);
+        pFeatures->fVmxSecondaryExecCtls     = RT_BOOL(fProcCtls & VMX_PROC_CTLS_USE_SECONDARY_CTLS);//激活二级控制，启用EPT/VPID等高级特性。
     }
 
     /* Secondary processor-based VM-execution controls. */
     {
+        //激活二级控制，启用EPT/VPID等高级特性。
         uint32_t const fProcCtls2 = pFeatures->fVmxSecondaryExecCtls ? pVmxMsrs->ProcCtls2.n.allowed1 : 0;
         pFeatures->fVmxVirtApicAccess        = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_VIRT_APIC_ACCESS);
-        pFeatures->fVmxEpt                   = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_EPT);
+        //EPT 依赖二级控制：若 fVmxEpt 为真，必须确保 fVmxSecondaryExecCtls 已启用。
+        pFeatures->fVmxEpt                   = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_EPT);//扩展页表 (EPT)，减少内存虚拟化的GPA→HPA转换开销。
         pFeatures->fVmxDescTableExit         = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_DESC_TABLE_EXIT);
-        pFeatures->fVmxRdtscp                = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_RDTSCP);
-        pFeatures->fVmxVirtX2ApicMode        = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_VIRT_X2APIC_MODE);
-        pFeatures->fVmxVpid                  = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_VPID);
+        pFeatures->fVmxRdtscp                = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_RDTSCP);//是否支持 RDTSCP 指令。
+        pFeatures->fVmxVirtX2ApicMode        = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_VIRT_X2APIC_MODE);//是否支持 x2APIC 虚拟化。
+        pFeatures->fVmxVpid                  = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_VPID); //虚拟处理器ID，优化TLB无效化的性能。是否支持虚拟处理器 ID（减少 TLB 刷新）
         pFeatures->fVmxWbinvdExit            = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_WBINVD_EXIT);
-        pFeatures->fVmxUnrestrictedGuest     = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_UNRESTRICTED_GUEST);
+        pFeatures->fVmxUnrestrictedGuest     = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_UNRESTRICTED_GUEST);//是否允许 Guest 运行在非分页模式。
         pFeatures->fVmxApicRegVirt           = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_APIC_REG_VIRT);
-        pFeatures->fVmxVirtIntDelivery       = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_VIRT_INT_DELIVERY);
+        pFeatures->fVmxVirtIntDelivery       = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_VIRT_INT_DELIVERY);//虚拟中断投递，支持APICv的高级中断处理机制。
         pFeatures->fVmxPauseLoopExit         = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_PAUSE_LOOP_EXIT);
         pFeatures->fVmxRdrandExit            = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_RDRAND_EXIT);
         pFeatures->fVmxInvpcid               = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_INVPCID);
         pFeatures->fVmxVmFunc                = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_VMFUNC);
         pFeatures->fVmxVmcsShadowing         = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_VMCS_SHADOWING);
         pFeatures->fVmxRdseedExit            = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_RDSEED_EXIT);
-        pFeatures->fVmxPml                   = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_PML);
+        pFeatures->fVmxPml                   = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_PML);//是否支持页修改日志（加速脏页跟踪）。
         pFeatures->fVmxEptXcptVe             = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_EPT_XCPT_VE);
         pFeatures->fVmxConcealVmxFromPt      = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_CONCEAL_VMX_FROM_PT);
         pFeatures->fVmxXsavesXrstors         = RT_BOOL(fProcCtls2 & VMX_PROC_CTLS2_XSAVES_XRSTORS);
@@ -1348,22 +1380,22 @@ static void cpumExplodeVmxFeatures(PCVMXMSRS pVmxMsrs, PCPUMFEATURES pFeatures)
     {
         uint64_t const fProcCtls3 = pFeatures->fVmxTertiaryExecCtls ? pVmxMsrs->u64ProcCtls3 : 0;
         pFeatures->fVmxLoadIwKeyExit         = RT_BOOL(fProcCtls3 & VMX_PROC_CTLS3_LOADIWKEY_EXIT);
-        pFeatures->fVmxHlat                  = RT_BOOL(fProcCtls3 & VMX_PROC_CTLS3_HLAT);
+        pFeatures->fVmxHlat                  = RT_BOOL(fProcCtls3 & VMX_PROC_CTLS3_HLAT);//是否支持分层线性地址转换（5 级分页）。
         pFeatures->fVmxEptPagingWrite        = RT_BOOL(fProcCtls3 & VMX_PROC_CTLS3_EPT_PAGING_WRITE);
         pFeatures->fVmxGstPagingVerify       = RT_BOOL(fProcCtls3 & VMX_PROC_CTLS3_GST_PAGING_VERIFY);
-        pFeatures->fVmxIpiVirt               = RT_BOOL(fProcCtls3 & VMX_PROC_CTLS3_IPI_VIRT);
-        pFeatures->fVmxVirtSpecCtrl          = RT_BOOL(fProcCtls3 & VMX_PROC_CTLS3_VIRT_SPEC_CTRL);
+        pFeatures->fVmxIpiVirt               = RT_BOOL(fProcCtls3 & VMX_PROC_CTLS3_IPI_VIRT);//是否支持虚拟 IPI 指令
+        pFeatures->fVmxVirtSpecCtrl          = RT_BOOL(fProcCtls3 & VMX_PROC_CTLS3_VIRT_SPEC_CTRL);//是否支持 Spectre 缓解措施虚拟化。
     }
 
     /* VM-exit controls. */
     {
         uint32_t const fExitCtls = fVmxTrueMsrs ? pVmxMsrs->TrueExitCtls.n.allowed1 : pVmxMsrs->ExitCtls.n.allowed1;
-        pFeatures->fVmxExitSaveDebugCtls     = RT_BOOL(fExitCtls & VMX_EXIT_CTLS_SAVE_DEBUG);
+        pFeatures->fVmxExitSaveDebugCtls     = RT_BOOL(fExitCtls & VMX_EXIT_CTLS_SAVE_DEBUG);//退出时是否保存 Guest 调试寄存器。
         pFeatures->fVmxHostAddrSpaceSize     = RT_BOOL(fExitCtls & VMX_EXIT_CTLS_HOST_ADDR_SPACE_SIZE);
         pFeatures->fVmxExitAckExtInt         = RT_BOOL(fExitCtls & VMX_EXIT_CTLS_ACK_EXT_INT);
-        pFeatures->fVmxExitSavePatMsr        = RT_BOOL(fExitCtls & VMX_EXIT_CTLS_SAVE_PAT_MSR);
+        pFeatures->fVmxExitSavePatMsr        = RT_BOOL(fExitCtls & VMX_EXIT_CTLS_SAVE_PAT_MSR); //是否保存 Guest 的 PAT（页属性表）。
         pFeatures->fVmxExitLoadPatMsr        = RT_BOOL(fExitCtls & VMX_EXIT_CTLS_LOAD_PAT_MSR);
-        pFeatures->fVmxExitSaveEferMsr       = RT_BOOL(fExitCtls & VMX_EXIT_CTLS_SAVE_EFER_MSR);
+        pFeatures->fVmxExitSaveEferMsr       = RT_BOOL(fExitCtls & VMX_EXIT_CTLS_SAVE_EFER_MSR);//是否保存 Guest 的 EFER（扩展功能使能寄存器）。
         pFeatures->fVmxExitLoadEferMsr       = RT_BOOL(fExitCtls & VMX_EXIT_CTLS_LOAD_EFER_MSR);
         pFeatures->fVmxSavePreemptTimer      = RT_BOOL(fExitCtls & VMX_EXIT_CTLS_SAVE_PREEMPT_TIMER);
         pFeatures->fVmxSecondaryExitCtls     = RT_BOOL(fExitCtls & VMX_EXIT_CTLS_USE_SECONDARY_CTLS);
@@ -1373,8 +1405,8 @@ static void cpumExplodeVmxFeatures(PCVMXMSRS pVmxMsrs, PCPUMFEATURES pFeatures)
     {
         uint32_t const fEntryCtls = fVmxTrueMsrs ? pVmxMsrs->TrueEntryCtls.n.allowed1 : pVmxMsrs->EntryCtls.n.allowed1;
         pFeatures->fVmxEntryLoadDebugCtls    = RT_BOOL(fEntryCtls & VMX_ENTRY_CTLS_LOAD_DEBUG);
-        pFeatures->fVmxIa32eModeGuest        = RT_BOOL(fEntryCtls & VMX_ENTRY_CTLS_IA32E_MODE_GUEST);
-        pFeatures->fVmxEntryLoadEferMsr      = RT_BOOL(fEntryCtls & VMX_ENTRY_CTLS_LOAD_EFER_MSR);
+        pFeatures->fVmxIa32eModeGuest        = RT_BOOL(fEntryCtls & VMX_ENTRY_CTLS_IA32E_MODE_GUEST);//是否支持 Guest 运行在 64 位模式。
+        pFeatures->fVmxEntryLoadEferMsr      = RT_BOOL(fEntryCtls & VMX_ENTRY_CTLS_LOAD_EFER_MSR);//是否在入口时恢复 Guest 的 EFER。
         pFeatures->fVmxEntryLoadPatMsr       = RT_BOOL(fEntryCtls & VMX_ENTRY_CTLS_LOAD_PAT_MSR);
     }
 
@@ -1382,47 +1414,59 @@ static void cpumExplodeVmxFeatures(PCVMXMSRS pVmxMsrs, PCPUMFEATURES pFeatures)
     {
         uint32_t const fMiscData = pVmxMsrs->u64Misc;
         pFeatures->fVmxExitSaveEferLma       = RT_BOOL(fMiscData & VMX_MISC_EXIT_SAVE_EFER_LMA);
-        pFeatures->fVmxPt                    = RT_BOOL(fMiscData & VMX_MISC_INTEL_PT);
-        pFeatures->fVmxVmwriteAll            = RT_BOOL(fMiscData & VMX_MISC_VMWRITE_ALL);
+        pFeatures->fVmxPt                    = RT_BOOL(fMiscData & VMX_MISC_INTEL_PT);//是否支持处理器跟踪（Performance Tracing）。
+        pFeatures->fVmxVmwriteAll            = RT_BOOL(fMiscData & VMX_MISC_VMWRITE_ALL);//是否允许 VMWRITE 操作所有 VMCS 字段。
         pFeatures->fVmxEntryInjectSoftInt    = RT_BOOL(fMiscData & VMX_MISC_ENTRY_INJECT_SOFT_INT);
     }
 }
 
 
+//该函数将 CPUID 指令返回的原始数据解析为结构化特性标志
+/*
+  此函数通过分析 CPUID 指令返回的多组数据（paLeaves），填充 CPUMFEATURES 结构体，
+      详细描述 CPU 的厂商、微架构、指令集扩展、虚拟化支持等特性。
+  核心作用：为虚拟化平台提供精确的 CPU 功能报告，确保 Guest OS 能正确识别和利用宿主 CPU 的特性。
+*/
 int cpumCpuIdExplodeFeaturesX86(PCCPUMCPUIDLEAF paLeaves, uint32_t cLeaves, PCCPUMMSRS pMsrs, PCPUMFEATURES pFeatures)
 {
     Assert(pMsrs);
     RT_ZERO(*pFeatures);
+    //至少需要 2 个基本叶子（Leaf 0 和 Leaf 1）
     if (cLeaves >= 2)
     {
         AssertLogRelReturn(paLeaves[0].uLeaf == 0, VERR_CPUM_IPE_1);
         AssertLogRelReturn(paLeaves[1].uLeaf == 1, VERR_CPUM_IPE_1);
-        PCCPUMCPUIDLEAF const pStd0Leaf = cpumCpuIdFindLeafEx(paLeaves, cLeaves, 0, 0);
+        PCCPUMCPUIDLEAF const pStd0Leaf = cpumCpuIdFindLeafEx(paLeaves, cLeaves, 0, 0);//验证 Leaf 0 和 Leaf 1 的存在性
         AssertLogRelReturn(pStd0Leaf, VERR_CPUM_IPE_1);
         PCCPUMCPUIDLEAF const pStd1Leaf = cpumCpuIdFindLeafEx(paLeaves, cLeaves, 1, 0);
         AssertLogRelReturn(pStd1Leaf, VERR_CPUM_IPE_1);
 
+        //通过 Leaf 0 的 EAX、EBX、ECX、EDX 调用 CPUMCpuIdDetectX86VendorEx，确定 CPU 厂商（如 Intel、AMD）
         pFeatures->enmCpuVendor = CPUMCpuIdDetectX86VendorEx(pStd0Leaf->uEax,
                                                              pStd0Leaf->uEbx,
                                                              pStd0Leaf->uEcx,
                                                              pStd0Leaf->uEdx);
+        //CPU 型号：从 Leaf 1 的 EAX 中解析家族（uFamily）、型号（uModel）、步进（uStepping）
         pFeatures->uFamily      = RTX86GetCpuFamily(pStd1Leaf->uEax);
         pFeatures->uModel       = RTX86GetCpuModel(pStd1Leaf->uEax, pFeatures->enmCpuVendor == CPUMCPUVENDOR_INTEL);
         pFeatures->uStepping    = RTX86GetCpuStepping(pStd1Leaf->uEax);
+        //微架构判定, 根据厂商和型号确定微架构（如 Skylake、Zen）
         pFeatures->enmMicroarch = CPUMCpuIdDetermineX86MicroarchEx((CPUMCPUVENDOR)pFeatures->enmCpuVendor,
                                                                    pFeatures->uFamily,
                                                                    pFeatures->uModel,
                                                                    pFeatures->uStepping);
 
+        //从 Leaf 0x80000008 获取（cMaxPhysAddrWidth 和 cMaxLinearAddrWidth），若无则回退到 PSE-36 或 32 位默认值
         PCCPUMCPUIDLEAF const pExtLeaf8 = cpumCpuIdFindLeaf(paLeaves, cLeaves, 0x80000008);
-        if (pExtLeaf8)
+        //地址宽度检测: 扩展 Leaf > PSE36 标志 > 默认 32 位
+        if (pExtLeaf8)// 扩展 Leaf 0x80000008
         {
             pFeatures->cMaxPhysAddrWidth   = pExtLeaf8->uEax & 0xff;
             pFeatures->cMaxLinearAddrWidth = (pExtLeaf8->uEax >> 8) & 0xff;
         }
         else if (pStd1Leaf->uEdx & X86_CPUID_FEATURE_EDX_PSE36)
         {
-            pFeatures->cMaxPhysAddrWidth   = 36;
+            pFeatures->cMaxPhysAddrWidth   = 36; // 回退方案
             pFeatures->cMaxLinearAddrWidth = 36;
         }
         else
@@ -1432,6 +1476,13 @@ int cpumCpuIdExplodeFeaturesX86(PCCPUMCPUIDLEAF paLeaves, uint32_t cLeaves, PCCP
         }
 
         /* Standard features. */
+        //从 Leaf 1 的 EDX 和 ECX 中解析超过 50 项功能，包括：
+        /*
+         * 基础功能：fMsr（模型专用寄存器）、fApic（APIC 支持）、fPae（物理地址扩展）。
+              指令集扩展：fSse、fAvx、fAesNi、fRdRand。
+              虚拟化支持：fVmx（Intel VT-x）、fSvm（AMD SVM）。
+              若支持 VMX，进一步调用 cpumExplodeVmxFeatures 解析 VMX 相关特性。
+         * */
         pFeatures->fMsr                 = RT_BOOL(pStd1Leaf->uEdx & X86_CPUID_FEATURE_EDX_MSR);
         pFeatures->fApic                = RT_BOOL(pStd1Leaf->uEdx & X86_CPUID_FEATURE_EDX_APIC);
         pFeatures->fX2Apic              = RT_BOOL(pStd1Leaf->uEcx & X86_CPUID_FEATURE_ECX_X2APIC);
@@ -1472,6 +1523,12 @@ int cpumCpuIdExplodeFeaturesX86(PCCPUMCPUIDLEAF paLeaves, uint32_t cLeaves, PCCP
             cpumExplodeVmxFeatures(&pMsrs->hwvirt.vmx, pFeatures);
 
         /* Structured extended features. */
+        /*
+         * 从 Leaf 7 的 EBX 和 EDX 中解析：
+             指令集：fAvx2、fAvx512Foundation、fSha（SHA 指令）。
+             安全特性：fIbpb（间接分支预测屏障）、fStibp（单线程间接分支预测）。
+             其他：fHle（硬件锁省略）、fRtm（受限事务内存）。
+         * */
         PCCPUMCPUIDLEAF const pSxfLeaf0 = cpumCpuIdFindLeafEx(paLeaves, cLeaves, 7, 0);
         if (pSxfLeaf0)
         {
@@ -1503,6 +1560,11 @@ int cpumCpuIdExplodeFeaturesX86(PCCPUMCPUIDLEAF paLeaves, uint32_t cLeaves, PCCP
                                         ==                    (X86_CPUID_MWAIT_ECX_EXT | X86_CPUID_MWAIT_ECX_BREAKIRQIF0);
 
         /* Extended features. */
+        /*
+         * AMD/Hygon 专属特性：
+             解析长模式（fLongMode）、NX 位（fNoExecute）、3DNow! 指令集（f3DNow）。
+             SVM（安全虚拟机）特性详细解析（如嵌套分页 fSvmNestedPaging）。
+        */
         PCCPUMCPUIDLEAF const pExtLeaf  = cpumCpuIdFindLeaf(paLeaves, cLeaves, 0x80000001);
         if (pExtLeaf)
         {
@@ -1578,6 +1640,10 @@ int cpumCpuIdExplodeFeaturesX86(PCCPUMCPUIDLEAF paLeaves, uint32_t cLeaves, PCCP
         /*
          * Quirks.
          */
+        /*
+         * 厂商特定行为：
+           例如 AMD 的 FXSAVE 泄漏问题（fLeakyFxSR）。
+         * */
         pFeatures->fLeakyFxSR = pExtLeaf
                              && (pExtLeaf->uEdx & X86_CPUID_AMD_FEATURE_EDX_FFXSR)
                              && (   (   pFeatures->enmCpuVendor == CPUMCPUVENDOR_AMD
@@ -1590,6 +1656,7 @@ int cpumCpuIdExplodeFeaturesX86(PCCPUMCPUIDLEAF paLeaves, uint32_t cLeaves, PCCP
         pFeatures->cbMaxExtendedState = pFeatures->fFxSaveRstor ? sizeof(X86FXSTATE) : sizeof(X86FPUSTATE);
         if (pFeatures->fXSaveRstor)
         {
+            //根据 Leaf 13 计算 cbMaxExtendedState，支持 XSAVE/XRSTOR 时更新为更大的值（如 AVX-512 需额外空间）。
             PCCPUMCPUIDLEAF const pXStateLeaf0 = cpumCpuIdFindLeafEx(paLeaves, cLeaves, 13, 0);
             if (pXStateLeaf0)
             {
@@ -1623,6 +1690,7 @@ int cpumCpuIdExplodeFeaturesX86(PCCPUMCPUIDLEAF paLeaves, uint32_t cLeaves, PCCP
          * Enable or disable VEX support depending on whether it's needed. Note that AVX,
          * BMI1, and BMI2 all use VEX encoding but are theoretically independent of each other.
          */
+        //VEX 编码支持： 根据 AVX/BMI 指令需求设置 fVex 标志。
         pFeatures->fVex = pFeatures->fAvx | pFeatures->fBmi1 | pFeatures->fBmi2;
     }
     else

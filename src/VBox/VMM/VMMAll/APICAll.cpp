@@ -281,8 +281,10 @@ static int apicMsrAccessError(PVMCPUCC pVCpu, uint32_t u32Reg, APICMSRACCESS enm
     } const s_aAccess[] =
     {
         /* enmAccess  pszBefore                        pszAfter */
+        //模式不匹配：如在非x2APIC模式下访问MSR（类型0/1）
         /* 0 */     { "read MSR",                      " while not in x2APIC mode"    },
         /* 1 */     { "write MSR",                     " while not in x2APIC mode"    },
+        //如读写保留/未知MSR（类型2/3）、读写权限冲突（类型4/5）
         /* 2 */     { "read reserved/unknown MSR",     ""                             },
         /* 3 */     { "write reserved/unknown MSR",    ""                             },
         /* 4 */     { "read write-only MSR",           ""                             },
@@ -290,6 +292,7 @@ static int apicMsrAccessError(PVMCPUCC pVCpu, uint32_t u32Reg, APICMSRACCESS enm
         /* 6 */     { "read reserved bits of MSR",     ""                             },
         /* 7 */     { "write reserved bits of MSR",    ""                             },
         /* 8 */     { "write an invalid value to MSR", ""                             },
+        //如因配置禁用导致的访问（类型9/10)
         /* 9 */     { "write MSR",                     " disallowed by configuration" },
         /* 10 */    { "read MSR",                      " disallowed by configuration" },
     };
@@ -297,6 +300,8 @@ static int apicMsrAccessError(PVMCPUCC pVCpu, uint32_t u32Reg, APICMSRACCESS enm
 
     size_t const i = enmAccess;
     Assert(i < RT_ELEMENTS(s_aAccess));
+    //通过cLogMaxAccessError计数器限制最多输出5次相同错误日志，避免日志泛滥
+    //例如：APIC0: Attempt to write MSR (0x3a) while not in x2APIC mode -> #GP(0)
     if (pVCpu->apic.s.cLogMaxAccessError++ < 5)
         LogRel(("APIC%u: Attempt to %s (%#x)%s -> #GP(0)\n", pVCpu->idCpu, s_aAccess[i].pszBefore, u32Reg, s_aAccess[i].pszAfter));
     return VERR_CPUM_RAISE_GP_0;
@@ -350,13 +355,13 @@ const char *apicGetDeliveryModeName(XAPICDELIVERYMODE enmDeliveryMode)
 {
     switch (enmDeliveryMode)
     {
-        case XAPICDELIVERYMODE_FIXED:        return "Fixed";
-        case XAPICDELIVERYMODE_LOWEST_PRIO:  return "Lowest-priority";
-        case XAPICDELIVERYMODE_SMI:          return "SMI";
-        case XAPICDELIVERYMODE_NMI:          return "NMI";
-        case XAPICDELIVERYMODE_INIT:         return "INIT";
-        case XAPICDELIVERYMODE_STARTUP:      return "SIPI";
-        case XAPICDELIVERYMODE_EXTINT:       return "ExtINT";
+        case XAPICDELIVERYMODE_FIXED:        return "Fixed"; //固定优先级中断，按目标CPU的本地APIC ID精确投递
+        case XAPICDELIVERYMODE_LOWEST_PRIO:  return "Lowest-priority"; //动态选择当前优先级最低的CPU投递，用于负载均衡场景
+        case XAPICDELIVERYMODE_SMI:          return "SMI";//系统管理中断（System Management Interrupt），触发CPU进入SMM模式
+        case XAPICDELIVERYMODE_NMI:          return "NMI";//不可屏蔽中断（Non-Maskable Interrupt），用于硬件故障等紧急事件
+        case XAPICDELIVERYMODE_INIT:         return "INIT";//初始化中断，用于多核CPU的启动或复位流程
+        case XAPICDELIVERYMODE_STARTUP:      return "SIPI";//启动IPI（Startup IPI），用于唤醒从核执行指定代码段
+        case XAPICDELIVERYMODE_EXTINT:       return "ExtINT";//外部中断控制器（如8259A）转发的中断，兼容传统PIC模式
         default:                             break;
     }
     return "Invalid";
@@ -373,8 +378,8 @@ const char *apicGetDestModeName(XAPICDESTMODE enmDestMode)
 {
     switch (enmDestMode)
     {
-        case XAPICDESTMODE_PHYSICAL:  return "Physical";
-        case XAPICDESTMODE_LOGICAL:   return "Logical";
+        case XAPICDESTMODE_PHYSICAL:  return "Physical";//表示物理目标模式，通过CPU的APIC ID直接指定目标处理器
+        case XAPICDESTMODE_LOGICAL:   return "Logical"; //表示逻辑目标模式，通过逻辑地址掩码选择一组处理器
         default:                      break;
     }
     return "Invalid";
@@ -431,7 +436,7 @@ const char *apicGetTimerModeName(XAPICTIMERMODE enmTimerMode)
     {
         case XAPICTIMERMODE_ONESHOT:        return "One-shot";
         case XAPICTIMERMODE_PERIODIC:       return "Periodic";
-        case XAPICTIMERMODE_TSC_DEADLINE:   return "TSC deadline";
+        case XAPICTIMERMODE_TSC_DEADLINE:   return "TSC deadline";//TSC截止模式：基于时间戳计数器（TSC）的绝对时间触发中断（现代CPU支持）。
         default:                            break;
     }
     return "Invalid";
@@ -632,25 +637,26 @@ static int apicSetSvr(PVMCPUCC pVCpu, uint32_t uSvr)
         uValidMask |= XAPIC_SVR_SUPRESS_EOI_BROADCAST;
 
     if (   XAPIC_IN_X2APIC_MODE(pVCpu)
-        && (uSvr & ~uValidMask))
+        && (uSvr & ~uValidMask))//在x2APIC模式下，若写入值包含非法位（uSvr & ~uValidMask），触发apicMsrAccessError错误
         return apicMsrAccessError(pVCpu, MSR_IA32_X2APIC_SVR, APICMSRACCESS_WRITE_RSVD_BITS);
 
     Log2(("APIC%u: apicSetSvr: uSvr=%#RX32\n", pVCpu->idCpu, uSvr));
-    apicWriteRaw32(pXApicPage, XAPIC_OFF_SVR, uSvr);
+    apicWriteRaw32(pXApicPage, XAPIC_OFF_SVR, uSvr);//通过apicWriteRaw32写入32位值到SVR寄存器（偏移量XAPIC_OFF_SVR），控制APIC的全局行为
+    //当APIC被禁用（svr.u.fApicSoftwareEnable=0），强制屏蔽所有LVT（Local Vector Table）中断，包括定时器、LINT0/1等
     if (!pXApicPage->svr.u.fApicSoftwareEnable)
     {
         /** @todo CMCI. */
-        pXApicPage->lvt_timer.u.u1Mask   = 1;
+        pXApicPage->lvt_timer.u.u1Mask   = 1;// 屏蔽定时器中断
 #if XAPIC_HARDWARE_VERSION == XAPIC_HARDWARE_VERSION_P4
         pXApicPage->lvt_thermal.u.u1Mask = 1;
 #endif
         pXApicPage->lvt_perf.u.u1Mask    = 1;
-        pXApicPage->lvt_lint0.u.u1Mask   = 1;
+        pXApicPage->lvt_lint0.u.u1Mask   = 1; // 屏蔽LINT0中断
         pXApicPage->lvt_lint1.u.u1Mask   = 1;
         pXApicPage->lvt_error.u.u1Mask   = 1;
     }
 
-    apicSignalNextPendingIntr(pVCpu);
+    apicSignalNextPendingIntr(pVCpu); // 触发下一个待处理中断
     return VINF_SUCCESS;
 }
 
@@ -674,6 +680,10 @@ static int apicSetSvr(PVMCPUCC pVCpu, uint32_t uSvr)
  * @param   rcRZ                The return code if the operation cannot be
  *                              performed in the current context.
  */
+//负责根据投递模式（enmDeliveryMode）和目标CPU集合（pDestCpuSet）将中断（向量号为 uVector）分发给指定的虚拟CPU（vCPU）
+//处理7种标准APIC投递模式（如Fixed、NMI、SIPI等）。
+//区分R0/R3环境，处理需上下文切换的操作（如INIT/SIPI）。
+//通过 pfIntrAccepted 返回中断是否被接受，通过返回值处理异步操作。
 static VBOXSTRICTRC apicSendIntr(PVMCC pVM, PVMCPUCC pVCpu, uint8_t uVector, XAPICTRIGGERMODE enmTriggerMode,
                                  XAPICDELIVERYMODE enmDeliveryMode, PCVMCPUSET pDestCpuSet, bool *pfIntrAccepted,
                                  uint32_t uSrcTag, int rcRZ)
@@ -688,6 +698,7 @@ static VBOXSTRICTRC apicSendIntr(PVMCC pVM, PVMCPUCC pVCpu, uint8_t uVector, XAP
     bool          fAccepted = false;
     switch (enmDeliveryMode)
     {
+        //（固定投递）
         case XAPICDELIVERYMODE_FIXED:
         {
             for (VMCPUID idCpu = 0; idCpu < cCpus; idCpu++)
@@ -695,30 +706,36 @@ static VBOXSTRICTRC apicSendIntr(PVMCC pVM, PVMCPUCC pVCpu, uint8_t uVector, XAP
                 {
                     PVMCPUCC pItVCpu = pVM->CTX_SUFF(apCpus)[idCpu];
                     if (APICIsEnabled(pItVCpu))
+                        //行为：向目标集合中的所有vCPU发送同一中断向量。
+                        //应用场景：普通设备中断（如IOAPIC转发的中断）。
                         fAccepted = apicPostInterrupt(pItVCpu, uVector, enmTriggerMode, uSrcTag);
                 }
             break;
         }
 
+        //行为：实际实现简化为投递给目标集合中的第一个vCPU（需改进为真实优先级仲裁）。
+        //应用场景：负载均衡场景下选择优先级最低的CPU处理中断。
         case XAPICDELIVERYMODE_LOWEST_PRIO:
         {
             VMCPUID const idCpu = VMCPUSET_FIND_FIRST_PRESENT(pDestCpuSet);
             AssertMsgBreak(idCpu < pVM->cCpus, ("APIC: apicSendIntr: No CPU found for lowest-priority delivery mode! idCpu=%u\n", idCpu));
             PVMCPUCC pVCpuDst = pVM->CTX_SUFF(apCpus)[idCpu];
             if (APICIsEnabled(pVCpuDst))
-                fAccepted = apicPostInterrupt(pVCpuDst, uVector, enmTriggerMode, uSrcTag);
+                fAccepted = apicPostInterrupt(pVCpuDst, uVector, enmTriggerMode, uSrcTag);// 仅投递给第一个目标vCPU
             else
                 AssertMsgFailed(("APIC: apicSendIntr: Target APIC not enabled in lowest-priority delivery mode! idCpu=%u\n", idCpu));
             break;
         }
 
+        //行为：通过快速标志（Fast Flag）触发特殊中断，绕过APIC的普通优先级检查。
+        //虚拟化处理：直接设置vCPU的中断标志，由后续调度逻辑处理。
         case XAPICDELIVERYMODE_SMI:
         {
             for (VMCPUID idCpu = 0; idCpu < cCpus; idCpu++)
                 if (VMCPUSET_IS_PRESENT(pDestCpuSet, idCpu))
                 {
                     Log2(("APIC: apicSendIntr: Raising SMI on VCPU%u\n", idCpu));
-                    apicSetInterruptFF(pVM->CTX_SUFF(apCpus)[idCpu], PDMAPICIRQ_SMI);
+                    apicSetInterruptFF(pVM->CTX_SUFF(apCpus)[idCpu], PDMAPICIRQ_SMI);// 设置SMI标志位
                     fAccepted = true;
                 }
             break;
@@ -733,13 +750,14 @@ static VBOXSTRICTRC apicSendIntr(PVMCC pVM, PVMCPUCC pVCpu, uint8_t uVector, XAP
                     if (APICIsEnabled(pItVCpu))
                     {
                         Log2(("APIC: apicSendIntr: Raising NMI on VCPU%u\n", idCpu));
-                        apicSetInterruptFF(pItVCpu, PDMAPICIRQ_NMI);
+                        apicSetInterruptFF(pItVCpu, PDMAPICIRQ_NMI);// 设置NMI标志位
                         fAccepted = true;
                     }
                 }
             break;
         }
 
+        //INIT/SIPI Mode（初始化/启动IPI）
         case XAPICDELIVERYMODE_INIT:
         {
 #ifdef IN_RING3
@@ -747,12 +765,12 @@ static VBOXSTRICTRC apicSendIntr(PVMCC pVM, PVMCPUCC pVCpu, uint8_t uVector, XAP
                 if (VMCPUSET_IS_PRESENT(pDestCpuSet, idCpu))
                 {
                     Log2(("APIC: apicSendIntr: Issuing INIT to VCPU%u\n", idCpu));
-                    VMMR3SendInitIpi(pVM, idCpu);
+                    VMMR3SendInitIpi(pVM, idCpu);// R3环境直接调用
                     fAccepted = true;
                 }
 #else
             /* We need to return to ring-3 to deliver the INIT. */
-            rcStrict = rcRZ;
+            rcStrict = rcRZ;// R0环境需返回到R3处理
             fAccepted = true;
 #endif
             break;
@@ -777,13 +795,14 @@ static VBOXSTRICTRC apicSendIntr(PVMCC pVM, PVMCPUCC pVCpu, uint8_t uVector, XAP
             break;
         }
 
+        //ExtINT Mode（外部中断）
         case XAPICDELIVERYMODE_EXTINT:
         {
             for (VMCPUID idCpu = 0; idCpu < cCpus; idCpu++)
                 if (VMCPUSET_IS_PRESENT(pDestCpuSet, idCpu))
                 {
                     Log2(("APIC: apicSendIntr: Raising EXTINT on VCPU%u\n", idCpu));
-                    apicSetInterruptFF(pVM->CTX_SUFF(apCpus)[idCpu], PDMAPICIRQ_EXTINT);
+                    apicSetInterruptFF(pVM->CTX_SUFF(apCpus)[idCpu], PDMAPICIRQ_EXTINT); // 模拟8259A中断控制器行为
                     fAccepted = true;
                 }
             break;
@@ -841,6 +860,8 @@ static VBOXSTRICTRC apicSendIntr(PVMCC pVM, PVMCPUCC pVCpu, uint8_t uVector, XAP
  *
  * @thread  Any.
  */
+//判断目标地址 fDest 是否匹配当前vCPU的逻辑APIC ID，
+//支持xAPIC和x2APIC两种模式，并根据不同硬件架构（P4/P6）实现差异化逻辑地址解析
 static bool apicIsLogicalDest(PVMCPUCC pVCpu, uint32_t fDest)
 {
     if (XAPIC_IN_X2APIC_MODE(pVCpu))
@@ -851,10 +872,12 @@ static bool apicIsLogicalDest(PVMCPUCC pVCpu, uint32_t fDest)
          *    - High 16 bits is the cluster ID.
          *    - Low 16 bits: each bit represents a unique APIC within the cluster.
          */
+        //高16位：Cluster ID（集群标识）
+        //低16位：每个bit代表集群内的一个APIC（位图寻址）
         PCX2APICPAGE pX2ApicPage = VMCPU_TO_CX2APICPAGE(pVCpu);
         uint32_t const u32Ldr    = pX2ApicPage->ldr.u32LogicalApicId;
-        if (X2APIC_LDR_GET_CLUSTER_ID(u32Ldr) == (fDest & X2APIC_LDR_CLUSTER_ID))
-            return RT_BOOL(u32Ldr & fDest & X2APIC_LDR_LOGICAL_ID);
+        if (X2APIC_LDR_GET_CLUSTER_ID(u32Ldr) == (fDest & X2APIC_LDR_CLUSTER_ID)) //检查目标Cluster ID是否与当前vCPU的Cluster ID一致
+            return RT_BOOL(u32Ldr & fDest & X2APIC_LDR_LOGICAL_ID);//检查目标逻辑ID位图与当前vCPU的位图是否有交集（按位与操作）
         return false;
     }
 
@@ -865,13 +888,15 @@ static bool apicIsLogicalDest(PVMCPUCC pVCpu, uint32_t fDest)
      */
     Assert(!XAPIC_IN_X2APIC_MODE(pVCpu));
     if ((fDest & XAPIC_LDR_FLAT_LOGICAL_ID) == XAPIC_LDR_FLAT_LOGICAL_ID)
-        return true;
+        return true;// // 全1地址视为广播
 
     PCXAPICPAGE pXApicPage = VMCPU_TO_CXAPICPAGE(pVCpu);
     XAPICDESTFORMAT enmDestFormat = (XAPICDESTFORMAT)pXApicPage->dfr.u.u4Model;
     if (enmDestFormat == XAPICDESTFORMAT_FLAT)
     {
         /* The destination mask is interpreted as a bitmap of 8 unique logical APIC IDs. */
+        //8位目标地址直接作为位图，每个bit对应一个APIC（最多支持8个）
+        //示例：当前vCPU的LDR= 0x01（bit0），目标地址 fDest=0x03（bit0+bit1）→ 匹配成功。
         uint8_t const u8Ldr = pXApicPage->ldr.u.u8LogicalApicId;
         return RT_BOOL(u8Ldr & fDest & XAPIC_LDR_FLAT_LOGICAL_ID);
     }
@@ -881,6 +906,10 @@ static bool apicIsLogicalDest(PVMCPUCC pVCpu, uint32_t fDest)
      *    - High 4 bits is the cluster ID.
      *    - Low 4 bits: each bit represents a unique APIC within the cluster.
      */
+    //高4位：Cluster ID（最多16个集群）
+    //低4位：集群内APIC位图（最多4个APIC）
+    //检查目标Cluster ID是否匹配。
+    //若匹配，检查集群内APIC位图是否有交集
     Assert(enmDestFormat == XAPICDESTFORMAT_CLUSTER);
     uint8_t const u8Ldr = pXApicPage->ldr.u.u8LogicalApicId;
     if (XAPIC_LDR_CLUSTERED_GET_CLUSTER_ID(u8Ldr) == (fDest & XAPIC_LDR_CLUSTERED_CLUSTER_ID))
@@ -903,6 +932,20 @@ static bool apicIsLogicalDest(PVMCPUCC pVCpu, uint32_t fDest)
  * @param   enmDeliveryMode The delivery mode.
  * @param   pDestCpuSet     The destination CPU set to update.
  */
+//该函数根据目标掩码（fDestMask）、广播掩码（fBroadcastMask）
+//和投递模式（enmDestMode），生成目标vCPU集合（pDestCpuSet），用于后续中断投递
+/*
+  模式仲裁：处理物理寻址（Physical）和逻辑寻址（Logical）两种目标模式。
+  广播检测：识别全1掩码的特殊广播情况。
+  最低优先级仲裁：在逻辑模式下选择TPR（Task Priority Register）最低的vCPU。
+*/
+
+/*
+  apicSendIntr (Fixed模式)
+    → apicGetDestCpuSet (物理模式, fDestMask=0x2)
+    → VMCPUSET_ADD(pDestCpuSet, 1)  // 目标vCPU1
+    → apicPostInterrupt(vCPU1)
+*/
 static void apicGetDestCpuSet(PVMCC pVM, uint32_t fDestMask, uint32_t fBroadcastMask, XAPICDESTMODE enmDestMode,
                               XAPICDELIVERYMODE enmDeliveryMode, PVMCPUSET pDestCpuSet)
 {
@@ -920,11 +963,14 @@ static void apicGetDestCpuSet(PVMCC pVM, uint32_t fDestMask, uint32_t fBroadcast
     if (   enmDestMode == XAPICDESTMODE_PHYSICAL
         && enmDeliveryMode == XAPICDELIVERYMODE_LOWEST_PRIO)
     {
-        AssertMsgFailed(("APIC: Lowest-priority delivery using physical destination mode!"));
-        enmDeliveryMode = XAPICDELIVERYMODE_FIXED;
+        AssertMsgFailed(("APIC: Lowest-priority delivery using physical destination mode!")); // 物理模式不支持最低优先级投递
+        enmDeliveryMode = XAPICDELIVERYMODE_FIXED;// 降级为Fixed模式
     }
 
     uint32_t const cCpus = pVM->cCpus;
+    //仲裁逻辑：
+    //遍历所有匹配逻辑目标的vCPU。
+    //选择TPR值最低的vCPU（若相同，取最高ID的vCPU，符合AMD规范16.6.2）。
     if (enmDeliveryMode == XAPICDELIVERYMODE_LOWEST_PRIO)
     {
         Assert(enmDestMode == XAPICDESTMODE_LOGICAL);
@@ -944,7 +990,7 @@ static void apicGetDestCpuSet(PVMCC pVM, uint32_t fDestMask, uint32_t fBroadcast
                  * Hence the use of "<=" in the check below.
                  * See AMD spec. 16.6.2 "Lowest Priority Messages and Arbitration".
                  */
-                if (u8Tpr <= u8LowestTpr)
+                if (u8Tpr <= u8LowestTpr) // 选择TPR最低的vCPU
                 {
                     u8LowestTpr    = u8Tpr;
                     idCpuLowestTpr = idCpu;
@@ -970,20 +1016,24 @@ static void apicGetDestCpuSet(PVMCC pVM, uint32_t fDestMask, uint32_t fBroadcast
      * [2] See Intel spec. 10.6.2.1 "Physical Destination Mode".
      * [2] See AMD spec. 16.6.1 "Receiving System and IPI Interrupts".
      */
+    //xAPIC：fBroadcastMask=0xFF（8位掩码）
+    //x2APIC：fBroadcastMask=0xFFFFFFFF（32位掩码）
     if ((fDestMask & fBroadcastMask) == fBroadcastMask)
     {
-        VMCPUSET_FILL(pDestCpuSet);
+        VMCPUSET_FILL(pDestCpuSet);//广播, 填充所有vCPU, 全1掩码触发广播
         return;
     }
 
     if (enmDestMode == XAPICDESTMODE_PHYSICAL)
     {
         /* The destination mask is interpreted as the physical APIC ID of a single target. */
-#if 1
+#if 1   // 直接使用vCPU ID映射
+        // 默认启用快速路径，牺牲APIC ID可编程性换取性能。
         /* Since our physical APIC ID is read-only to software, set the corresponding bit in the CPU set. */
         if (RT_LIKELY(fDestMask < cCpus))
-            VMCPUSET_ADD(pDestCpuSet, fDestMask);
-#else
+            //虚拟化中简化实现，假设 fDestMask 直接对应vCPU ID（从0开始）。
+            VMCPUSET_ADD(pDestCpuSet, fDestMask);//直接映射vCPU ID
+#else  // 完整APIC ID匹配（未启用）
         /* The physical APIC ID may not match our VCPU ID, search through the list of targets. */
         for (VMCPUID idCpu = 0; idCpu < cCpus; idCpu++)
         {
@@ -991,7 +1041,7 @@ static void apicGetDestCpuSet(PVMCC pVM, uint32_t fDestMask, uint32_t fBroadcast
             if (XAPIC_IN_X2APIC_MODE(pVCpuDst))
             {
                 PCX2APICPAGE pX2ApicPage = VMCPU_TO_CX2APICPAGE(pVCpuDst);
-                if (pX2ApicPage->id.u32ApicId == fDestMask)
+                if (pX2ApicPage->id.u32ApicId == fDestMask) // 实际APIC ID匹配
                     VMCPUSET_ADD(pDestCpuSet, pVCpuDst->idCpu);
             }
             else
@@ -1015,7 +1065,7 @@ static void apicGetDestCpuSet(PVMCC pVM, uint32_t fDestMask, uint32_t fBroadcast
         for (VMCPUID idCpu = 0; idCpu < cCpus; idCpu++)
         {
             PVMCPUCC pVCpuDst = pVM->CTX_SUFF(apCpus)[idCpu];
-            if (apicIsLogicalDest(pVCpuDst, fDestMask))
+            if (apicIsLogicalDest(pVCpuDst, fDestMask)) //// 调用逻辑目标判定函数
                 VMCPUSET_ADD(pDestCpuSet, pVCpuDst->idCpu);
         }
     }
@@ -1031,6 +1081,34 @@ static void apicGetDestCpuSet(PVMCC pVM, uint32_t fDestMask, uint32_t fBroadcast
  * @param   rcRZ            The return code if the operation cannot be
  *                          performed in the current context.
  */
+/*
+该函数负责处理虚拟APIC的IPI（处理器间中断）发送请求，主要流程包括：
+  ICR解析：从APIC页面的ICR寄存器提取投递参数（模式/目标/触发方式等）
+  硬件兼容性检查：验证P4处理器的特殊限制
+  目标CPU集合生成：根据目标简写模式（DestShorthand）确定接收vCPU集合
+  中断投递：调用 apicSendIntr 执行实际中断注入
+ * */
+/*
+ * // ICR_LOW 寄存器字段（共32位）
+typedef struct {
+    uint8_t  u8Vector;          // 中断向量号（bits 7:0）
+    uint3_t  u3DeliveryMode;   // 投递模式（bits 10:8）
+    uint1_t  u1DestMode;       // 目标模式（物理/逻辑，bit 11）
+    uint1_t  u1Level;          // 电平触发（bit 14）
+    uint1_t  u1TriggerMode;    // 边沿/电平触发（bit 15）
+    uint2_t  u2DestShorthand;  // 目标简写模式（bits 19:18）
+} XAPIC_ICR_LOW;
+
+// ICR_HIGH 寄存器（存储目标APIC ID）
+uint32_t u32IcrHi;  // x2APIC模式（32位）
+uint8_t  u8Dest;    // xAPIC模式（8位）
+ * */
+/*
+ * Guest写入ICR → VMExit处理 → apicSendIpi
+    → apicGetDestCpuSet（生成目标集合）
+    → apicSendIntr（注入中断到目标vCPU）
+    → VMEntry后目标vCPU处理中断
+ * */
 DECLINLINE(VBOXSTRICTRC) apicSendIpi(PVMCPUCC pVCpu, int rcRZ)
 {
     VMCPU_ASSERT_EMT(pVCpu);
@@ -1056,16 +1134,18 @@ DECLINLINE(VBOXSTRICTRC) apicSendIpi(PVMCPUCC pVCpu, int rcRZ)
      *
      * See AMD spec. 16.5 "Interprocessor Interrupts (IPI)" for a table of valid ICR combinations.
      */
+    //P4/Xeon不支持Level De-assert的特定投递模式组合（源于Intel勘误表）
+    //虚拟化实现：严格模拟硬件行为，避免触发Guest OS异常
     if (   enmTriggerMode  == XAPICTRIGGERMODE_LEVEL
         && enmInitLevel    == XAPICINITLEVEL_DEASSERT
-        && (   enmDeliveryMode == XAPICDELIVERYMODE_FIXED
-            || enmDeliveryMode == XAPICDELIVERYMODE_LOWEST_PRIO
-            || enmDeliveryMode == XAPICDELIVERYMODE_SMI
-            || enmDeliveryMode == XAPICDELIVERYMODE_NMI
-            || enmDeliveryMode == XAPICDELIVERYMODE_INIT))
+        && (   enmDeliveryMode == XAPICDELIVERYMODE_FIXED//固定投递到目标CPU
+            || enmDeliveryMode == XAPICDELIVERYMODE_LOWEST_PRIOa//投递到TPR最低的CPU
+            || enmDeliveryMode == XAPICDELIVERYMODE_SMIa//系统管理中断
+            || enmDeliveryMode == XAPICDELIVERYMODE_NMI//不可屏蔽中断
+            || enmDeliveryMode == XAPICDELIVERYMODE_INIT))//INIT中断（处理器初始化）
     {
         Log2(("APIC%u: %s level de-assert unsupported, ignoring!\n", pVCpu->idCpu, apicGetDeliveryModeName(enmDeliveryMode)));
-        return VINF_SUCCESS;
+        return VINF_SUCCESS;// 静默忽略不支持的组合
     }
 #else
 # error "Implement Pentium and P6 family APIC architectures"
@@ -1075,10 +1155,15 @@ DECLINLINE(VBOXSTRICTRC) apicSendIpi(PVMCPUCC pVCpu, int rcRZ)
      * The destination and delivery modes are ignored/by-passed when a destination shorthand is specified.
      * See Intel spec. 10.6.2.3 "Broadcast/Self Delivery Mode".
      */
-    VMCPUSET DestCpuSet;
+    /*
+     * 广播掩码差异：
+        xAPIC：XAPIC_ID_BROADCAST_MASK = 0xFF
+        x2APIC：X2APIC_ID_BROADCAST_MASK = 0xFFFFFFFF
+     * */
+    VMCPUSET DestCpuSet;//目标vCPU位图
     switch (enmDestShorthand)
     {
-        case XAPICDESTSHORTHAND_NONE:
+        case XAPICDESTSHORTHAND_NONE: // 常规目标模式
         {
             PVMCC pVM = pVCpu->CTX_SUFF(pVM);
             uint32_t const fBroadcastMask = XAPIC_IN_X2APIC_MODE(pVCpu) ? X2APIC_ID_BROADCAST_MASK : XAPIC_ID_BROADCAST_MASK;
@@ -1086,20 +1171,20 @@ DECLINLINE(VBOXSTRICTRC) apicSendIpi(PVMCPUCC pVCpu, int rcRZ)
             break;
         }
 
-        case XAPICDESTSHORTHAND_SELF:
+        case XAPICDESTSHORTHAND_SELF:// 仅发送给自己
         {
             VMCPUSET_EMPTY(&DestCpuSet);
             VMCPUSET_ADD(&DestCpuSet, pVCpu->idCpu);
             break;
         }
 
-        case XAPIDDESTSHORTHAND_ALL_INCL_SELF:
+        case XAPIDDESTSHORTHAND_ALL_INCL_SELF:// 广播（含自己）
         {
             VMCPUSET_FILL(&DestCpuSet);
             break;
         }
 
-        case XAPICDESTSHORTHAND_ALL_EXCL_SELF:
+        case XAPICDESTSHORTHAND_ALL_EXCL_SELF:// 广播（不含自己）
         {
             VMCPUSET_FILL(&DestCpuSet);
             VMCPUSET_DEL(&DestCpuSet, pVCpu->idCpu);
@@ -1119,13 +1204,14 @@ DECLINLINE(VBOXSTRICTRC) apicSendIpi(PVMCPUCC pVCpu, int rcRZ)
  * @param   pVCpu           The cross context virtual CPU structure.
  * @param   uIcrHi          The ICR high dword.
  */
+//设置xAPIC模式下ICR_HI寄存器的值
 static VBOXSTRICTRC apicSetIcrHi(PVMCPUCC pVCpu, uint32_t uIcrHi)
 {
     VMCPU_ASSERT_EMT(pVCpu);
     Assert(!XAPIC_IN_X2APIC_MODE(pVCpu));
 
     PXAPICPAGE pXApicPage = VMCPU_TO_XAPICPAGE(pVCpu);
-    pXApicPage->icr_hi.all.u32IcrHi = uIcrHi & XAPIC_ICR_HI_DEST;
+    pXApicPage->icr_hi.all.u32IcrHi = uIcrHi & XAPIC_ICR_HI_DEST;//将参数 uIcrHi 的值写入虚拟APIC的ICR_HI寄存器
     STAM_COUNTER_INC(&pVCpu->apic.s.StatIcrHiWrite);
     Log2(("APIC%u: apicSetIcrHi: uIcrHi=%#RX32\n", pVCpu->idCpu, pXApicPage->icr_hi.all.u32IcrHi));
 
@@ -1144,6 +1230,8 @@ static VBOXSTRICTRC apicSetIcrHi(PVMCPUCC pVCpu, uint32_t uIcrHi)
  * @param   fUpdateStat     Whether to update the ICR low write statistics
  *                          counter.
  */
+//XAPIC_ICR_LO_WR_VALID 确保仅保留有效字段（如向量号、投递模式等），过滤硬件保留位
+//规范依据：符合Intel SDM Vol.3 10.6.1对ICR_LO寄存器的定义
 static VBOXSTRICTRC apicSetIcrLo(PVMCPUCC pVCpu, uint32_t uIcrLo, int rcRZ, bool fUpdateStat)
 {
     VMCPU_ASSERT_EMT(pVCpu);
@@ -1156,7 +1244,7 @@ static VBOXSTRICTRC apicSetIcrLo(PVMCPUCC pVCpu, uint32_t uIcrLo, int rcRZ, bool
         STAM_COUNTER_INC(&pVCpu->apic.s.StatIcrLoWrite);
     RT_NOREF(fUpdateStat);
 
-    return apicSendIpi(pVCpu, rcRZ);
+    return apicSendIpi(pVCpu, rcRZ); // 同步触发IPI
 }
 
 
@@ -1174,19 +1262,21 @@ static VBOXSTRICTRC apicSetIcrLo(PVMCPUCC pVCpu, uint32_t uIcrLo, int rcRZ, bool
  *          happens when invalid bits are set. For the time being, it will
  *          \#GP like a regular x2APIC access.
  */
+//该函数用于在x2APIC模式下设置64位ICR
+//规范引用：符合Intel Vol.3 10.12.9对x2APIC ICR保留位的约束
 static VBOXSTRICTRC apicSetIcr(PVMCPUCC pVCpu, uint64_t u64Icr, int rcRZ)
 {
     VMCPU_ASSERT_EMT(pVCpu);
 
     /* Validate. */
     uint32_t const uLo = RT_LO_U32(u64Icr);
-    if (RT_LIKELY(!(uLo & ~XAPIC_ICR_LO_WR_VALID)))
+    if (RT_LIKELY(!(uLo & ~XAPIC_ICR_LO_WR_VALID)))//检查ICR_LO保留位是否全0, XAPIC_ICR_LO_WR_VALID 通常为 0xFFF32000
     {
         /* Update high dword first, then update the low dword which sends the IPI. */
         PX2APICPAGE pX2ApicPage = VMCPU_TO_X2APICPAGE(pVCpu);
-        pX2ApicPage->icr_hi.u32IcrHi = RT_HI_U32(u64Icr);
+        pX2ApicPage->icr_hi.u32IcrHi = RT_HI_U32(u64Icr);// 先写高32位
         STAM_COUNTER_INC(&pVCpu->apic.s.StatIcrFullWrite);
-        return apicSetIcrLo(pVCpu, uLo, rcRZ, false /* fUpdateStat */);
+        return apicSetIcrLo(pVCpu, uLo, rcRZ, false /* fUpdateStat */);// 后写低32位
     }
     return apicMsrAccessError(pVCpu, MSR_IA32_X2APIC_ICR, APICMSRACCESS_WRITE_RSVD_BITS);
 }
@@ -1224,6 +1314,12 @@ static int apicSetEsr(PVMCPUCC pVCpu, uint32_t uEsr)
  *
  * @param   pVCpu           The cross context virtual CPU structure.
  */
+/*
+寄存器	     字段位域    作用                       虚拟化处理
+TPR	         [7:4]	    软件设置的任务优先级阈值	Guest写操作触发PPR重计算
+ISR	         [255:0]	标记当前正在处理的中断向量	每个bit对应一个中断向量号
+PPR	         [7:4]	    实际生效的处理器优先级	    由TPR和ISR动态计算得出
+ * */
 static void apicUpdatePpr(PVMCPUCC pVCpu)
 {
     VMCPU_ASSERT_EMT(pVCpu);
@@ -1232,10 +1328,12 @@ static void apicUpdatePpr(PVMCPUCC pVCpu)
     PXAPICPAGE    pXApicPage = VMCPU_TO_XAPICPAGE(pVCpu);
     uint8_t const uIsrv      = apicGetHighestSetBitInReg(&pXApicPage->isr, 0 /* rcNotFound */);
     uint8_t       uPpr;
+    //XAPIC_TPR_GET_TP：提取TPR[7:4]的任务优先级字段
+    //XAPIC_PPR_GET_PP：将ISR最高位索引转换为优先级值 (右移4位对齐)
     if (XAPIC_TPR_GET_TP(pXApicPage->tpr.u8Tpr) >= XAPIC_PPR_GET_PP(uIsrv))
-        uPpr = pXApicPage->tpr.u8Tpr;
+        uPpr = pXApicPage->tpr.u8Tpr;// TPR优先级更高时直接采用TPR值
     else
-        uPpr = XAPIC_PPR_GET_PP(uIsrv);
+        uPpr = XAPIC_PPR_GET_PP(uIsrv);// 否则采用ISR最高位优先级
     pXApicPage->ppr.u8Ppr = uPpr;
 }
 
@@ -1305,6 +1403,15 @@ static int apicSetTprEx(PVMCPUCC pVCpu, uint32_t uTpr, bool fForceX2ApicBehaviou
  * @param   fForceX2ApicBehaviour   Pretend the APIC is in x2APIC mode during
  *                                  this write.
  */
+/*
+  中断结束处理：清除ISR（In-Service Register）最高优先级中断
+  级联操作：
+    对电平触发中断广播EOI至I/O APIC
+    更新PPR（Processor Priority Register）和待处理中断
+    模式兼容：支持xAPIC/x2APIC双模式（通过fForceX2ApicBehaviour强制控制）
+
+    虚拟化扩展：fForceX2ApicBehaviour用于嵌套虚拟化场景的强制模式切换
+*/
 static VBOXSTRICTRC apicSetEoi(PVMCPUCC pVCpu, uint32_t uEoi, bool fForceX2ApicBehaviour)
 {
     VMCPU_ASSERT_EMT(pVCpu);
@@ -1315,10 +1422,10 @@ static VBOXSTRICTRC apicSetEoi(PVMCPUCC pVCpu, uint32_t uEoi, bool fForceX2ApicB
     bool const fX2ApicMode = XAPIC_IN_X2APIC_MODE(pVCpu) || fForceX2ApicBehaviour;
     if (   fX2ApicMode
         && (uEoi & ~XAPIC_EOI_WO_VALID))
-        return apicMsrAccessError(pVCpu, MSR_IA32_X2APIC_EOI, APICMSRACCESS_WRITE_RSVD_BITS);
+        return apicMsrAccessError(pVCpu, MSR_IA32_X2APIC_EOI, APICMSRACCESS_WRITE_RSVD_BITS);// 规范要求：x2APIC的EOI MSR（0x80B）必须全0写入
 
     PXAPICPAGE pXApicPage = VMCPU_TO_XAPICPAGE(pVCpu);
-    int isrv = apicGetHighestSetBitInReg(&pXApicPage->isr, -1 /* rcNotFound */);
+    int isrv = apicGetHighestSetBitInReg(&pXApicPage->isr, -1 /* rcNotFound */);//获取ISR中最高优先级中断向量
     if (isrv >= 0)
     {
         /*
@@ -1330,10 +1437,11 @@ static VBOXSTRICTRC apicSetEoi(PVMCPUCC pVCpu, uint32_t uEoi, bool fForceX2ApicB
          */
         Assert(isrv <= (int)UINT8_MAX);
         uint8_t const uVector      = isrv;
-        bool const fLevelTriggered = apicTestVectorInReg(&pXApicPage->tmr, uVector);
+        bool const fLevelTriggered = apicTestVectorInReg(&pXApicPage->tmr, uVector);//检查TMR（Trigger Mode Register）确定是否为电平触发
         if (fLevelTriggered)
         {
-            PDMIoApicBroadcastEoi(pVCpu->CTX_SUFF(pVM), uVector);
+            //并发安全：广播期间可能触发新中断，但EMT线程独占保证原子性
+            PDMIoApicBroadcastEoi(pVCpu->CTX_SUFF(pVM), uVector);//硬件行为模拟：物理APIC通过总线通知I/O APIC中断结束
 
             /*
              * Clear the vector from the TMR.
@@ -1349,6 +1457,7 @@ static VBOXSTRICTRC apicSetEoi(PVMCPUCC pVCpu, uint32_t uEoi, bool fForceX2ApicB
              * The LINT1 pin does not support level-triggered interrupts.
              * See Intel spec. 10.5.1 "Local Vector Table".
              */
+            //LINT0特殊处理：仅对Fixed模式电平触发中断清除Remote IRR位
             uint32_t const uLvtLint0 = pXApicPage->lvt_lint0.all.u32LvtLint0;
             if (   XAPIC_LVT_GET_REMOTE_IRR(uLvtLint0)
                 && XAPIC_LVT_GET_VECTOR(uLvtLint0) == uVector
@@ -1365,9 +1474,9 @@ static VBOXSTRICTRC apicSetEoi(PVMCPUCC pVCpu, uint32_t uEoi, bool fForceX2ApicB
          * Mark interrupt as serviced, update the PPR and signal pending interrupts.
          */
         Log2(("APIC%u: apicSetEoi: Clearing interrupt from ISR. uVector=%#x\n", pVCpu->idCpu, uVector));
-        apicClearVectorInReg(&pXApicPage->isr, uVector);
-        apicUpdatePpr(pVCpu);
-        apicSignalNextPendingIntr(pVCpu);
+        apicClearVectorInReg(&pXApicPage->isr, uVector);// 清除ISR位
+        apicUpdatePpr(pVCpu);                           // 更新处理器优先级
+        apicSignalNextPendingIntr(pVCpu);               // 触发下一待处理中断
     }
     else
     {
@@ -1392,18 +1501,20 @@ static VBOXSTRICTRC apicSetEoi(PVMCPUCC pVCpu, uint32_t uEoi, bool fForceX2ApicB
  *
  * @remarks LDR is read-only in x2APIC mode.
  */
-static VBOXSTRICTRC apicSetLdr(PVMCPUCC pVCpu, uint32_t uLdr)
+//更新APIC的逻辑目标地址（用于逻辑目标模式下的中断路由）
+static vboxstrictrc apicsetldr(pvmcpucc pvcpu, uint32_t uldr)
 {
-    VMCPU_ASSERT_EMT(pVCpu);
-    PCAPIC pApic = VM_TO_APIC(pVCpu->CTX_SUFF(pVM));
-    Assert(!XAPIC_IN_X2APIC_MODE(pVCpu) || pApic->fHyperVCompatMode); RT_NOREF_PV(pApic);
+    vmcpu_assert_emt(pvcpu);
+    pcapic papic = vm_to_apic(pvcpu->ctx_suff(pvm));
+    assert(!xapic_in_x2apic_mode(pvcpu) || papic->fhypervcompatmode); rt_noref_pv(papic);//x2APIC模式下LDR寄存器不可直接写入（需通过MSR 0x80D）
 
-    Log2(("APIC%u: apicSetLdr: uLdr=%#RX32\n", pVCpu->idCpu, uLdr));
+    log2(("apic%u: apicsetldr: uldr=%#rx32\n", pvcpu->idcpu, uldr));
 
-    PXAPICPAGE pXApicPage = VMCPU_TO_XAPICPAGE(pVCpu);
-    apicWriteRaw32(pXApicPage, XAPIC_OFF_LDR, uLdr & XAPIC_LDR_VALID);
-    STAM_COUNTER_INC(&pVCpu->apic.s.StatLdrWrite);
-    return VINF_SUCCESS;
+    pxapicpage pxapicpage = vmcpu_to_xapicpage(pvcpu);
+    //位域过滤：XAPIC_LDR_VALID掩码确保只写入有效位（xAPIC为[31:24]和[15:8]，x2APIC为[15:0]）
+    apicwriteraw32(pxapicpage, xapic_off_ldr, uldr & xapic_ldr_valid);
+    stam_counter_inc(&pvcpu->apic.s.statldrwrite);
+    return vinf_success;
 }
 
 
@@ -1419,15 +1530,16 @@ static VBOXSTRICTRC apicSetLdr(PVMCPUCC pVCpu, uint32_t uLdr)
 static VBOXSTRICTRC apicSetDfr(PVMCPUCC pVCpu, uint32_t uDfr)
 {
     VMCPU_ASSERT_EMT(pVCpu);
-    Assert(!XAPIC_IN_X2APIC_MODE(pVCpu));
+    Assert(!XAPIC_IN_X2APIC_MODE(pVCpu));//x2APIC架构移除DFR寄存器，改用Cluster模型目标寻址
 
-    uDfr &= XAPIC_DFR_VALID;
-    uDfr |= XAPIC_DFR_RSVD_MB1;
+    //uDfr 合法值：0xFFFFFFFF（Flat模式）或0x0FFFFFFF（Hierarchical模式）
+    uDfr &= XAPIC_DFR_VALID;// 仅保留[31:28]有效位,XAPIC_DFR_VALID：掩码0xF0000000
+    uDfr |= XAPIC_DFR_RSVD_MB1;// 强制[27:0]保留位为1
 
     Log2(("APIC%u: apicSetDfr: uDfr=%#RX32\n", pVCpu->idCpu, uDfr));
 
     PXAPICPAGE pXApicPage = VMCPU_TO_XAPICPAGE(pVCpu);
-    apicWriteRaw32(pXApicPage, XAPIC_OFF_DFR, uDfr);
+    apicWriteRaw32(pXApicPage, XAPIC_OFF_DFR, uDfr);//XAPIC_OFF_DFR对应APIC页偏移量0x0E0
     STAM_COUNTER_INC(&pVCpu->apic.s.StatDfrWrite);
     return VINF_SUCCESS;
 }
@@ -1465,6 +1577,22 @@ static VBOXSTRICTRC apicSetTimerDcr(PVMCPUCC pVCpu, uint32_t uTimerDcr)
  * @param   rcBusy          The busy return code for the timer critical section.
  * @param   puValue         Where to store the LVT timer CCR.
  */
+/*
+该函数用于读取APIC定时器的CCR（Current-Count Register），主要完成：
+  模式检测：区分TSC-Deadline模式与传统周期模式
+  时间计算：基于虚拟时钟计算剩余计数值
+  同步控制：通过定时器锁保证多核环境下的原子性访问
+ * */
+/*
+应用场景影响
+  Guest定时器驱动：
+    Windows的KeQueryPerformanceCounter依赖CCR精度
+    Linux的APIC定时器校准（calibrate_APIC_clock）
+嵌套虚拟化：
+  需正确处理TSC-Deadline模式穿透
+实时性保障：
+  虚拟时钟漂移影响Guest超时准确性
+ * */
 static VBOXSTRICTRC apicGetTimerCcr(PPDMDEVINS pDevIns, PVMCPUCC pVCpu, int rcBusy, uint32_t *puValue)
 {
     VMCPU_ASSERT_EMT(pVCpu);
@@ -1474,12 +1602,12 @@ static VBOXSTRICTRC apicGetTimerCcr(PPDMDEVINS pDevIns, PVMCPUCC pVCpu, int rcBu
     *puValue = 0;
 
     /* In TSC-deadline mode, CCR returns 0, see Intel spec. 10.5.4.1 "TSC-Deadline Mode". */
-    if (pXApicPage->lvt_timer.u.u2TimerMode == XAPIC_TIMER_MODE_TSC_DEADLINE)
+    if (pXApicPage->lvt_timer.u.u2TimerMode == XAPIC_TIMER_MODE_TSC_DEADLINE) //Intel SDM 10.5.4.1规定TSC-Deadline模式不维护CCR
         return VINF_SUCCESS;
 
     /* If the initial-count register is 0, CCR returns 0 as it cannot exceed the ICR. */
     uint32_t const uInitialCount = pXApicPage->timer_icr.u32InitialCount;
-    if (!uInitialCount)
+    if (!uInitialCount) // 物理APIC在ICR=0时停止计数
         return VINF_SUCCESS;
 
     /*
@@ -1491,6 +1619,7 @@ static VBOXSTRICTRC apicGetTimerCcr(PPDMDEVINS pDevIns, PVMCPUCC pVCpu, int rcBu
     PCAPICCPU       pApicCpu = VMCPU_TO_APICCPU(pVCpu);
     TMTIMERHANDLE   hTimer   = pApicCpu->hTimer;
 
+    //防止在apicR3TimerCallback回调执行期间读CCR
     VBOXSTRICTRC rc = PDMDevHlpTimerLockClock(pDevIns, hTimer, rcBusy);
     if (rc == VINF_SUCCESS)
     {
@@ -1498,12 +1627,13 @@ static VBOXSTRICTRC apicGetTimerCcr(PPDMDEVINS pDevIns, PVMCPUCC pVCpu, int rcBu
         uint32_t const uCurrentCount = pXApicPage->timer_ccr.u32CurrentCount;
         if (uCurrentCount)
         {
-            uint64_t const cTicksElapsed = PDMDevHlpTimerGet(pDevIns, hTimer) - pApicCpu->u64TimerInitial;
+            uint64_t const cTicksElapsed = PDMDevHlpTimerGet(pDevIns, hTimer) - pApicCpu->u64TimerInitial;//获取主机纳秒级时间戳, u64TimerInitial记录定时器启动时刻
             PDMDevHlpTimerUnlockClock(pDevIns, hTimer);
+            //分频处理：uTimerShift实现1/2/4/8/16/32/64/128分频（由LVT Timer配置
             uint8_t  const uTimerShift   = apicGetTimerShift(pXApicPage);
             uint64_t const uDelta        = cTicksElapsed >> uTimerShift;
             if (uInitialCount > uDelta)
-                *puValue = uInitialCount - uDelta;
+                *puValue = uInitialCount - uDelta;// 计算剩余计数值
         }
         else
             PDMDevHlpTimerUnlockClock(pDevIns, hTimer);
@@ -1521,6 +1651,9 @@ static VBOXSTRICTRC apicGetTimerCcr(PPDMDEVINS pDevIns, PVMCPUCC pVCpu, int rcBu
  * @param   rcBusy          The busy return code for the timer critical section.
  * @param   uInitialCount   The timer ICR.
  */
+//该函数用于设置APIC定时器的ICR（Initial-Count Register）
+//定时器初始化：配置初始计数值并启动/停止定时器
+//模式检测：跳过TSC-Deadline模式下的无效写入
 static VBOXSTRICTRC apicSetTimerIcr(PPDMDEVINS pDevIns, PVMCPUCC pVCpu, int rcBusy, uint32_t uInitialCount)
 {
     VMCPU_ASSERT_EMT(pVCpu);
@@ -1535,7 +1668,7 @@ static VBOXSTRICTRC apicSetTimerIcr(PPDMDEVINS pDevIns, PVMCPUCC pVCpu, int rcBu
     /* In TSC-deadline mode, timer ICR writes are ignored, see Intel spec. 10.5.4.1 "TSC-Deadline Mode". */
     if (   pApic->fSupportsTscDeadline
         && pXApicPage->lvt_timer.u.u2TimerMode == XAPIC_TIMER_MODE_TSC_DEADLINE)
-        return VINF_SUCCESS;
+        return VINF_SUCCESS;//规范依据：Intel SDM 10.5.4.1规定此模式下ICR写入无效
 
     /*
      * The timer CCR may be modified by apicR3TimerCallback() in parallel,
@@ -1543,15 +1676,17 @@ static VBOXSTRICTRC apicSetTimerIcr(PPDMDEVINS pDevIns, PVMCPUCC pVCpu, int rcBu
      * timer ICR. We rely on CCR being consistent in apicGetTimerCcr().
      */
     TMTIMERHANDLE hTimer = pApicCpu->hTimer;
+    //防止与apicR3TimerCallback回调函数的并发冲突
     VBOXSTRICTRC rc = PDMDevHlpTimerLockClock(pDevIns, hTimer, rcBusy);
     if (rc == VINF_SUCCESS)
     {
-        pXApicPage->timer_icr.u32InitialCount = uInitialCount;
+        //硬件行为模拟：物理APIC在ICR写入时会重置CCR
+        pXApicPage->timer_icr.u32InitialCount = uInitialCount;// 同步CCR与ICR
         pXApicPage->timer_ccr.u32CurrentCount = uInitialCount;
         if (uInitialCount)
-            apicStartTimer(pVCpu, uInitialCount);
+            apicStartTimer(pVCpu, uInitialCount);//基于虚拟时钟计算到期时间
         else
-            apicStopTimer(pVCpu);
+            apicStopTimer(pVCpu);//清零CCR并取消定时器回调
         PDMDevHlpTimerUnlockClock(pDevIns, hTimer);
     }
     return rc;
@@ -1566,6 +1701,12 @@ static VBOXSTRICTRC apicSetTimerIcr(PPDMDEVINS pDevIns, PVMCPUCC pVCpu, int rcBu
  * @param   offLvt          The LVT entry offset in the xAPIC page.
  * @param   uLvt            The LVT value to set.
  */
+/*
+  该函数用于配置LVT（Local Vector Table）条目，主要处理：
+    多类型中断配置：支持Timer/Thermal/Performance/LINT0/LINT1/Error六类LVT
+    模式验证：区分xAPIC/x2APIC模式下的不同行为
+    状态管理：处理APIC软件禁用状态下的特殊限制
+ * */
 static VBOXSTRICTRC apicSetLvtEntry(PVMCPUCC pVCpu, uint16_t offLvt, uint32_t uLvt)
 {
     VMCPU_ASSERT_EMT(pVCpu);
@@ -1591,8 +1732,8 @@ static VBOXSTRICTRC apicSetLvtEntry(PVMCPUCC pVCpu, uint16_t offLvt, uint32_t uL
             && (uLvt & XAPIC_LVT_TIMER_TSCDEADLINE))
         {
             if (XAPIC_IN_X2APIC_MODE(pVCpu))
-                return apicMsrAccessError(pVCpu, XAPIC_GET_X2APIC_MSR(offLvt), APICMSRACCESS_WRITE_RSVD_BITS);
-            uLvt &= ~XAPIC_LVT_TIMER_TSCDEADLINE;
+                return apicMsrAccessError(pVCpu, XAPIC_GET_X2APIC_MSR(offLvt), APICMSRACCESS_WRITE_RSVD_BITS);// x2APIC模式下触发#GP
+            uLvt &= ~XAPIC_LVT_TIMER_TSCDEADLINE;// xAPIC模式下静默清除
             /** @todo TSC-deadline timer mode transition */
         }
     }
@@ -1611,15 +1752,17 @@ static VBOXSTRICTRC apicSetLvtEntry(PVMCPUCC pVCpu, uint16_t offLvt, uint32_t uL
         && (uLvt & ~g_au32LvtValidMasks[idxLvt]))
         return apicMsrAccessError(pVCpu, XAPIC_GET_X2APIC_MSR(offLvt), APICMSRACCESS_WRITE_RSVD_BITS);
 
-    uLvt &= g_au32LvtValidMasks[idxLvt];
+    //g_au32LvtValidMasks数组定义每类LVT的合法位
+    uLvt &= g_au32LvtValidMasks[idxLvt];// 应用预定义的位掩码
 
     /*
      * In the software-disabled state, LVT mask-bit must remain set and attempts to clear the mask
      * bit must be ignored. See Intel spec. 10.4.7.2 "Local APIC State After It Has Been Software Disabled".
      */
     PXAPICPAGE pXApicPage = VMCPU_TO_XAPICPAGE(pVCpu);
+    //规范引用：Intel SDM 10.4.7.2规定禁用时mask位不可清除
     if (!pXApicPage->svr.u.fApicSoftwareEnable)
-        uLvt |= XAPIC_LVT_MASK;
+        uLvt |= XAPIC_LVT_MASK;// 强制保持屏蔽状态
 
     /*
      * It is unclear whether we should signal a 'send illegal vector' error here and ignore updating
@@ -1632,7 +1775,8 @@ static VBOXSTRICTRC apicSetLvtEntry(PVMCPUCC pVCpu, uint16_t offLvt, uint32_t uL
      */
     if (RT_UNLIKELY(   XAPIC_LVT_GET_VECTOR(uLvt) <= XAPIC_ILLEGAL_VECTOR_END
                     && XAPIC_LVT_GET_DELIVERY_MODE(uLvt) == XAPICDELIVERYMODE_FIXED))
-        apicSetError(pVCpu, XAPIC_ESR_SEND_ILLEGAL_VECTOR);
+        //接收非法向量由apicPostInterrupt处理
+        apicSetError(pVCpu, XAPIC_ESR_SEND_ILLEGAL_VECTOR);//发送非法向量（ESR bit 5）
 
     Log2(("APIC%u: apicSetLvtEntry: offLvt=%#RX16 uLvt=%#RX32\n", pVCpu->idCpu, offLvt, uLvt));
 
@@ -1673,23 +1817,42 @@ static int apicSetLvtExtEntry(PVMCPUCC pVCpu, uint16_t offLvt, uint32_t uLvt)
  * @param   uTimerShift     The new timer shift.
  * @thread  Any.
  */
+/*
+* 该函数为APIC定时器提供频率提示（Frequency Hinting）机制，主要实现：
+  动态频率计算：基于ICR初始值和分频系数推算理论中断频率
+  智能提示更新：仅在配置变化时重新计算频率（避免冗余计算）
+  主机调度优化：通过PDMDevHlpTimerSetFrequencyHint提升定时精度
+ * */
+/*
+ 1）定时器模式支持
+模式	    频率计算公式	                    典型应用场景
+周期模式	主机时钟频率/(ICR<<分频)	        Windows多媒体定时器
+单次触发	同周期模式（但CCR递减至0后停止）	Linux高精度定时器
+（2）与物理APIC的差异
+特性	    物理APIC	            虚拟化实现（apicHintTimerFreq）
+时钟源	    依赖处理器总线时钟	    主机任意高精度时钟（TSC/HPET）
+频率响应	固定硬件精度	        动态适应Guest配置37
+ * */
 void apicHintTimerFreq(PPDMDEVINS pDevIns, PAPICCPU pApicCpu, uint32_t uInitialCount, uint8_t uTimerShift)
 {
     Assert(pApicCpu);
 
+    //通过uHintedTimer*变量记录上次配置
+    //跳过未改变的配置（如Guest重复写入相同值
     if (   pApicCpu->uHintedTimerInitialCount != uInitialCount
         || pApicCpu->uHintedTimerShift        != uTimerShift)
     {
         uint32_t uHz;
         if (uInitialCount)
         {
+            //uTimerShift实现硬件级1-128分频（对应APIC_LVT_TIMER_SHIFT_MASK)
             uint64_t cTicksPerPeriod = (uint64_t)uInitialCount << uTimerShift;
             uHz = PDMDevHlpTimerGetFreq(pDevIns, pApicCpu->hTimer) / cTicksPerPeriod;
         }
         else
-            uHz = 0;
+            uHz = 0;//uHz=0时自动禁用提示（对应ICR=0场景）
 
-        PDMDevHlpTimerSetFrequencyHint(pDevIns, pApicCpu->hTimer, uHz);
+        PDMDevHlpTimerSetFrequencyHint(pDevIns, pApicCpu->hTimer, uHz);//后端优化：提示主机调度器调整定时器精度（如Linux的hrtimer）
         pApicCpu->uHintedTimerInitialCount = uInitialCount;
         pApicCpu->uHintedTimerShift = uTimerShift;
     }
@@ -1951,7 +2114,7 @@ VMM_INT_DECL(VBOXSTRICTRC) APICReadMsr(PVMCPUCC pVCpu, uint32_t u32Reg, uint64_t
      * Validate.
      */
     VMCPU_ASSERT_EMT(pVCpu);
-    Assert(u32Reg >= MSR_IA32_X2APIC_ID && u32Reg <= MSR_IA32_X2APIC_SELF_IPI);
+    Assert(u32Reg >= MSR_IA32_X2APIC_ID && u32Reg <= MSR_IA32_X2APIC_SELF_IPI);//严格校验MSR地址范围（0x802-0x83F）
     Assert(pu64Value);
 
     /*
@@ -1990,7 +2153,7 @@ VMM_INT_DECL(VBOXSTRICTRC) APICReadMsr(PVMCPUCC pVCpu, uint32_t u32Reg, uint64_t
             case MSR_IA32_X2APIC_TIMER_CCR:
             {
                 uint32_t uValue;
-                rcStrict = apicGetTimerCcr(VMCPU_TO_DEVINS(pVCpu), pVCpu, VINF_CPUM_R3_MSR_READ, &uValue);
+                rcStrict = apicGetTimerCcr(VMCPU_TO_DEVINS(pVCpu), pVCpu, VINF_CPUM_R3_MSR_READ, &uValue);//定时器锁保护
                 *pu64Value = uValue;
                 break;
             }
@@ -1998,7 +2161,7 @@ VMM_INT_DECL(VBOXSTRICTRC) APICReadMsr(PVMCPUCC pVCpu, uint32_t u32Reg, uint64_t
             /* Special handling, compatible with xAPIC: */
             case MSR_IA32_X2APIC_PPR:
             {
-                *pu64Value = apicGetPpr(pVCpu);
+                *pu64Value = apicGetPpr(pVCpu);//实时结合TPR/ISR状态
                 break;
             }
 
@@ -2043,7 +2206,7 @@ VMM_INT_DECL(VBOXSTRICTRC) APICReadMsr(PVMCPUCC pVCpu, uint32_t u32Reg, uint64_t
             {
                 PXAPICPAGE pXApicPage = VMCPU_TO_XAPICPAGE(pVCpu);
                 uint16_t const offReg = X2APIC_GET_XAPIC_OFF(u32Reg);
-                *pu64Value = apicReadRaw32(pXApicPage, offReg);
+                *pu64Value = apicReadRaw32(pXApicPage, offReg); //xAPIC/x2APIC位域一致
                 break;
             }
 
@@ -2051,7 +2214,7 @@ VMM_INT_DECL(VBOXSTRICTRC) APICReadMsr(PVMCPUCC pVCpu, uint32_t u32Reg, uint64_t
             case MSR_IA32_X2APIC_SELF_IPI:
             case MSR_IA32_X2APIC_EOI:
             {
-                rcStrict = apicMsrAccessError(pVCpu, u32Reg, APICMSRACCESS_READ_WRITE_ONLY);
+                rcStrict = apicMsrAccessError(pVCpu, u32Reg, APICMSRACCESS_READ_WRITE_ONLY);//写寄存器读取：EOI/SELF_IPI等寄存器只允许写入,按规范注入#GP(0)异常
                 break;
             }
 
@@ -2093,6 +2256,12 @@ VMM_INT_DECL(VBOXSTRICTRC) APICReadMsr(PVMCPUCC pVCpu, uint32_t u32Reg, uint64_t
  * @param   u32Reg          The MSR being written.
  * @param   u64Value        The value to write.
  */
+/*
+该函数处理x2APIC模式下的MSR写入请求，主要实现：
+  寄存器路由：将MSR地址映射到对应的APIC功能函数
+  严格校验：x2APIC模式下对保留位的写入会触发#GP异常
+  模式兼容：支持Hyper-V特殊兼容模式下的非标准行为
+ * */
 VMM_INT_DECL(VBOXSTRICTRC) APICWriteMsr(PVMCPUCC pVCpu, uint32_t u32Reg, uint64_t u64Value)
 {
     /*
@@ -2129,6 +2298,8 @@ VMM_INT_DECL(VBOXSTRICTRC) APICWriteMsr(PVMCPUCC pVCpu, uint32_t u32Reg, uint64_
      * case first and handle validating the remaining bits on a per-register basis.
      * See Intel spec. 10.12.1.2 "x2APIC Register Address Space".
      */
+    //除ICR外所有寄存器bits 63:32必须为0（Intel SDM 10.12.1.2）
+    //区分配置禁用(APICMSRACCESS_WRITE_DISALLOWED_CONFIG)和保留位错误
     if (   u32Reg != MSR_IA32_X2APIC_ICR
         && RT_HI_U32(u64Value))
         return apicMsrAccessError(pVCpu, u32Reg, APICMSRACCESS_WRITE_RSVD_BITS);
@@ -2142,13 +2313,13 @@ VMM_INT_DECL(VBOXSTRICTRC) APICWriteMsr(PVMCPUCC pVCpu, uint32_t u32Reg, uint64_
         {
             case MSR_IA32_X2APIC_TPR:
             {
-                rcStrict = apicSetTprEx(pVCpu, u32Value, false /* fForceX2ApicBehaviour */);
+                rcStrict = apicSetTprEx(pVCpu, u32Value, false /* fForceX2ApicBehaviour */);//虚拟化优先级优化
                 break;
             }
 
             case MSR_IA32_X2APIC_ICR:
             {
-                rcStrict = apicSetIcr(pVCpu, u64Value, VINF_CPUM_R3_MSR_WRITE);
+                rcStrict = apicSetIcr(pVCpu, u64Value, VINF_CPUM_R3_MSR_WRITE);//64位全处理，含目标选择
                 break;
             }
 
@@ -2183,7 +2354,7 @@ VMM_INT_DECL(VBOXSTRICTRC) APICWriteMsr(PVMCPUCC pVCpu, uint32_t u32Reg, uint64_
 
             case MSR_IA32_X2APIC_TIMER_ICR:
             {
-                rcStrict = apicSetTimerIcr(VMCPU_TO_DEVINS(pVCpu), pVCpu, VINF_CPUM_R3_MSR_WRITE, u32Value);
+                rcStrict = apicSetTimerIcr(VMCPU_TO_DEVINS(pVCpu), pVCpu, VINF_CPUM_R3_MSR_WRITE, u32Value);//触发定时器模式切换
                 break;
             }
 
@@ -2191,7 +2362,7 @@ VMM_INT_DECL(VBOXSTRICTRC) APICWriteMsr(PVMCPUCC pVCpu, uint32_t u32Reg, uint64_
             case MSR_IA32_X2APIC_SELF_IPI:
             {
                 uint8_t const uVector = XAPIC_SELF_IPI_GET_VECTOR(u32Value);
-                apicPostInterrupt(pVCpu, uVector, XAPICTRIGGERMODE_EDGE, 0 /* uSrcTag */);
+                apicPostInterrupt(pVCpu, uVector, XAPICTRIGGERMODE_EDGE, 0 /* uSrcTag */);//绕过ISR的快速自中断
                 rcStrict = VINF_SUCCESS;
                 break;
             }
@@ -2208,7 +2379,7 @@ VMM_INT_DECL(VBOXSTRICTRC) APICWriteMsr(PVMCPUCC pVCpu, uint32_t u32Reg, uint64_
              * index (0x80E). The write value was 0xffffffff on a Windows 8.1 64-bit guest. We can
              * safely ignore this nonsense, See @bugref{8382#c7}.
              */
-            case MSR_IA32_X2APIC_LDR + 1:
+            case MSR_IA32_X2APIC_LDR + 1://Windows Hyper-V驱动会写入非法MSR 0x80E,避免触发Guest OS错误
             {
                 if (pApic->fHyperVCompatMode)
                     rcStrict = VINF_SUCCESS;
@@ -2264,6 +2435,12 @@ VMM_INT_DECL(VBOXSTRICTRC) APICWriteMsr(PVMCPUCC pVCpu, uint32_t u32Reg, uint64_
  *
  * @param   pVCpu           The cross context virtual CPU structure.
  */
+/*
+ 该函数负责在CPU复位时初始化APIC Base MSR（IA32_APICBASE），主要实现：
+  状态重建：根据硬件规范设置默认xAPIC模式
+  BSP标记：为CPU0设置BSP标志位（Bit 8）
+  模式同步：维护CPUID.1H9（APIC可用位）与MSR状态一致性ICBASE）
+*/
 static void apicResetBaseMsr(PVMCPUCC pVCpu)
 {
     /*
@@ -2280,14 +2457,14 @@ static void apicResetBaseMsr(PVMCPUCC pVCpu)
     /* Construct. */
     PAPICCPU pApicCpu     = VMCPU_TO_APICCPU(pVCpu);
     PAPIC    pApic        = VM_TO_APIC(pVCpu->CTX_SUFF(pVM));
-    uint64_t uApicBaseMsr = MSR_IA32_APICBASE_ADDR;
+    uint64_t uApicBaseMsr = MSR_IA32_APICBASE_ADDR;// 默认FEE00000h,物理地址, xAPIC默认映射到4GB-18MB区域（符合Intel规范）
     if (pVCpu->idCpu == 0)
-        uApicBaseMsr |= MSR_IA32_APICBASE_BSP;
+        uApicBaseMsr |= MSR_IA32_APICBASE_BSP; // 设置BSP标志, 仅CPU0在复位时获得BSP身份
 
     /* If the VM was configured with no APIC, don't enable xAPIC mode, obviously. */
     if (pApic->enmMaxMode != PDMAPICMODE_NONE)
     {
-        uApicBaseMsr |= MSR_IA32_APICBASE_EN;
+        uApicBaseMsr |= MSR_IA32_APICBASE_EN; // 设置Enable位(bit 11),硬件行为模拟：复位后APIC自动启用
 
         /*
          * While coming out of a reset the APIC is enabled and in xAPIC mode. If software had previously
@@ -2299,7 +2476,7 @@ static void apicResetBaseMsr(PVMCPUCC pVCpu)
     }
 
     /* Commit. */
-    ASMAtomicWriteU64(&pApicCpu->uApicBaseMsr, uApicBaseMsr);
+    ASMAtomicWriteU64(&pApicCpu->uApicBaseMsr, uApicBaseMsr);//Intel规定复位时CPUID.1H9必须为1
 }
 
 
@@ -2309,6 +2486,13 @@ static void apicResetBaseMsr(PVMCPUCC pVCpu)
  *
  * @param   pVCpu       The cross context virtual CPU structure.
  */
+/*
+该函数模拟处理器收到INIT IPI后的APIC状态重置，主要实现：
+  寄存器清零：清除IRR/ISR/TMR等中断状态寄存器
+  LVT初始化：将本地向量表项设为Masked状态
+  特殊配置：设置DFR为Flat模式、SVR为0xFF向量
+ * */
+
 void apicInitIpi(PVMCPUCC pVCpu)
 {
     VMCPU_ASSERT_EMT_OR_NOT_RUNNING(pVCpu);
@@ -2322,10 +2506,10 @@ void apicInitIpi(PVMCPUCC pVCpu)
      * is because there are some registers that are not touched by the INIT IPI (e.g. version)
      * operation and this function is only a subset of the reset operation.
      */
+    RT_ZERO(pXApicPage->irr);// 中断请求寄存器
     RT_ZERO(pXApicPage->irr);
-    RT_ZERO(pXApicPage->irr);
-    RT_ZERO(pXApicPage->isr);
-    RT_ZERO(pXApicPage->tmr);
+    RT_ZERO(pXApicPage->isr);// 服务中中断
+    RT_ZERO(pXApicPage->tmr); // 触发模式寄存器
     RT_ZERO(pXApicPage->icr_hi);
     RT_ZERO(pXApicPage->icr_lo);
     RT_ZERO(pXApicPage->ldr);
@@ -2341,7 +2525,7 @@ void apicInitIpi(PVMCPUCC pVCpu)
     /** @todo CMCI. */
 
     RT_ZERO(pXApicPage->lvt_timer);
-    pXApicPage->lvt_timer.u.u1Mask = 1;
+    pXApicPage->lvt_timer.u.u1Mask = 1;// 所有LVT默认Masked
 
 #if XAPIC_HARDWARE_VERSION == XAPIC_HARDWARE_VERSION_P4
     RT_ZERO(pXApicPage->lvt_thermal);
@@ -2361,7 +2545,7 @@ void apicInitIpi(PVMCPUCC pVCpu)
     pXApicPage->lvt_error.u.u1Mask = 1;
 
     RT_ZERO(pXApicPage->svr);
-    pXApicPage->svr.u.u8SpuriousVector = 0xff;
+    pXApicPage->svr.u.u8SpuriousVector = 0xff; // 伪向量设为无效值
 
     /* The self-IPI register is reset to 0. See Intel spec. 10.12.5.1 "x2APIC States" */
     PX2APICPAGE pX2ApicPage = VMCPU_TO_X2APICPAGE(pVCpu);
@@ -2369,11 +2553,11 @@ void apicInitIpi(PVMCPUCC pVCpu)
 
     /* Clear the pending-interrupt bitmaps. */
     PAPICCPU pApicCpu = VMCPU_TO_APICCPU(pVCpu);
-    RT_BZERO(&pApicCpu->ApicPibLevel, sizeof(APICPIB));
+    RT_BZERO(&pApicCpu->ApicPibLevel, sizeof(APICPIB));// 清空PIB
     RT_BZERO(pApicCpu->CTX_SUFF(pvApicPib), sizeof(APICPIB));
 
     /* Clear the interrupt line states for LINT0 and LINT1 pins. */
-    pApicCpu->fActiveLint0 = false;
+    pApicCpu->fActiveLint0 = false;// 清除LINT0引脚状态
     pApicCpu->fActiveLint1 = false;
 }
 
@@ -2412,8 +2596,8 @@ void apicResetCpu(PVMCPUCC pVCpu, bool fResetApicBaseMsr)
      */
     PXAPICPAGE pXApicPage = VMCPU_TO_XAPICPAGE(pVCpu);
 #if XAPIC_HARDWARE_VERSION == XAPIC_HARDWARE_VERSION_P4
-    pXApicPage->version.u.u8MaxLvtEntry = XAPIC_MAX_LVT_ENTRIES_P4 - 1;
-    pXApicPage->version.u.u8Version     = XAPIC_HARDWARE_VERSION_P4;
+    pXApicPage->version.u.u8MaxLvtEntry = XAPIC_MAX_LVT_ENTRIES_P4 - 1; // 5个LVT
+    pXApicPage->version.u.u8Version     = XAPIC_HARDWARE_VERSION_P4;  // 0x14
     AssertCompile(sizeof(pXApicPage->id.u8ApicId) >= XAPIC_APIC_ID_BIT_COUNT_P4 / 8);
 #else
 # error "Implement Pentium and P6 family APIC architectures"
@@ -2421,13 +2605,15 @@ void apicResetCpu(PVMCPUCC pVCpu, bool fResetApicBaseMsr)
 
     /** @todo It isn't clear in the spec. where exactly the default base address
      *        is (re)initialized, atm we do it here in Reset. */
+    //场景区分：冷启动需重置MSR，热复位可能保留配置
     if (fResetApicBaseMsr)
         apicResetBaseMsr(pVCpu);
 
     /*
      * Initialize the APIC ID register to xAPIC format.
      */
-    RT_BZERO(&pXApicPage->id, sizeof(pXApicPage->id));
+    //物理CPU需通过CPUID.1H31:24获取初始APIC ID
+    RT_BZERO(&pXApicPage->id, sizeof(pXApicPage->id)); // 直接映射vCPU ID
     pXApicPage->id.u8ApicId = pVCpu->idCpu;
 }
 
@@ -2443,6 +2629,16 @@ void apicResetCpu(PVMCPUCC pVCpu, bool fResetApicBaseMsr)
  * @param   pVCpu       The cross context virtual CPU structure.
  * @param   u64BaseMsr  The value to set.
  */
+/*
+ *
+stateDiagram-v2
+    [*] --> Disabled
+    Disabled --> xAPIC: 设置EN位
+    xAPIC --> x2APIC: 同时设置EN+EXTD
+    x2APIC --> xAPIC: 清除EXTD位
+    xAPIC --> Disabled: 清除EN位
+    x2APIC --> Disabled: 清除EN位
+ * */
 VMM_INT_DECL(int) APICSetBaseMsr(PVMCPUCC pVCpu, uint64_t u64BaseMsr)
 {
     Assert(pVCpu);
@@ -2464,7 +2660,7 @@ VMM_INT_DECL(int) APICSetBaseMsr(PVMCPUCC pVCpu, uint64_t u64BaseMsr)
      *      region remains mapped but doesn't belong to the called VCPU's APIC).
      */
     /** @todo Handle per-VCPU APIC base relocation. */
-    if (MSR_IA32_APICBASE_GET_ADDR(uBaseMsr) != MSR_IA32_APICBASE_ADDR)
+    if (MSR_IA32_APICBASE_GET_ADDR(uBaseMsr) != MSR_IA32_APICBASE_ADDR)//避免动态MMIO区域管理的复杂性
     {
         if (pVCpu->apic.s.cLogMaxSetApicBaseAddr++ < 5)
             LogRel(("APIC%u: Attempt to relocate base to %#RGp, unsupported -> #GP(0)\n", pVCpu->idCpu,
@@ -2545,7 +2741,7 @@ VMM_INT_DECL(int) APICSetBaseMsr(PVMCPUCC pVCpu, uint64_t u64BaseMsr)
                  */
                 PX2APICPAGE pX2ApicPage = VMCPU_TO_X2APICPAGE(pVCpu);
                 RT_BZERO(&pX2ApicPage->id, sizeof(pX2ApicPage->id));
-                pX2ApicPage->id.u32ApicId = pVCpu->idCpu;
+                pX2ApicPage->id.u32ApicId = pVCpu->idCpu;// 重设APIC ID,进入x2APIC时APIC ID变为只读
 
                 /*
                  * LDR initialization occurs when entering x2APIC mode.
@@ -2567,7 +2763,7 @@ VMM_INT_DECL(int) APICSetBaseMsr(PVMCPUCC pVCpu, uint64_t u64BaseMsr)
         }
     }
 
-    ASMAtomicWriteU64(&pApicCpu->uApicBaseMsr, uBaseMsr);
+    ASMAtomicWriteU64(&pApicCpu->uApicBaseMsr, uBaseMsr);//最终提交,确保模式切换对其他线程立即可见
     return VINF_SUCCESS;
 }
 
@@ -2726,6 +2922,21 @@ VMM_INT_DECL(int) APICGetTimerFreq(PVMCC pVM, uint64_t *pu64Value)
  * @param   uTriggerMode    The trigger mode.
  * @param   uSrcTag         The interrupt source tag (debugging).
  */
+
+/*
+该函数作为APIC子系统中断传递的总入口，主要实现：
+  中断路由枢纽：处理来自I/O APIC/MSI的中断请求
+  目标CPU计算：解析物理/逻辑目标模式
+  传递策略控制：支持广播/单播等8种投递模式
+*/
+/*
+ sequenceDiagram
+    I/O APIC->>APICBusDeliver: 传递中断(向量+NMI等)
+    APICBusDeliver->>apicGetDestCpuSet: 计算目标vCPU集合
+    apicGetDestCpuSet->>apicSendIntr: 每个目标vCPU
+    apicSendIntr->>vCPU: 注入中断/设置IRR
+    Note right of vCPU: 下次VM-Entry时处理
+ * */
 VMM_INT_DECL(int) APICBusDeliver(PVMCC pVM, uint8_t uDest, uint8_t uDestMode, uint8_t uDeliveryMode, uint8_t uVector,
                                  uint8_t uPolarity, uint8_t uTriggerMode, uint32_t uSrcTag)
 {
@@ -2737,7 +2948,7 @@ VMM_INT_DECL(int) APICBusDeliver(PVMCC pVM, uint8_t uDest, uint8_t uDestMode, ui
     if (APICIsEnabled(pVM->CTX_SUFF(apCpus)[0]))
     { /* likely */ }
     else
-        return VINF_SUCCESS;
+        return VINF_SUCCESS;// APIC全局禁用时静默成功
 
     /*
      * The destination field (mask) in the IO APIC redirectable table entry is 8-bits.
@@ -2756,7 +2967,13 @@ VMM_INT_DECL(int) APICBusDeliver(PVMCC pVM, uint8_t uDest, uint8_t uDestMode, ui
 
     bool     fIntrAccepted;
     VMCPUSET DestCpuSet;
+    /*
+     * 物理模式：直接使用8位目标ID（0xFF=全广播）
+       逻辑模式：通过LDR+DFR计算目标集合
+       特殊处理：Lowest Priority模式需动态选择CPU
+     * */
     apicGetDestCpuSet(pVM, fDestMask, fBroadcastMask, enmDestMode, enmDeliveryMode, &DestCpuSet);
+    //中断传递执行
     VBOXSTRICTRC rcStrict = apicSendIntr(pVM, NULL /* pVCpu */, uVector, enmTriggerMode, enmDeliveryMode, &DestCpuSet,
                                          &fIntrAccepted, uSrcTag, VINF_SUCCESS /* rcRZ */);
     if (fIntrAccepted)
@@ -2777,15 +2994,26 @@ VMM_INT_DECL(int) APICBusDeliver(PVMCC pVM, uint8_t uDest, uint8_t uDestMode, ui
  *
  * @note    All callers totally ignores the status code!
  */
+//处理通过 CPU 本地 APIC（高级可编程中断控制器）的 LINT0 和 LINT1 引脚传入的中断。
+//它根据本地向量表（LVT）的编程设置来处理边沿触发和电平触发的中断。
+/*
+关键区别：传统 vs 现代中断传递
+中断类型	     传递路径	                    依赖LINT0/LINT1？
+传统PIC中断	     PIC → LINT0/LINT1	            是
+I/O APIC中断	 I/O APIC → APIC总线 → LAPIC	否
+MSI/MSI-X中断	 PCIe设备 → 内存写入 → LAPIC	否
+IPI	             CPU A的LAPIC → CPU B的LAPIC	否
+LAPIC内部中断	 LAPIC内部触发	                否
+ * */
 VMM_INT_DECL(VBOXSTRICTRC) APICLocalInterrupt(PVMCPUCC pVCpu, uint8_t u8Pin, uint8_t u8Level, int rcRZ)
 {
-    AssertReturn(u8Pin <= 1, VERR_INVALID_PARAMETER);
+    AssertReturn(u8Pin <= 1, VERR_INVALID_PARAMETER);//检查引脚号 u8Pin 是否为 0 或 1（对应 LINT0 或 LINT1）
     AssertReturn(u8Level <= 1, VERR_INVALID_PARAMETER);
 
     VBOXSTRICTRC rcStrict = VINF_SUCCESS;
 
     /* If the APIC is enabled, the interrupt is subject to LVT programming. */
-    if (APICIsEnabled(pVCpu))
+    if (APICIsEnabled(pVCpu))//如果 APIC 已启用，则根据 LVT 的设置处理中断
     {
         PCXAPICPAGE pXApicPage = VMCPU_TO_CXAPICPAGE(pVCpu);
 
@@ -2795,6 +3023,11 @@ VMM_INT_DECL(VBOXSTRICTRC) APICLocalInterrupt(PVMCPUCC pVCpu, uint8_t u8Pin, uin
             XAPIC_OFF_LVT_LINT0,
             XAPIC_OFF_LVT_LINT1
         };
+        /*
+         * 查找对应引脚（LINT0 或 LINT1）的 LVT 条目
+           检查中断是否在 LVT 中被屏蔽
+           根据 LVT 条目中指定的传递模式进行处理
+         * */
         Assert(u8Pin < RT_ELEMENTS(s_au16LvtOffsets));
         uint16_t const offLvt = s_au16LvtOffsets[u8Pin];
         uint32_t const uLvt   = apicReadRaw32(pXApicPage, offLvt);
@@ -2814,6 +3047,9 @@ VMM_INT_DECL(VBOXSTRICTRC) APICLocalInterrupt(PVMCPUCC pVCpu, uint8_t u8Pin, uin
                 }
                 RT_FALL_THRU();
                 case XAPICDELIVERYMODE_FIXED:
+                //使用指定向量的标准中断传递
+                //处理边沿触发与电平触发的区别
+                //对于电平触发，管理 Remote IRR 位
                 {
                     PAPICCPU       pApicCpu = VMCPU_TO_APICCPU(pVCpu);
                     uint8_t const  uVector  = XAPIC_LVT_GET_VECTOR(uLvt);
@@ -2873,6 +3109,7 @@ VMM_INT_DECL(VBOXSTRICTRC) APICLocalInterrupt(PVMCPUCC pVCpu, uint8_t u8Pin, uin
                     break;
                 }
 
+                //特殊中断类型
                 case XAPICDELIVERYMODE_SMI:
                 case XAPICDELIVERYMODE_NMI:
                 {
@@ -2881,7 +3118,7 @@ VMM_INT_DECL(VBOXSTRICTRC) APICLocalInterrupt(PVMCPUCC pVCpu, uint8_t u8Pin, uin
                     VMCPUSET_ADD(&DestCpuSet, pVCpu->idCpu);
                     uint8_t const uVector = XAPIC_LVT_GET_VECTOR(uLvt);
                     rcStrict = apicSendIntr(pVCpu->CTX_SUFF(pVM), pVCpu, uVector, enmTriggerMode, enmDeliveryMode, &DestCpuSet,
-                                            NULL /* pfIntrAccepted */, 0 /* uSrcTag */, rcRZ);
+                                            NULL /* pfIntrAccepted */, 0 /* uSrcTag */, rcRZ);//使用 apicSendIntr 实际传递中断
                     break;
                 }
 
@@ -2909,6 +3146,11 @@ VMM_INT_DECL(VBOXSTRICTRC) APICLocalInterrupt(PVMCPUCC pVCpu, uint8_t u8Pin, uin
             }
         }
     }
+    /*
+     * 如果 APIC 被禁用，则回退到传统行为：
+        LINT0 作为外部中断（INTR）
+        LINT1 作为不可屏蔽中断（NMI）
+    */
     else
     {
         /* The APIC is hardware disabled. The CPU behaves as though there is no on-chip APIC. */
@@ -2943,6 +3185,21 @@ VMM_INT_DECL(VBOXSTRICTRC) APICLocalInterrupt(PVMCPUCC pVCpu, uint8_t u8Pin, uin
  * @param   pu8Vector   Where to store the vector.
  * @param   puSrcTag    Where to store the interrupt source tag (debugging).
  */
+/*
+此函数负责从本地 APIC (LAPIC) 的中断请求寄存器 (IRR) 中获取最高优先级的中断向量，
+并检查其是否满足传递条件（未被 TPR/PPR 屏蔽）。
+若条件满足，则将中断从 IRR 转移到 ISR（服务中寄存器），并更新中断状态。
+ * */
+
+/*
+寄存器/逻辑	             作用
+IRR	                     存储已接收但尚未递交给 CPU 的中断请求（按优先级排序）。
+ISR	                     存储正在服务中的中断（同一时间可处理多个中断，支持嵌套）。
+TPR	                     由软件设置，屏蔽优先级低于 TPR 的中断（用于任务调度）。
+PPR	                     动态计算值（基于 ISR 和 TPR），决定当前可接受的最低中断优先级。
+优先级仲裁	             硬件行为：通过 256 位比较器实时选择 IRR 中最高优先级中断（apicGetHighestSetBitInReg）。
+
+ * */
 VMM_INT_DECL(int) APICGetInterrupt(PVMCPUCC pVCpu, uint8_t *pu8Vector, uint32_t *puSrcTag)
 {
     VMCPU_ASSERT_EMT(pVCpu);
@@ -2951,11 +3208,13 @@ VMM_INT_DECL(int) APICGetInterrupt(PVMCPUCC pVCpu, uint8_t *pu8Vector, uint32_t 
     LogFlow(("APIC%u: apicGetInterrupt:\n", pVCpu->idCpu));
 
     PXAPICPAGE pXApicPage = VMCPU_TO_XAPICPAGE(pVCpu);
+    //检查 APIC 是否硬件启用（APICIsEnabled）且软件启用（pXApicPage->svr.u.fApicSoftwareEnable）
     bool const fApicHwEnabled = APICIsEnabled(pVCpu);
     if (   fApicHwEnabled
         && pXApicPage->svr.u.fApicSoftwareEnable)
     {
-        int const irrv = apicGetHighestSetBitInReg(&pXApicPage->irr, -1);
+        //硬件行为：物理APIC使用256位比较器实时仲裁
+        int const irrv = apicGetHighestSetBitInReg(&pXApicPage->irr, -1);//获取IRR中最高优先级中断
         if (RT_LIKELY(irrv >= 0))
         {
             Assert(irrv <= (int)UINT8_MAX);
@@ -2967,14 +3226,14 @@ VMM_INT_DECL(int) APICGetInterrupt(PVMCPUCC pVCpu, uint8_t *pu8Vector, uint32_t 
              */
             uint8_t const uTpr = pXApicPage->tpr.u8Tpr;
             if (   uTpr > 0
-                && XAPIC_TPR_GET_TP(uVector) <= XAPIC_TPR_GET_TP(uTpr))
+                && XAPIC_TPR_GET_TP(uVector) <= XAPIC_TPR_GET_TP(uTpr))//比较中断向量的优先级（XAPIC_TPR_GET_TP(uVector)）与 TPR 的当前值（uTpr）
             {
                 Log2(("APIC%u: apicGetInterrupt: Interrupt masked. uVector=%#x uTpr=%#x SpuriousVector=%#x\n", pVCpu->idCpu,
                       uVector, uTpr, pXApicPage->svr.u.u8SpuriousVector));
                 *pu8Vector = uVector;
                 *puSrcTag  = 0;
                 STAM_COUNTER_INC(&pVCpu->apic.s.StatMaskedByTpr);
-                return VERR_APIC_INTR_MASKED_BY_TPR;
+                return VERR_APIC_INTR_MASKED_BY_TPR;//表示中断被 TPR 屏蔽
             }
 
             /*
@@ -2982,19 +3241,19 @@ VMM_INT_DECL(int) APICGetInterrupt(PVMCPUCC pVCpu, uint8_t *pu8Vector, uint32_t 
              * We're on EMT so no parallel updates possible.
              * Subject the pending vector to PPR prioritization.
              */
-            uint8_t const uPpr = pXApicPage->ppr.u8Ppr;
+            uint8_t const uPpr = pXApicPage->ppr.u8Ppr;//检查 PPR 的当前值（uPpr）
             if (   !uPpr
-                || XAPIC_PPR_GET_PP(uVector) > XAPIC_PPR_GET_PP(uPpr))
+                || XAPIC_PPR_GET_PP(uVector) > XAPIC_PPR_GET_PP(uPpr))//若中断优先级 高于 PPR or PPR==0
             {
-                apicClearVectorInReg(&pXApicPage->irr, uVector);
-                apicSetVectorInReg(&pXApicPage->isr, uVector);
-                apicUpdatePpr(pVCpu);
-                apicSignalNextPendingIntr(pVCpu);
+                apicClearVectorInReg(&pXApicPage->irr, uVector);//从 IRR 中清除该向量
+                apicSetVectorInReg(&pXApicPage->isr, uVector);//在 ISR 中设置该向量
+                apicUpdatePpr(pVCpu);//更新 PPR
+                apicSignalNextPendingIntr(pVCpu);//触发下一个待处理中断
 
                 /* Retrieve the interrupt source tag associated with this interrupt. */
                 PAPICCPU pApicCpu = VMCPU_TO_APICCPU(pVCpu);
                 AssertCompile(RT_ELEMENTS(pApicCpu->auSrcTags) > UINT8_MAX);
-                *puSrcTag = pApicCpu->auSrcTags[uVector];
+                *puSrcTag = pApicCpu->auSrcTags[uVector];//从 pApicCpu->auSrcTags 中获取中断源标签（uSrcTag），并清零该标签
                 pApicCpu->auSrcTags[uVector] = 0;
 
                 Log2(("APIC%u: apicGetInterrupt: Valid Interrupt. uVector=%#x uSrcTag=%#x\n", pVCpu->idCpu, uVector, *puSrcTag));
@@ -3011,7 +3270,7 @@ VMM_INT_DECL(int) APICGetInterrupt(PVMCPUCC pVCpu, uint8_t *pu8Vector, uint32_t 
     }
     else
         Log2(("APIC%u: apicGetInterrupt: APIC %s disabled\n", pVCpu->idCpu, !fApicHwEnabled ? "hardware" : "software"));
-
+    //若 IRR 中无待处理中断或 APIC 未启用
     *pu8Vector = 0;
     *puSrcTag  = 0;
     return VERR_APIC_INTR_NOT_PENDING;
@@ -3021,19 +3280,31 @@ VMM_INT_DECL(int) APICGetInterrupt(PVMCPUCC pVCpu, uint8_t *pu8Vector, uint32_t 
 /**
  * @callback_method_impl{FNIOMMMIONEWREAD}
  */
+//此函数是 Local APIC 的 MMIO（内存映射 I/O）读操作的回调函数，
+//负责从指定的 APIC 寄存器地址（offReg）读取 32 位值，并返回给调用者。
+//核心作用：模拟 x86 CPU 通过内存访问（如 MOV EAX, [APIC_BASE + offset]）读取 APIC 寄存器的行为。
+/*
+寄存器类型	        示例偏移量	   说明
+ID 寄存器	        0x020	       存储 APIC 的逻辑 ID（多核系统中唯一标识）。
+TPR (任务优先级)	0x080	       控制当前 CPU 可接受的中断优先级阈值。
+EOI (中断结束)	    0x0B0	       写入该寄存器表示中断处理完成（读操作通常无意义）。
+ICR (中断命令)	    0x300-0x310	   用于发送 IPI（处理器间中断），分高低 32 位。
+ * */
 DECLCALLBACK(VBOXSTRICTRC) apicReadMmio(PPDMDEVINS pDevIns, void *pvUser, RTGCPHYS off, void *pv, unsigned cb)
 {
     NOREF(pvUser);
-    Assert(!(off & 0xf));
-    Assert(cb == 4); RT_NOREF_PV(cb);
+    Assert(!(off & 0xf));//断言 off 是 16 字节对齐
+    Assert(cb == 4); RT_NOREF_PV(cb);//断言 cb 必须为 4 字节（Assert(cb == 4)），因为 APIC 寄存器是 32 位宽
 
     PVMCPUCC pVCpu    = PDMDevHlpGetVMCPU(pDevIns);
+    //从输入地址 off 中提取低 12 位（off & 0xff0），得到 APIC 寄存器偏移量 offReg。
+    //（例如：若 off = 0xFEE00320，则 offReg = 0x320，对应 ICR_LOW 寄存器）。
     uint16_t offReg   = off & 0xff0;
     uint32_t uValue   = 0;
 
     STAM_COUNTER_INC(&pVCpu->apic.s.CTX_SUFF_Z(StatMmioRead));
 
-    VBOXSTRICTRC rc = VBOXSTRICTRC_VAL(apicReadRegister(pDevIns, pVCpu, offReg, &uValue));
+    VBOXSTRICTRC rc = VBOXSTRICTRC_VAL(apicReadRegister(pDevIns, pVCpu, offReg, &uValue));//从 pVCpu 的 APIC 页面中读取偏移量为 offReg 的寄存器值，结果存入 uValue
     *(uint32_t *)pv = uValue;
 
     Log2(("APIC%u: apicReadMmio: offReg=%#RX16 uValue=%#RX32\n", pVCpu->idCpu, offReg, uValue));
@@ -3068,23 +3339,26 @@ DECLCALLBACK(VBOXSTRICTRC) apicWriteMmio(PPDMDEVINS pDevIns, void *pvUser, RTGCP
  * @param   pVCpu           The cross context virtual CPU structure.
  * @param   enmType         The IRQ type.
  */
-static void apicSetInterruptFF(PVMCPUCC pVCpu, PDMAPICIRQ enmType)
+//该函数用于设置虚拟 CPU 的中断标志（Force Flag, FF），并触发目标 CPU 的响应（如唤醒或中断注入）
+static void apicsetinterruptff(pvmcpucc pvcpu, pdmapicirq enmtype)
 {
 #ifdef IN_RING3
     /* IRQ state should be loaded as-is by "LoadExec". Changes can be made from LoadDone. */
+    //在 Ring-3 模式下，检查虚拟机状态是否为 VMSTATE_LOADING（加载中），
+    //若正在加载且未完成状态恢复（PDMR3HasLoadedState），则断言失败。
     Assert(pVCpu->pVMR3->enmVMState != VMSTATE_LOADING || PDMR3HasLoadedState(pVCpu->pVMR3));
 #endif
 
     switch (enmType)
     {
-        case PDMAPICIRQ_HARDWARE:
+        case PDMAPICIRQ_HARDWARE://常规 APIC 中断（如 IPI 或本地中断）。
             VMCPU_ASSERT_EMT_OR_NOT_RUNNING(pVCpu);
             VMCPU_FF_SET(pVCpu, VMCPU_FF_INTERRUPT_APIC);
             break;
-        case PDMAPICIRQ_UPDATE_PENDING: VMCPU_FF_SET(pVCpu, VMCPU_FF_UPDATE_APIC);    break;
-        case PDMAPICIRQ_NMI:            VMCPU_FF_SET(pVCpu, VMCPU_FF_INTERRUPT_NMI);  break;
-        case PDMAPICIRQ_SMI:            VMCPU_FF_SET(pVCpu, VMCPU_FF_INTERRUPT_SMI);  break;
-        case PDMAPICIRQ_EXTINT:         VMCPU_FF_SET(pVCpu, VMCPU_FF_INTERRUPT_PIC);  break;
+        case PDMAPICIRQ_UPDATE_PENDING: VMCPU_FF_SET(pVCpu, VMCPU_FF_UPDATE_APIC);    break;//请求更新 APIC 状态（如 TPR 变更）。
+        case PDMAPICIRQ_NMI:            VMCPU_FF_SET(pVCpu, VMCPU_FF_INTERRUPT_NMI);  break;//不可屏蔽中断（NMI）。
+        case PDMAPICIRQ_SMI:            VMCPU_FF_SET(pVCpu, VMCPU_FF_INTERRUPT_SMI);  break;//	系统管理中断（SMI）。
+        case PDMAPICIRQ_EXTINT:         VMCPU_FF_SET(pVCpu, VMCPU_FF_INTERRUPT_PIC);  break;//外部中断（通过 8259 PIC 触发）。
         default:
             AssertMsgFailed(("enmType=%d\n", enmType));
             break;
@@ -3098,19 +3372,20 @@ static void apicSetInterruptFF(PVMCPUCC pVCpu, PDMAPICIRQ enmType)
 #if defined(IN_RING0)
     PVMCC   pVM   = pVCpu->CTX_SUFF(pVM);
     VMCPUID idCpu = pVCpu->idCpu;
+    //例外：PDMAPICIRQ_HARDWARE 类型的中断不触发唤醒（注释提到待优化，可能因硬件中断已通过其他机制处理）。
     if (   enmType != PDMAPICIRQ_HARDWARE
-        && VMMGetCpuId(pVM) != idCpu)
+        && VMMGetCpuId(pVM) != idCpu)//当调用者不是目标 CPU 所属的 EMT 线程时，需主动唤醒目标 CPU 处理中断
     {
         switch (VMCPU_GET_STATE(pVCpu))
         {
             case VMCPUSTATE_STARTED_EXEC:
                 Log7Func(("idCpu=%u VMCPUSTATE_STARTED_EXEC\n", idCpu));
-                GVMMR0SchedPokeNoGVMNoLock(pVM, idCpu);
+                GVMMR0SchedPokeNoGVMNoLock(pVM, idCpu);//发送“轻量级唤醒”信号。
                 break;
 
             case VMCPUSTATE_STARTED_HALTED:
                 Log7Func(("idCpu=%u VMCPUSTATE_STARTED_HALTED\n", idCpu));
-                GVMMR0SchedWakeUpNoGVMNoLock(pVM, idCpu);
+                GVMMR0SchedWakeUpNoGVMNoLock(pVM, idCpu);//强制唤醒
                 break;
 
             default:
@@ -3125,7 +3400,7 @@ static void apicSetInterruptFF(PVMCPUCC pVCpu, PDMAPICIRQ enmType)
         && VMMGetCpuId(pVM) != idCpu)
     {
         Log7Func(("idCpu=%u enmState=%d\n", idCpu, pVCpu->enmState));
-        VMR3NotifyCpuFFU(pVCpu->pUVCpu, VMNOTIFYFF_FLAGS_DONE_REM | VMNOTIFYFF_FLAGS_POKE);
+        VMR3NotifyCpuFFU(pVCpu->pUVCpu, VMNOTIFYFF_FLAGS_DONE_REM | VMNOTIFYFF_FLAGS_POKE);// 通知目标 CPU 处理 Force Flag，附带 POKE 标志确保及时响应
     }
 #endif
 }
@@ -3172,10 +3447,12 @@ void apicClearInterruptFF(PVMCPUCC pVCpu, PDMAPICIRQ enmType)
  *
  * @thread  Any.
  */
+//此函数负责将指定中断向量（uVector）提交到目标 vCPU 的 APIC 中断请求队列中，
+//并根据触发模式（enmTriggerMode）更新 IRR（Interrupt Request Register）或 TMR（Trigger Mode Register）。
 bool apicPostInterrupt(PVMCPUCC pVCpu, uint8_t uVector, XAPICTRIGGERMODE enmTriggerMode, uint32_t uSrcTag)
 {
     Assert(pVCpu);
-    Assert(uVector > XAPIC_ILLEGAL_VECTOR_END);
+    Assert(uVector > XAPIC_ILLEGAL_VECTOR_END);//合法向量范围：0x10-0xFF
 
     PVMCC    pVM       = pVCpu->CTX_SUFF(pVM);
     PCAPIC   pApic     = VM_TO_APIC(pVM);
@@ -3183,8 +3460,8 @@ bool apicPostInterrupt(PVMCPUCC pVCpu, uint8_t uVector, XAPICTRIGGERMODE enmTrig
     bool     fAccepted = true;
 
     STAM_PROFILE_START(&pApicCpu->StatPostIntr, a);
-    STAM_REL_COUNTER_INC(&pApicCpu->StatPostIntrCnt);
-    STAM_REL_COUNTER_INC(&pApicCpu->aStatVectors[uVector]);
+    STAM_REL_COUNTER_INC(&pApicCpu->StatPostIntrCnt);//记录中断提交次数
+    STAM_REL_COUNTER_INC(&pApicCpu->aStatVectors[uVector]);//特定向量触发次数
 
     /*
      * Only post valid interrupt vectors.
@@ -3197,27 +3474,34 @@ bool apicPostInterrupt(PVMCPUCC pVCpu, uint8_t uVector, XAPICTRIGGERMODE enmTrig
          * potential expensive operation of poking the guest EMT out of execution.
          */
         PCXAPICPAGE pXApicPage = VMCPU_TO_CXAPICPAGE(pVCpu);
-        if (!apicTestVectorInReg(&pXApicPage->irr, uVector))     /* PAV */
+        if (!apicTestVectorInReg(&pXApicPage->irr, uVector))     /* PAV */// 检查该向量是否已在 IRR 中挂起
         {
             /* Update the interrupt source tag (debugging). */
+            //为中断向量关联源标签（uSrcTag），用于跟踪中断来源。
+            //若标签已存在，设置高位标记（RT_BIT_32(31)）表示多次触发。
             if (!pApicCpu->auSrcTags[uVector])
                 pApicCpu->auSrcTags[uVector]  = uSrcTag;
             else
                 pApicCpu->auSrcTags[uVector] |= RT_BIT_32(31);
 
+            //记录中断来源、目标 CPU、向量和触发模式（如 APIC: apicPostInterrupt: SrcCpu=0 TargetCpu=1 uVector=0x20 edge）。
             Log2(("APIC: apicPostInterrupt: SrcCpu=%u TargetCpu=%u uVector=%#x %s\n",
                   VMMGetCpuId(pVM), pVCpu->idCpu, uVector, enmTriggerMode == XAPICTRIGGERMODE_EDGE ? "edge" : "lvl"));
             if (enmTriggerMode == XAPICTRIGGERMODE_EDGE)
             {
+                //若硬件支持 Posted Interrupt（pApic->fPostedIntrsEnabled），直接通过硬件加速提交（代码中留空待实现）。
                 if (pApic->fPostedIntrsEnabled)
                 { /** @todo posted-interrupt call to hardware */ }
                 else
                 {
+                    //将向量写入 PIB（Posted Interrupt Buffer）
                     apicSetVectorInPib(pApicCpu->CTX_SUFF(pvApicPib), uVector);
+                    //通过原子操作设置通知位
                     uint32_t const fAlreadySet = apicSetNotificationBitInPib((PAPICPIB)pApicCpu->CTX_SUFF(pvApicPib));
                     if (!fAlreadySet)
                     {
                         Log2(("APIC: apicPostInterrupt: Setting UPDATE_APIC FF for edge-triggered intr. uVector=%#x\n", uVector));
+                        //若首次设置则触发 PDMAPICIRQ_UPDATE_PENDING 强制标志（FF），唤醒目标 vCPU 处理中断。
                         apicSetInterruptFF(pVCpu, PDMAPICIRQ_UPDATE_PENDING);
                     }
                 }
@@ -3228,17 +3512,21 @@ bool apicPostInterrupt(PVMCPUCC pVCpu, uint8_t uVector, XAPICTRIGGERMODE enmTrig
                  * Level-triggered interrupts requires updating of the TMR and thus cannot be
                  * delivered asynchronously.
                  */
+                //电平触发需更新 TMR（记录触发模式），因此无法完全异步处理
                 apicSetVectorInPib(&pApicCpu->ApicPibLevel, uVector);
+                //向量写入专用 Level PIB
                 uint32_t const fAlreadySet = apicSetNotificationBitInPib(&pApicCpu->ApicPibLevel);
                 if (!fAlreadySet)
                 {
                     Log2(("APIC: apicPostInterrupt: Setting UPDATE_APIC FF for level-triggered intr. uVector=%#x\n", uVector));
+                    //若首次设置则触发 PDMAPICIRQ_UPDATE_PENDING 强制标志（FF），唤醒目标 vCPU 处理中断。
                     apicSetInterruptFF(pVCpu, PDMAPICIRQ_UPDATE_PENDING);
                 }
             }
         }
         else
         {
+            //若已存在，跳过重复提交（减少不必要的 EMT 唤醒），并记录日志
             Log2(("APIC: apicPostInterrupt: SrcCpu=%u TargetCpu=%u. Vector %#x Already in IRR, skipping\n", VMMGetCpuId(pVM),
                   pVCpu->idCpu, uVector));
             STAM_COUNTER_INC(&pApicCpu->StatPostIntrAlreadyPending);
@@ -3263,18 +3551,26 @@ bool apicPostInterrupt(PVMCPUCC pVCpu, uint8_t uVector, XAPICTRIGGERMODE enmTrig
  *                          0.
  * @thread  Any.
  */
+//根据输入的初始计数值（uInitialCount）和当前定时器分频系数（uTimerShift），
+//计算出下一次定时器中断的触发时间，并启动定时器
+/*
+  Initial Count	    APIC 定时器的初始计数值（写入 ICR 寄存器），决定第一次中断的触发时间。
+  Divide Config	    分频配置寄存器（DCR），通过 uTimerShift 控制定时器时钟频率。
+  u64TimerInitial	缓存初始计数值，用于后续中断处理（如重新加载计数器）。
+*/
 void apicStartTimer(PVMCPUCC pVCpu, uint32_t uInitialCount)
 {
     Assert(pVCpu);
-    PAPICCPU   pApicCpu = VMCPU_TO_APICCPU(pVCpu);
-    PPDMDEVINS pDevIns  = VMCPU_TO_DEVINS(pVCpu);
-    Assert(PDMDevHlpTimerIsLockOwner(pDevIns, pApicCpu->hTimer));
-    Assert(uInitialCount > 0);
+    PAPICCPU   pApicCpu = VMCPU_TO_APICCPU(pVCpu);//获取当前 vCPU 的 APIC 状态
+    PPDMDEVINS pDevIns  = VMCPU_TO_DEVINS(pVCpu);// 获取设备实例
+    Assert(PDMDevHlpTimerIsLockOwner(pDevIns, pApicCpu->hTimer));//确保当前线程持有定时器锁（PDMDevHlpTimerIsLockOwner），防止并发修改
+    Assert(uInitialCount > 0);//验证初始计数值 uInitialCount 必须大于 0（否则定时器无意义）。
 
     PCXAPICPAGE    pXApicPage   = APICCPU_TO_CXAPICPAGE(pApicCpu);
-    uint8_t  const uTimerShift  = apicGetTimerShift(pXApicPage);
-    uint64_t const cTicksToNext = (uint64_t)uInitialCount << uTimerShift;
+    uint8_t  const uTimerShift  = apicGetTimerShift(pXApicPage);//从 APIC 寄存器（pXApicPage）中读取当前分频系数（uTimerShift），决定定时器时钟频率。
+    uint64_t const cTicksToNext = (uint64_t)uInitialCount << uTimerShift;//分频系数将初始计数值转换为实际时钟滴答数
 
+    //记录初始计数值、分频系数和计算的触发时间（调试用）。
     Log2(("APIC%u: apicStartTimer: uInitialCount=%#RX32 uTimerShift=%u cTicksToNext=%RU64\n", pVCpu->idCpu, uInitialCount,
           uTimerShift, cTicksToNext));
 
@@ -3284,7 +3580,11 @@ void apicStartTimer(PVMCPUCC pVCpu, uint32_t uInitialCount)
      * however is updating u64TimerInitial 'atomically' while setting the next
      * tick.
      */
+    //启动定时器，在 cTicksToNext 个时钟滴答后触发中断
+    ////原子性保证：同时更新 pApicCpu->u64TimerInitial（初始计数值的完整记录），
+    //确保后续操作（如 EOI）能正确读取原始值。
     PDMDevHlpTimerSetRelative(pDevIns, pApicCpu->hTimer, cTicksToNext, &pApicCpu->u64TimerInitial);
+    // 向虚拟化平台提供定时器频率提示（可能用于优化调度）
     apicHintTimerFreq(pDevIns, pApicCpu, uInitialCount, uTimerShift);
 }
 
@@ -3328,24 +3628,27 @@ static void apicStopTimer(PVMCPUCC pVCpu)
  *          is ready to take actually service the interrupt (TPR,
  *          interrupt shadow etc.)
  */
+//该函数用于将已挂起的中断从 IRR（Interrupt Request Register）
+//转移到 ISR（In-Service Register），表示该中断即将被 CPU 处理
 VMM_INT_DECL(bool) APICQueueInterruptToService(PVMCPUCC pVCpu, uint8_t u8PendingIntr)
 {
     VMCPU_ASSERT_EMT(pVCpu);
 
     PVMCC pVM   = pVCpu->CTX_SUFF(pVM);
     PAPIC pApic = VM_TO_APIC(pVM);
-    Assert(!pApic->fVirtApicRegsEnabled);
+    Assert(!pApic->fVirtApicRegsEnabled);//检查虚拟 APIC 寄存器未启用（!pApic->fVirtApicRegsEnabled），确保操作基于物理 APIC 行为。
     NOREF(pApic);
 
     PXAPICPAGE pXApicPage = VMCPU_TO_XAPICPAGE(pVCpu);
-    bool const fIsPending = apicTestVectorInReg(&pXApicPage->irr, u8PendingIntr);
+    bool const fIsPending = apicTestVectorInReg(&pXApicPage->irr, u8PendingIntr);//检查目标中断向量（u8PendingIntr）是否在 IRR 中挂起
     if (fIsPending)
     {
-        apicClearVectorInReg(&pXApicPage->irr, u8PendingIntr);
-        apicSetVectorInReg(&pXApicPage->isr, u8PendingIntr);
-        apicUpdatePpr(pVCpu);
+        apicClearVectorInReg(&pXApicPage->irr, u8PendingIntr);//清除 IRR 位,表示中断已被认领，不再等待处理
+        apicSetVectorInReg(&pXApicPage->isr, u8PendingIntr);//设置 ISR 位, 标记中断为“服务中”，防止嵌套中断
+        apicUpdatePpr(pVCpu);//重新计算处理器优先级（PPR），确保后续中断能正确仲裁
         return true;
     }
+    //若不存在
     return false;
 }
 
@@ -3360,6 +3663,12 @@ VMM_INT_DECL(bool) APICQueueInterruptToService(PVMCPUCC pVCpu, uint8_t u8Pending
  * @param   u8PendingIntr       The pending interrupt to de-queue from
  *                              in-service.
  */
+//该函数实现中断从服务中(ISR)回退到待处理(IRR)的状态逆向迁移,典型场景：中断处理失败需重试
+//更新PPR（Processor Priority Register）反映ISR变化
+/*
+  硬件行为差异：物理APIC无此逆向操作，纯虚拟化需求
+  典型场景：VM-Entry失败时恢复中断状态
+*/
 VMM_INT_DECL(void) APICDequeueInterruptFromService(PVMCPUCC pVCpu, uint8_t u8PendingIntr)
 {
     VMCPU_ASSERT_EMT(pVCpu);
@@ -3374,7 +3683,7 @@ VMM_INT_DECL(void) APICDequeueInterruptFromService(PVMCPUCC pVCpu, uint8_t u8Pen
     if (fInService)
     {
         apicClearVectorInReg(&pXApicPage->isr, u8PendingIntr);
-        apicSetVectorInReg(&pXApicPage->irr, u8PendingIntr);
+        apicSetVectorInReg(&pXApicPage->irr, u8PendingIntr); // ISR → IRR回退
         apicUpdatePpr(pVCpu);
     }
 }
@@ -3387,9 +3696,14 @@ VMM_INT_DECL(void) APICDequeueInterruptFromService(PVMCPUCC pVCpu, uint8_t u8Pen
  *
  * @note    NEM/win is ASSUMING the an up to date TPR is not required here.
  */
+/*
+  合并 PIB（Posted Interrupt Buffer）中的中断请求：将异步接收的边沿/电平触发中断同步到 IRR 和 TMR 寄存器。
+  更新中断状态：根据触发模式设置 IRR（中断请求寄存器）和 TMR（触发模式寄存器）。
+  触发中断注入：若存在待处理中断且未设置 VMCPU_FF_INTERRUPT_APIC 标志，唤醒目标 vCPU 处理中断。
+*/
 VMMDECL(void) APICUpdatePendingInterrupts(PVMCPUCC pVCpu)
 {
-    VMCPU_ASSERT_EMT_OR_NOT_RUNNING(pVCpu);
+    VMCPU_ASSERT_EMT_OR_NOT_RUNNING(pVCpu);// 确保当前在 EMT或虚拟机未运行状态。
 
     PAPICCPU   pApicCpu         = VMCPU_TO_APICCPU(pVCpu);
     PXAPICPAGE pXApicPage       = VMCPU_TO_XAPICPAGE(pVCpu);
@@ -3402,6 +3716,7 @@ VMMDECL(void) APICUpdatePendingInterrupts(PVMCPUCC pVCpu)
     PAPICPIB pPib = (PAPICPIB)pApicCpu->CTX_SUFF(pvApicPib);
     for (;;)
     {
+        //循环调用 apicClearNotificationBitInPib 清除通知位，直到所有边沿中断处理完成。
         uint32_t const fAlreadySet = apicClearNotificationBitInPib((PAPICPIB)pApicCpu->CTX_SUFF(pvApicPib));
         if (!fAlreadySet)
             break;
@@ -3409,6 +3724,7 @@ VMMDECL(void) APICUpdatePendingInterrupts(PVMCPUCC pVCpu)
         AssertCompile(RT_ELEMENTS(pXApicPage->irr.u) == 2 * RT_ELEMENTS(pPib->au64VectorBitmap));
         for (size_t idxPib = 0, idxReg = 0; idxPib < RT_ELEMENTS(pPib->au64VectorBitmap); idxPib++, idxReg += 2)
         {
+            //原子读取并清零 PIB 中的中断位图
             uint64_t const u64Fragment = ASMAtomicXchgU64(&pPib->au64VectorBitmap[idxPib], 0);
             if (u64Fragment)
             {
@@ -3418,12 +3734,12 @@ VMMDECL(void) APICUpdatePendingInterrupts(PVMCPUCC pVCpu)
                           pXApicPage->irr.u[idxReg].u32Reg, pXApicPage->irr.u[idxReg + 1].u32Reg,
                           pXApicPage->tmr.u[idxReg].u32Reg, pXApicPage->tmr.u[idxReg + 1].u32Reg));
 
-                pXApicPage->irr.u[idxReg].u32Reg     |=  u32FragmentLo;
+                pXApicPage->irr.u[idxReg].u32Reg     |=  u32FragmentLo;// 将中断向量写入 IRR
                 pXApicPage->irr.u[idxReg + 1].u32Reg |=  u32FragmentHi;
 
-                pXApicPage->tmr.u[idxReg].u32Reg     &= ~u32FragmentLo;
+                pXApicPage->tmr.u[idxReg].u32Reg     &= ~u32FragmentLo;//边沿触发的 TMR 位需清零，因为 TMR 仅用于电平触发。
                 pXApicPage->tmr.u[idxReg + 1].u32Reg &= ~u32FragmentHi;
-                fHasPendingIntrs = true;
+                fHasPendingIntrs = true;//设置 fHasPendingIntrs=true 表示有待处理中断
             }
         }
     }
@@ -3432,11 +3748,13 @@ VMMDECL(void) APICUpdatePendingInterrupts(PVMCPUCC pVCpu)
     pPib = (PAPICPIB)&pApicCpu->ApicPibLevel;
     for (;;)
     {
+        //循环调用 apicClearNotificationBitInPib 清除通知位，直到所有level中断处理完成。
         uint32_t const fAlreadySet = apicClearNotificationBitInPib((PAPICPIB)&pApicCpu->ApicPibLevel);
         if (!fAlreadySet)
             break;
 
         AssertCompile(RT_ELEMENTS(pXApicPage->irr.u) == 2 * RT_ELEMENTS(pPib->au64VectorBitmap));
+        //原子操作获取中断位图后，同时设置 IRR 和 TMR（电平触发需在 TMR 中标记）
         for (size_t idxPib = 0, idxReg = 0; idxPib < RT_ELEMENTS(pPib->au64VectorBitmap); idxPib++, idxReg += 2)
         {
             uint64_t const u64Fragment = ASMAtomicXchgU64(&pPib->au64VectorBitmap[idxPib], 0);
@@ -3451,7 +3769,7 @@ VMMDECL(void) APICUpdatePendingInterrupts(PVMCPUCC pVCpu)
                 pXApicPage->irr.u[idxReg].u32Reg     |= u32FragmentLo;
                 pXApicPage->irr.u[idxReg + 1].u32Reg |= u32FragmentHi;
 
-                pXApicPage->tmr.u[idxReg].u32Reg     |= u32FragmentLo;
+                pXApicPage->tmr.u[idxReg].u32Reg     |= u32FragmentLo;//TMR 位被置位,用于后续 EOI 处理。
                 pXApicPage->tmr.u[idxReg + 1].u32Reg |= u32FragmentHi;
                 fHasPendingIntrs = true;
             }
@@ -3461,6 +3779,7 @@ VMMDECL(void) APICUpdatePendingInterrupts(PVMCPUCC pVCpu)
     STAM_PROFILE_STOP(&pApicCpu->StatUpdatePendingIntrs, a);
     Log3(("APIC%u: APICUpdatePendingInterrupts: fHasPendingIntrs=%RTbool\n", pVCpu->idCpu, fHasPendingIntrs));
 
+    //若存在待处理中断（fHasPendingIntrs）且未设置 VMCPU_FF_INTERRUPT_APIC 标志，调用 apicSignalNextPendingIntr 触发中断流程。
     if (   fHasPendingIntrs
         && !VMCPU_FF_IS_SET(pVCpu, VMCPU_FF_INTERRUPT_APIC))
         apicSignalNextPendingIntr(pVCpu);
