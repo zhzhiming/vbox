@@ -8356,6 +8356,18 @@ VBOXSTRICTRC iemMemStackPopBeginSpecial(PVMCPUCC pVCpu, size_t cbMem, uint32_t c
  *                              to retrieve a new value and anything we return
  *                              here would be discarded.)
  */
+//安全从客户机栈中弹出数据
+/*
+ * 跨模式栈指针计算（16/32/64位模式自动适配）
+   栈内存映射与对齐检查
+   虚拟化环境下的异常处理（#SS、EPT Violation等）
+
+   off	       size_t	    栈顶偏移量（用于非连续弹出操作）
+   cbMem	   size_t	    需弹出的数据长度（必须 < 256字节）
+   ppvMem	   void const**	输出映射后的宿主机虚拟地址指针
+   pbUnmapInfo	uint8_t*	内存映射信息（用于后续提交/回滚）
+   uCurNewRsp	uint64_t	当前栈指针值（已考虑pop操作后的新RSP）
+*/
 VBOXSTRICTRC iemMemStackPopContinueSpecial(PVMCPUCC pVCpu, size_t off, size_t cbMem,
                                            void const **ppvMem, uint8_t *pbUnmapInfo, uint64_t uCurNewRsp) RT_NOEXCEPT
 {
@@ -8364,12 +8376,17 @@ VBOXSTRICTRC iemMemStackPopContinueSpecial(PVMCPUCC pVCpu, size_t off, size_t cb
     /* The essense of iemRegGetRspForPopEx and friends: */ /** @todo put this into a inlined function? */
     RTGCPTR GCPtrTop;
     if (IEM_IS_64BIT_CODE(pVCpu))
-        GCPtrTop = uCurNewRsp;
+        GCPtrTop = uCurNewRsp;// 64位模式直接使用RSP
     else if (pVCpu->cpum.GstCtx.ss.Attr.n.u1DefBig)
-        GCPtrTop = (uint32_t)uCurNewRsp;
+        GCPtrTop = (uint32_t)uCurNewRsp; // 32位模式（默认操作数大小）
     else
-        GCPtrTop = (uint16_t)uCurNewRsp;
+        GCPtrTop = (uint16_t)uCurNewRsp;// 16位模式（实模式/16位保护模式）
 
+    /*
+     * X86_SREG_SS：显式指定使用SS段（避免段前缀干扰）
+       IEM_ACCESS_STACK_R：栈读权限标志（含段限长检查）
+       GCPtrTop + off：最终客户机线性地址（GVA）
+    */
     return iemMemMap(pVCpu, (void **)ppvMem, pbUnmapInfo, cbMem, X86_SREG_SS, GCPtrTop + off, IEM_ACCESS_STACK_R,
                      0 /* checked in iemMemStackPopBeginSpecial */);
 }
@@ -8478,16 +8495,23 @@ VBOXSTRICTRC iemMemFetchSysU32(PVMCPUCC pVCpu, uint32_t *pu32Dst, uint8_t iSegRe
  *                              this access.  The base and limits are checked.
  * @param   GCPtrMem            The address of the guest memory.
  */
+//安全读取客户机的8字节系统数据
+/*
+客户机 #PF             GVA→ GPA转换失败（页表无映射）         返回 VINF_IEM_RAISED_XCPT，由调用方注入#PF到客户机
+EPT Violation          GPA→ HVA转换失败（EPT无映射）	      返回 VINF_EM_NO_MEMORY，触发VM-Exit由hypervisor处理
+对齐检查               非对齐地址访问（x86架构一般不强制）	  当前实现依赖 iemMemMap 保证对齐（否则Assert）
+ * */
 VBOXSTRICTRC iemMemFetchSysU64(PVMCPUCC pVCpu, uint64_t *pu64Dst, uint8_t iSegReg, RTGCPTR GCPtrMem) RT_NOEXCEPT
 {
     /* The lazy approach for now... */
     uint8_t         bUnmapInfo;
     uint64_t const *pu64Src;
+    //GCPtrMem	RTGCPTR	客户机线性地址（GVA），需经客户机页表转换为GPA
     VBOXSTRICTRC rc = iemMemMap(pVCpu, (void **)&pu64Src, &bUnmapInfo, sizeof(*pu64Src), iSegReg, GCPtrMem, IEM_ACCESS_SYS_R, 0);
     if (rc == VINF_SUCCESS)
     {
-        *pu64Dst = *pu64Src;
-        rc = iemMemCommitAndUnmap(pVCpu, bUnmapInfo);
+        *pu64Dst = *pu64Src;//读取8字节数据
+        rc = iemMemCommitAndUnmap(pVCpu, bUnmapInfo);// 释放映射
     }
     return rc;
 }
@@ -8503,6 +8527,28 @@ VBOXSTRICTRC iemMemFetchSysU64(PVMCPUCC pVCpu, uint64_t *pu64Dst, uint8_t iSegRe
  * @param   uXcpt               The exception to raise on table lookup error.
  * @param   uErrorCode          The error code associated with the exception.
  */
+/*
+ * 该函数用于安全获取段描述符并处理所有可能的异常场景，主要完成：
+   根据选择子（uSel）定位 GDT/LDT 中的描述符
+   执行边界检查（Limit/权限验证）
+   处理 16/32/64 位模式差异
+   触发虚拟化相关的异常（VM-exit 或客户机 #GP）
+ * */
+/*
+   pDesc	    PIEMSELDESC	输出参数，存储获取的描述符（含传统模式和长模式扩展）
+   uSel	        uint16_t	输入的选择子（含 TI/RPL 位）
+   uXcpt	    uint8_t	    触发异常的类型（如 X86_XCPT_GP）
+   uErrorCode	uint16_t	异常错误码（例如选择子索引越界时为
+
+   GVA→ GPA转换：通过客户机CR3寄存器定位页表
+  可能触发客户机 #PF（注入到客户机）触发#PF的话，会造成vm exit吗?
+
+纯客户机页错误（无EPT/NPT违规）
+  不会触发 VM-Exit，VirtualBox 会直接向客户机注入 #PF 异常，由客户机操作系统处理。
+EPT/NPT 相关错误
+  如果缺页是由于EPT/NPT 条目无效（如无映射或权限不足），则会触发 VM-Exit，由 hypervisor 处理。
+
+*/
 static VBOXSTRICTRC iemMemFetchSelDescWithErr(PVMCPUCC pVCpu, PIEMSELDESC pDesc, uint16_t uSel,
                                               uint8_t uXcpt, uint16_t uErrorCode)  RT_NOEXCEPT
 {
@@ -8514,29 +8560,30 @@ static VBOXSTRICTRC iemMemFetchSelDescWithErr(PVMCPUCC pVCpu, PIEMSELDESC pDesc,
      * Get the selector table base and check bounds.
      */
     RTGCPTR GCPtrBase;
-    if (uSel & X86_SEL_LDT)
+    if (uSel & X86_SEL_LDT) // TI=1 选择LDT
     {
+        //Attr.n.u1Present=1 且选择子偏移 ≤ Limit
         if (   !pVCpu->cpum.GstCtx.ldtr.Attr.n.u1Present
             || (uSel | X86_SEL_RPL_LDT) > pVCpu->cpum.GstCtx.ldtr.u32Limit )
         {
             LogEx(LOG_GROUP_IEM, ("iemMemFetchSelDesc: LDT selector %#x is out of bounds (%3x) or ldtr is NP (%#x)\n",
                    uSel, pVCpu->cpum.GstCtx.ldtr.u32Limit, pVCpu->cpum.GstCtx.ldtr.Sel));
             return iemRaiseXcptOrInt(pVCpu, 0, uXcpt, IEM_XCPT_FLAGS_T_CPU_XCPT | IEM_XCPT_FLAGS_ERR,
-                                     uErrorCode, 0);
+                                     uErrorCode, 0); // 触发#GP(0)或#NP
         }
 
         Assert(pVCpu->cpum.GstCtx.ldtr.Attr.n.u1Present);
-        GCPtrBase = pVCpu->cpum.GstCtx.ldtr.u64Base;
+        GCPtrBase = pVCpu->cpum.GstCtx.ldtr.u64Base;// LDT基址
     }
     else
     {
-        if ((uSel | X86_SEL_RPL_LDT) > pVCpu->cpum.GstCtx.gdtr.cbGdt)
+        if ((uSel | X86_SEL_RPL_LDT) > pVCpu->cpum.GstCtx.gdtr.cbGdt)// TI=0 选择GDT
         {
             LogEx(LOG_GROUP_IEM, ("iemMemFetchSelDesc: GDT selector %#x is out of bounds (%3x)\n", uSel, pVCpu->cpum.GstCtx.gdtr.cbGdt));
             return iemRaiseXcptOrInt(pVCpu, 0, uXcpt, IEM_XCPT_FLAGS_T_CPU_XCPT | IEM_XCPT_FLAGS_ERR,
-                                     uErrorCode, 0);
+                                     uErrorCode, 0); // 触发#GP(0)
         }
-        GCPtrBase = pVCpu->cpum.GstCtx.gdtr.pGdt;
+        GCPtrBase = pVCpu->cpum.GstCtx.gdtr.pGdt;// GDT基址
     }
 
     /*
@@ -8544,7 +8591,8 @@ static VBOXSTRICTRC iemMemFetchSelDescWithErr(PVMCPUCC pVCpu, PIEMSELDESC pDesc,
      * required.
      */
     VBOXSTRICTRC rcStrict;
-    if (IEM_GET_TARGET_CPU(pVCpu) > IEMTARGETCPU_286)
+    if (IEM_GET_TARGET_CPU(pVCpu) > IEMTARGETCPU_286)// 非286模式
+        // 直接读取8字节
         rcStrict = iemMemFetchSysU64(pVCpu, &pDesc->Legacy.u, UINT8_MAX, GCPtrBase + (uSel & X86_SEL_MASK));
     else
     {
@@ -8571,6 +8619,7 @@ static VBOXSTRICTRC iemMemFetchSelDescWithErr(PVMCPUCC pVCpu, PIEMSELDESC pDesc,
         {
             LogEx(LOG_GROUP_IEM,("iemMemFetchSelDesc: system selector %#x is out of bounds\n", uSel));
             /** @todo is this the right exception? */
+            // 长模式描述符越界
             return iemRaiseXcptOrInt(pVCpu, 0, uXcpt, IEM_XCPT_FLAGS_T_CPU_XCPT | IEM_XCPT_FLAGS_ERR, uErrorCode, 0);
         }
     }
@@ -8603,15 +8652,54 @@ VBOXSTRICTRC iemMemFetchSelDesc(PVMCPUCC pVCpu, PIEMSELDESC pDesc, uint16_t uSel
  * @param   pVCpu               The cross context virtual CPU structure of the calling thread.
  * @param   uSel                The selector.
  */
+
+/*
+  该函数用于原子化标记段描述符为已访问（Accessed）状态，主要处理：
+    定位GDT/LDT中的描述符条目
+    原子化设置描述符的Accessed位（bit 40）
+    处理描述符地址对齐异常情况
+    确保虚拟化环境下的内存访问安全
+
+uSel: 段选择子
+
+sequenceDiagram
+    Guest OS->>+VirtualBox: MOV AX,[ES:0x1234]
+    VirtualBox->>+GDT: 用ES选择子查GDT(GVA)
+    VirtualBox->>+Guest PageTable: GVA→GPA转换
+    alt 客户机页表缺失
+        Guest PageTable-->>Guest OS: 触发#PF
+    else 成功
+        Guest PageTable-->>VirtualBox: 返回GPA
+    end
+    VirtualBox->>+EPT/NPT: GPA→HPA转换
+    alt EPT Violation
+        EPT-->>Hypervisor: 触发VM-exit
+    else 成功
+        EPT-->>VirtualBox: 返回HPA
+    end
+    VirtualBox->>Host OS: 访问HVA映射的内存
+
+ * */
 VBOXSTRICTRC iemMemMarkSelDescAccessed(PVMCPUCC pVCpu, uint16_t uSel) RT_NOEXCEPT
 {
     /*
      * Get the selector table base and calculate the entry address.
      */
+    /*
+     * 选择子结构：
+    ┌───┬───┬───┐
+    │15:3│ 2 │1:0│
+    ├───┼───┼───┤
+    │Index│TI│RPL│
+    └───┴───┴───┘
+    Index（13位）：描述符在GDT/LDT中的索引（0~8191）
+    TI（1位）：0=GDT，1=LDT
+    RPL（2位）：请求特权级
+     * */
     RTGCPTR GCPtr = uSel & X86_SEL_LDT
-                  ? pVCpu->cpum.GstCtx.ldtr.u64Base
-                  : pVCpu->cpum.GstCtx.gdtr.pGdt;
-    GCPtr += uSel & X86_SEL_MASK;
+                  ? pVCpu->cpum.GstCtx.ldtr.u64Base// LDT基址
+                  : pVCpu->cpum.GstCtx.gdtr.pGdt;  // GDT基址
+    GCPtr += uSel & X86_SEL_MASK;//目标描述符的客户机线性地址GVA
 
     /*
      * ASMAtomicBitSet will assert if the address is misaligned, so do some
@@ -8621,25 +8709,33 @@ VBOXSTRICTRC iemMemMarkSelDescAccessed(PVMCPUCC pVCpu, uint16_t uSel) RT_NOEXCEP
     VBOXSTRICTRC        rcStrict;
     uint8_t             bUnmapInfo;
     uint32_t volatile  *pu32;
-    if ((GCPtr & 3) == 0)
+    if ((GCPtr & 3) == 0) // 地址4字节对齐
     {
         /* The normal case, map the 32-bit bits around the accessed bit (40). */
-        GCPtr += 2 + 2;
+        GCPtr += 2 + 2; // 定位到包含Accessed位的双字
         rcStrict = iemMemMap(pVCpu, (void **)&pu32, &bUnmapInfo, 4, UINT8_MAX, GCPtr, IEM_ACCESS_SYS_RW, 0);
         if (rcStrict != VINF_SUCCESS)
             return rcStrict;
+        // 设置bit40（在映射后的偏移量）
         ASMAtomicBitSet(pu32, 8); /* X86_SEL_TYPE_ACCESSED is 1, but it is preceeded by u8BaseHigh1. */
     }
     else
-    {
+    {// 非对齐处理
         /* The misaligned GDT/LDT case, map the whole thing. */
+        //iemMemMap函数内部会处理GVA→GPA→HVA的转换
+        /*
+          该函数会：
+             先通过客户机CR3寄存器定位客户机页表
+             将GVA转换为GPA（可能触发客户机#PF异常）
+             再通过EPT/NPT将GPA转换为HVA（可能触发VM-exit）
+        */
         rcStrict = iemMemMap(pVCpu, (void **)&pu32, &bUnmapInfo, 8, UINT8_MAX, GCPtr, IEM_ACCESS_SYS_RW, 0);
         if (rcStrict != VINF_SUCCESS)
             return rcStrict;
-        switch ((uintptr_t)pu32 & 3)
+        switch ((uintptr_t)pu32 & 3) // 按低2bit分支
         {
             case 0: ASMAtomicBitSet(pu32,                         40 + 0 -  0); break;
-            case 1: ASMAtomicBitSet((uint8_t volatile *)pu32 + 3, 40 + 0 - 24); break;
+            case 1: ASMAtomicBitSet((uint8_t volatile *)pu32 + 3, 40 + 0 - 24); break;// 跨双字处理
             case 2: ASMAtomicBitSet((uint8_t volatile *)pu32 + 2, 40 + 0 - 16); break;
             case 3: ASMAtomicBitSet((uint8_t volatile *)pu32 + 1, 40 + 0 -  8); break;
         }
@@ -8672,6 +8768,25 @@ VBOXSTRICTRC iemMemMarkSelDescAccessed(PVMCPUCC pVCpu, uint16_t uSel) RT_NOEXCEP
  *                              - Second byte: RSP displacement (for POP [ESP]).
  * @param   pGCPtrEff           Where to return the effective address.
  */
+//这是 VirtualBox 指令模拟器（IEM）中最核心的地址计算函数，
+//负责解析 x86 指令的 ModR/M 编码并生成线性地址。
+/*
+  bRm	ModR/M字节（bit[7:6]=mod, bit[5:3]=reg/opcode, bit[2:0]=r/m）
+  cbImmAndRspOffset	复合字段：高24位=RSP偏移补偿（栈操作修正），低8位=立即数长度（RIP修正）
+  pGCPtrEff	输出计算后的客户机线性地址（GCPtr）
+
+  架构精确性- 严格遵循Intel手册规范
+  虚拟化效率- 最小化VM-exit触发可能
+
+  sequenceDiagram
+    MOV指令->>+IEM: MOV eax,[esi+ecx*2+0x10]
+    IEM->>+CalcAddr: bRm=0x54 (mod=01, reg=0, r/m=4)
+    CalcAddr->>Decoder: 读取SIB=0x31 (scale=1, index=ecx, base=esi)
+    CalcAddr->>Decoder: 读取disp8=0x10
+    CalcAddr->>CPUState: 读取esi/ecx
+    CalcAddr-->>IEM: 返回0x1A2B3C00
+    IEM-->>MOV指令: 完成地址计算
+ * */
 VBOXSTRICTRC iemOpHlpCalcRmEffAddr(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImmAndRspOffset, PRTGCPTR pGCPtrEff) RT_NOEXCEPT
 {
     Log5(("iemOpHlpCalcRmEffAddr: bRm=%#x\n", bRm));
@@ -8687,6 +8802,7 @@ VBOXSTRICTRC iemOpHlpCalcRmEffAddr(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImmAn
 /** @todo Check the effective address size crap! */
         if (pVCpu->iem.s.enmEffAddrMode == IEMMODE_16BIT)
         {
+            // 16位模式：仅用BX/BP/SI/DI组合
             uint16_t u16EffAddr;
 
             /* Handle the disp16 form with no registers first. */
@@ -8721,6 +8837,7 @@ VBOXSTRICTRC iemOpHlpCalcRmEffAddr(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImmAn
         }
         else
         {
+            // 32位模式：支持SIB和复杂寻址
             Assert(pVCpu->iem.s.enmEffAddrMode == IEMMODE_32BIT);
             uint32_t u32EffAddr;
 
@@ -8816,6 +8933,7 @@ VBOXSTRICTRC iemOpHlpCalcRmEffAddr(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImmAn
     }
     else
     {
+        // 64位模式：支持RIP相对寻址和R8-R15
         uint64_t u64EffAddr;
 
         /* Handle the rip+disp32 form with no registers first. */
@@ -8970,6 +9088,21 @@ VBOXSTRICTRC iemOpHlpCalcRmEffAddr(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImmAn
  *                                (only for RIP relative addressing).
  *                              - Second byte: RSP displacement (for POP [ESP]).
  */
+/*
+    该函数是VirtualBox专门为跳转类指令优化的地址计算器，主要处理：
+      跨模式地址计算（16/32/64位）
+      复杂寻址方式（基址+变址+比例+位移）
+      RIP相对寻址（64位模式特有）
+      段寄存器默认规则（SS段自动选择）
+      长跳转异常处理（通过IEM_DO_LONGJMP）
+
+sequenceDiagram
+    JMP指令->>+CalcAddr: JMP [RIP+0x1234]
+    CalcAddr->>Decoder: 解析ModR/M=0x05
+    CalcAddr->>Decoder: 读取disp32=0x1234
+    CalcAddr->>CPUState: 读取RIP
+    CalcAddr-->>JMP指令: 返回0x7FABCDEF
+ * */
 RTGCPTR iemOpHlpCalcRmEffAddrJmp(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImmAndRspOffset) IEM_NOEXCEPT_MAY_LONGJMP
 {
     Log5(("iemOpHlpCalcRmEffAddrJmp: bRm=%#x\n", bRm));
@@ -8983,6 +9116,7 @@ RTGCPTR iemOpHlpCalcRmEffAddrJmp(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImmAndR
     if (!IEM_IS_64BIT_CODE(pVCpu))
     {
 /** @todo Check the effective address size crap! */
+        // 16位BX/SI/DI/BP组合
         if (pVCpu->iem.s.enmEffAddrMode == IEMMODE_16BIT)
         {
             uint16_t u16EffAddr;
@@ -9006,7 +9140,7 @@ RTGCPTR iemOpHlpCalcRmEffAddrJmp(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImmAndR
                 {
                     case 0: u16EffAddr += pVCpu->cpum.GstCtx.bx + pVCpu->cpum.GstCtx.si; break;
                     case 1: u16EffAddr += pVCpu->cpum.GstCtx.bx + pVCpu->cpum.GstCtx.di; break;
-                    case 2: u16EffAddr += pVCpu->cpum.GstCtx.bp + pVCpu->cpum.GstCtx.si; SET_SS_DEF(); break;
+                    case 2: u16EffAddr += pVCpu->cpum.GstCtx.bp + pVCpu->cpum.GstCtx.si; SET_SS_DEF(); break;// 隐含SS段
                     case 3: u16EffAddr += pVCpu->cpum.GstCtx.bp + pVCpu->cpum.GstCtx.di; SET_SS_DEF(); break;
                     case 4: u16EffAddr += pVCpu->cpum.GstCtx.si;            break;
                     case 5: u16EffAddr += pVCpu->cpum.GstCtx.di;            break;
@@ -9019,6 +9153,7 @@ RTGCPTR iemOpHlpCalcRmEffAddrJmp(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImmAndR
             return u16EffAddr;
         }
 
+        // 32位SIB寻址
         Assert(pVCpu->iem.s.enmEffAddrMode == IEMMODE_32BIT);
         uint32_t u32EffAddr;
 
@@ -9113,12 +9248,16 @@ RTGCPTR iemOpHlpCalcRmEffAddrJmp(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImmAndR
         return u32EffAddr;
     }
 
+    // 64位RIP相对或R8-R15扩展
     uint64_t u64EffAddr;
 
     /* Handle the rip+disp32 form with no registers first. */
-    if ((bRm & (X86_MODRM_MOD_MASK | X86_MODRM_RM_MASK)) == 5)
+    // RIP相对寻址直接计算（64位模式）
+    // if ((bRm & 0xC7) == 0x05)
+    if ((bRm & (X86_MODRM_MOD_MASK | X86_MODRM_RM_MASK)) == 5) // mod=00, r/m=101
     {
         IEM_OPCODE_GET_NEXT_S32_SX_U64(&u64EffAddr);
+        //u64EffAddr = rip + IEM_GET_INSTR_LEN() + disp32;
         u64EffAddr += pVCpu->cpum.GstCtx.rip + IEM_GET_INSTR_LEN(pVCpu) + (cbImmAndRspOffset & UINT32_C(0xff));
     }
     else
@@ -9266,6 +9405,35 @@ RTGCPTR iemOpHlpCalcRmEffAddrJmp(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImmAndR
  * @param   puInfo              Extra info: 32-bit displacement (bits 31:0) and
  *                              SIB byte (bits 39:32).
  */
+/*
+ * 该函数是VirtualBox指令模拟器的寻址计算核心，负责解析x86指令的ModR/M字节并计算有效地址，主要处理：
+  三种地址模式（16/32/64位）的完整支持
+  复杂寻址方式（基址+变址+比例+位移）
+  段寄存器默认规则（SS段覆盖检测）
+  RIP相对寻址（64位模式特有）
+  调试信息收集（puInfo输出寻址详情）
+
+bRm	                uint8_t	    ModR/M字节（包含mod、reg/opcode、r/m字段）
+cbImmAndRspOffset	uint32_t	高24位：RSP偏移补偿量；低8位：立即数长度（用于RIP相对寻址修正）
+pGCPtrEff	        PRTGCPTR	输出计算出的线性地址
+puInfo	            uint64_t*	输出寻址详情（位移值/SIB字节等）
+
+    #define SET_SS_DEF() do { \
+        if (!(pVCpu->iem.s.fPrefixes & IEM_OP_PRF_SEG_MASK)) \
+            pVCpu->iem.s.iEffSeg = X86_SREG_SS; \
+    } while (0)
+    当使用BP/EBP/RBP基址寄存器时自动切换至SS段
+    显式段前缀（如DS:）可覆盖默认规则
+
+sequenceDiagram
+    Decoder->>+CalcAddr: MOV eax, [ebx+esi*4+0x10]
+    CalcAddr->>Decoder: 解析ModR/M=0x94
+    CalcAddr->>Decoder: 读取SIB=0x31
+    CalcAddr->>Decoder: 读取disp8=0x10
+    CalcAddr->>CPUState: 读取ebx/esi
+    CalcAddr-->>Decoder: 返回0x1A2B3C00
+
+ * */
 VBOXSTRICTRC iemOpHlpCalcRmEffAddrEx(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImmAndRspOffset, PRTGCPTR pGCPtrEff, uint64_t *puInfo) RT_NOEXCEPT
 {
     Log5(("iemOpHlpCalcRmEffAddr: bRm=%#x\n", bRm));
@@ -9277,9 +9445,15 @@ VBOXSTRICTRC iemOpHlpCalcRmEffAddrEx(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImm
     } while (0)
 
     uint64_t uInfo;
+    /*
+     * 16位模式：使用 BX/SI/DI/BP 等16位寄存器组合
+       32位模式：支持基址+变址+比例的复杂寻址（含 SIB 字节）
+       64位模式：扩展寄存器（R8-R15）并支持 RIP 相对寻址
+    */
     if (!IEM_IS_64BIT_CODE(pVCpu))
     {
 /** @todo Check the effective address size crap! */
+        // 16位寻址处理
         if (pVCpu->iem.s.enmEffAddrMode == IEMMODE_16BIT)
         {
             uint16_t u16EffAddr;
@@ -9305,9 +9479,9 @@ VBOXSTRICTRC iemOpHlpCalcRmEffAddrEx(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImm
                 /* Add the base and index registers to the disp. */
                 switch (bRm & X86_MODRM_RM_MASK)
                 {
-                    case 0: u16EffAddr += pVCpu->cpum.GstCtx.bx + pVCpu->cpum.GstCtx.si; break;
-                    case 1: u16EffAddr += pVCpu->cpum.GstCtx.bx + pVCpu->cpum.GstCtx.di; break;
-                    case 2: u16EffAddr += pVCpu->cpum.GstCtx.bp + pVCpu->cpum.GstCtx.si; SET_SS_DEF(); break;
+                    case 0: u16EffAddr += pVCpu->cpum.GstCtx.bx + pVCpu->cpum.GstCtx.si; break;// [bx+si]
+                    case 1: u16EffAddr += pVCpu->cpum.GstCtx.bx + pVCpu->cpum.GstCtx.di; break;// [bx+di]
+                    case 2: u16EffAddr += pVCpu->cpum.GstCtx.bp + pVCpu->cpum.GstCtx.si; SET_SS_DEF(); break;// [bp+si] (隐含SS段)
                     case 3: u16EffAddr += pVCpu->cpum.GstCtx.bp + pVCpu->cpum.GstCtx.di; SET_SS_DEF(); break;
                     case 4: u16EffAddr += pVCpu->cpum.GstCtx.si;            break;
                     case 5: u16EffAddr += pVCpu->cpum.GstCtx.di;            break;
@@ -9319,6 +9493,7 @@ VBOXSTRICTRC iemOpHlpCalcRmEffAddrEx(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImm
             *pGCPtrEff = u16EffAddr;
         }
         else
+        // 32位寻址处理
         {
             Assert(pVCpu->iem.s.enmEffAddrMode == IEMMODE_32BIT);
             uint32_t u32EffAddr;
@@ -9333,6 +9508,7 @@ VBOXSTRICTRC iemOpHlpCalcRmEffAddrEx(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImm
             {
                 /* Get the register (or SIB) value. */
                 uInfo = 0;
+                //&0x07
                 switch ((bRm & X86_MODRM_RM_MASK))
                 {
                     case 0: u32EffAddr = pVCpu->cpum.GstCtx.eax; break;
@@ -9357,9 +9533,11 @@ VBOXSTRICTRC iemOpHlpCalcRmEffAddrEx(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImm
                             case 7: u32EffAddr = pVCpu->cpum.GstCtx.edi; break;
                             IEM_NOT_REACHED_DEFAULT_CASE_RET();
                         }
-                        u32EffAddr <<= (bSib >> X86_SIB_SCALE_SHIFT) & X86_SIB_SCALE_SMASK;
+                        // 变址计算
+                        u32EffAddr <<= (bSib >> X86_SIB_SCALE_SHIFT) & X86_SIB_SCALE_SMASK;// // 比例因子(1/2/4/8)
 
                         /* add base */
+                        // 基址处理
                         switch (bSib & X86_SIB_BASE_MASK)
                         {
                             case 0: u32EffAddr += pVCpu->cpum.GstCtx.eax; break;
@@ -9376,6 +9554,7 @@ VBOXSTRICTRC iemOpHlpCalcRmEffAddrEx(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImm
                                 else
                                 {
                                     uint32_t u32Disp;
+                                    // 无基址只有disp32
                                     IEM_OPCODE_GET_NEXT_U32(&u32Disp);
                                     u32EffAddr += u32Disp;
                                     uInfo      |= u32Disp;
@@ -9422,10 +9601,12 @@ VBOXSTRICTRC iemOpHlpCalcRmEffAddrEx(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImm
         }
     }
     else
+    // 64位寻址处理
     {
         uint64_t u64EffAddr;
 
         /* Handle the rip+disp32 form with no registers first. */
+        //RIP相对寻址特殊处理
         if ((bRm & (X86_MODRM_MOD_MASK | X86_MODRM_RM_MASK)) == 5)
         {
             IEM_OPCODE_GET_NEXT_S32_SX_U64(&u64EffAddr);
@@ -9436,6 +9617,7 @@ VBOXSTRICTRC iemOpHlpCalcRmEffAddrEx(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImm
         {
             /* Get the register (or SIB) value. */
             uInfo = 0;
+            // REX前缀扩展寄存器（R8-R15）
             switch ((bRm & X86_MODRM_RM_MASK) | pVCpu->iem.s.uRexB)
             {
                 case  0: u64EffAddr = pVCpu->cpum.GstCtx.rax; break;
@@ -9460,7 +9642,8 @@ VBOXSTRICTRC iemOpHlpCalcRmEffAddrEx(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImm
                     uInfo = (uint64_t)bSib << 32;
 
                     /* Get the index and scale it. */
-                    switch (((bSib >> X86_SIB_INDEX_SHIFT) & X86_SIB_INDEX_SMASK) | pVCpu->iem.s.uRexIndex)
+                    //index = (bSib >> 3) & 7;
+                    switch (((bSib >> X86_SIB_INDEX_SHIFT) & X86_SIB_INDEX_SMASK) | pVCpu->iem.s.uRexIndex)// 变址寄存器编号
                     {
                         case  0: u64EffAddr = pVCpu->cpum.GstCtx.rax; break;
                         case  1: u64EffAddr = pVCpu->cpum.GstCtx.rcx; break;
@@ -9480,9 +9663,10 @@ VBOXSTRICTRC iemOpHlpCalcRmEffAddrEx(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImm
                         case 15: u64EffAddr = pVCpu->cpum.GstCtx.r15; break;
                         IEM_NOT_REACHED_DEFAULT_CASE_RET();
                     }
-                    u64EffAddr <<= (bSib >> X86_SIB_SCALE_SHIFT) & X86_SIB_SCALE_SMASK;
+                    u64EffAddr <<= (bSib >> X86_SIB_SCALE_SHIFT) & X86_SIB_SCALE_SMASK;// u64EffAddr << 比例因子(1/2/4/8)
 
                     /* add base */
+                    //base  = bSib & 7;  基址寄存器编号
                     switch ((bSib & X86_SIB_BASE_MASK) | pVCpu->iem.s.uRexB)
                     {
                         case  0: u64EffAddr += pVCpu->cpum.GstCtx.rax; break;
@@ -9582,19 +9766,29 @@ VBOXSTRICTRC iemOpHlpCalcRmEffAddrEx(PVMCPUCC pVCpu, uint8_t bRm, uint32_t cbImm
  *                      The @a fSameCtx parameter is now misleading and obsolete.
  * @param   pszFunction The IEM function doing the execution.
  */
+//作用：记录当前 CPU 执行的指令及其上下文（寄存器、标志位、FPU 状态等）。
+/*
+ * 适用场景：
+调试模式（LogIs2Enabled()）：输出详细的指令反汇编和寄存器状态。
+普通日志模式（LogFlow）：仅输出关键信息（CS:RIP、SS:RSP、EFLAGS）。
+调用时机：通常在 IEM（指令执行管理器）执行 Guest 指令前后调用，用于监控执行流程。
+ * */
 static void iemLogCurInstr(PVMCPUCC pVCpu, bool fSameCtx, const char *pszFunction) RT_NOEXCEPT
 {
 # ifdef IN_RING3
+    //仅在 日志级别 2（详细调试）启用时执行。
     if (LogIs2Enabled())
     {
         char     szInstr[256];
         uint32_t cbInstr = 0;
         if (fSameCtx)
+            //反汇编当前指令
             DBGFR3DisasInstrEx(pVCpu->pVMR3->pUVM, pVCpu->idCpu, 0, 0,
                                DBGF_DISAS_FLAGS_CURRENT_GUEST | DBGF_DISAS_FLAGS_DEFAULT_MODE,
                                szInstr, sizeof(szInstr), &cbInstr);
         else
         {
+            //根据 CPU 模式（16/32/64位）设置反汇编标志，并指定 CS:RIP 地址。
             uint32_t fFlags = 0;
             switch (IEM_GET_CPU_MODE(pVCpu))
             {
@@ -9612,6 +9806,13 @@ static void iemLogCurInstr(PVMCPUCC pVCpu, bool fSameCtx, const char *pszFunctio
         }
 
         PCX86FXSTATE pFpuCtx = &pVCpu->cpum.GstCtx.XState.x87;
+        /*
+         * 记录寄存器状态：
+             通用寄存器（EAX/EBX/ECX/EDX/ESI/EDI/EBP/ESP/EIP）。
+             段寄存器（CS/SS/DS/ES/FS/GS）。
+             EFLAGS（包括 IOPL 权限位）。
+             FPU/MMX/XMM 状态（FSW/FCW/FTW/MXCSR）。
+         * */
         Log2(("**** %s fExec=%x\n"
               " eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x\n"
               " eip=%08x esp=%08x ebp=%08x iopl=%d tr=%04x\n"
@@ -9632,6 +9833,12 @@ static void iemLogCurInstr(PVMCPUCC pVCpu, bool fSameCtx, const char *pszFunctio
     }
     else
 # endif
+        /*
+           精简信息：
+             CS:RIP（当前指令指针）。
+             SS:RSP（栈指针）。
+             EFLAGS（CPU 状态标志）。
+        */
         LogFlow(("%s: cs:rip=%04x:%08RX64 ss:rsp=%04x:%08RX64 EFL=%06x\n", pszFunction, pVCpu->cpum.GstCtx.cs.Sel,
                  pVCpu->cpum.GstCtx.rip, pVCpu->cpum.GstCtx.ss.Sel, pVCpu->cpum.GstCtx.rsp, pVCpu->cpum.GstCtx.eflags.u));
     RT_NOREF_PV(pVCpu); RT_NOREF_PV(fSameCtx);
@@ -9719,27 +9926,40 @@ static VBOXSTRICTRC iemHandleNestedInstructionBoundaryFFs(PVMCPUCC pVCpu, VBOXST
  *                      POP SS and MOV SS,GR.
  * @param   pszFunction The calling function name.
  */
+//负责单条指令的原子性执行和虚拟化状态管理
+/*
+状态安全：通过内存映射校验和异常回滚保证 Guest 状态一致性。
+硬件协同：动态选择 VT-x 加速或软件模拟，处理嵌套虚拟化事件。
+时序精确：严格模拟 x86 中断抑制行为，符合 CPU 微架构规范。
+可观测性：丰富的断言和统计计数器（如 cLongJumps）辅助调试。
+ * */
 DECLINLINE(VBOXSTRICTRC) iemExecOneInner(PVMCPUCC pVCpu, bool fExecuteInhibit, const char *pszFunction)
 {
+    // 强制检查 aMemMappings[0..2] , 确保无残留内存映射（防止跨指令内存泄漏
     AssertMsg(pVCpu->iem.s.aMemMappings[0].fAccess == IEM_ACCESS_INVALID, ("0: %#x %RGp\n", pVCpu->iem.s.aMemMappings[0].fAccess, pVCpu->iem.s.aMemBbMappings[0].GCPhysFirst));
     AssertMsg(pVCpu->iem.s.aMemMappings[1].fAccess == IEM_ACCESS_INVALID, ("1: %#x %RGp\n", pVCpu->iem.s.aMemMappings[1].fAccess, pVCpu->iem.s.aMemBbMappings[1].GCPhysFirst));
     AssertMsg(pVCpu->iem.s.aMemMappings[2].fAccess == IEM_ACCESS_INVALID, ("2: %#x %RGp\n", pVCpu->iem.s.aMemMappings[2].fAccess, pVCpu->iem.s.aMemBbMappings[2].GCPhysFirst));
     RT_NOREF_PV(pszFunction);
 
 #ifdef IEM_WITH_SETJMP
+    //作用：通过 setjmp/longjmp 实现 非局部跳转，处理内存访问异常（如 EPT Violation)
+    //性能影响：异常路径下需回滚临时内存映射，增加约 500-1000 时钟周期开销
     VBOXSTRICTRC rcStrict;
-    IEM_TRY_SETJMP(pVCpu, rcStrict)
+    IEM_TRY_SETJMP(pVCpu, rcStrict)// 设置异常捕获点
     {
         uint8_t b; IEM_OPCODE_GET_FIRST_U8(&b);
         rcStrict = FNIEMOP_CALL(g_apfnIemInterpretOnlyOneByteMap[b]);
     }
+    // 指令执行逻辑
     IEM_CATCH_LONGJMP_BEGIN(pVCpu, rcStrict);
     {
-        pVCpu->iem.s.cLongJumps++;
+        pVCpu->iem.s.cLongJumps++;// 记录异常次数
     }
     IEM_CATCH_LONGJMP_END(pVCpu);
 #else
+    //获取首字节，查表跳转到对应处理函数
     uint8_t b; IEM_OPCODE_GET_FIRST_U8(&b);
+    //若指令支持 VT-x 直接执行（如 MOV），优先使用硬件加速；否则降级到软件模拟
     VBOXSTRICTRC rcStrict = FNIEMOP_CALL(g_apfnIemInterpretOnlyOneByteMap[b]);
 #endif
     if (rcStrict == VINF_SUCCESS)
@@ -9777,10 +9997,13 @@ DECLINLINE(VBOXSTRICTRC) iemExecOneInner(PVMCPUCC pVCpu, bool fExecuteInhibit, c
 
     /* Execute the next instruction as well if a cli, pop ss or
        mov ss, Gr has just completed successfully. */
+    //中断抑制场景
+    //CLI/POP SS/MOV SS：执行后设置 fExecuteInhibit 标志，抑制下一条指令的中断响应
     if (   fExecuteInhibit
         && rcStrict == VINF_SUCCESS
         && CPUMIsInInterruptShadow(&pVCpu->cpum.GstCtx))
     {
+        // 预取下一条指令
         rcStrict = iemInitDecoderAndPrefetchOpcodes(pVCpu, pVCpu->iem.s.fExec & (IEM_F_BYPASS_HANDLERS | IEM_F_X86_DISREGARD_LOCK));
         if (rcStrict == VINF_SUCCESS)
         {
@@ -9799,6 +10022,7 @@ DECLINLINE(VBOXSTRICTRC) iemExecOneInner(PVMCPUCC pVCpu, bool fExecuteInhibit, c
             }
             IEM_CATCH_LONGJMP_END(pVCpu);
 #else
+            //再次调用指令处理函数;  // 保证中断抑制窗口的原子性
             IEM_OPCODE_GET_FIRST_U8(&b);
             rcStrict = FNIEMOP_CALL(g_apfnIemInterpretOnlyOneByteMap[b]);
 #endif
@@ -9868,12 +10092,14 @@ VMMDECL(VBOXSTRICTRC) IEMExecOne(PVMCPUCC pVCpu)
 }
 
 
+//单条指令执行
 VMMDECL(VBOXSTRICTRC) IEMExecOneEx(PVMCPUCC pVCpu, uint32_t *pcbWritten)
 {
     uint32_t const cbOldWritten = pVCpu->iem.s.cbWritten;
     VBOXSTRICTRC rcStrict = iemInitDecoderAndPrefetchOpcodes(pVCpu, 0 /*fExecOpts*/);
     if (rcStrict == VINF_SUCCESS)
     {
+        //单步模拟：通过 iemExecOneInner 执行单条指令，支持 硬件辅助加速（VT-x）或 软件回退模拟（RAW-mode）
         rcStrict = iemExecOneInner(pVCpu, true, "IEMExecOneEx");
         if (pcbWritten)
             *pcbWritten = pVCpu->iem.s.cbWritten - cbOldWritten;
@@ -9884,24 +10110,34 @@ VMMDECL(VBOXSTRICTRC) IEMExecOneEx(PVMCPUCC pVCpu, uint32_t *pcbWritten)
     return rcStrict;
 }
 
-
+//通过预取指令字节（pvOpcodeBytes）和匹配PC值（OpcodeBytesPC）实现：
+//减少内存访问：避免重复从客户机内存获取指令
+//提升性能：特别适用于频繁执行的代码区域（如循环体）
+/*
+预取命中（PC匹配+数据有效）	直接使用预取字节，跳过内存访问	        最高效（0内存延迟）
+预取未命中	                调用iemInitDecoderAndPrefetchOpcodes	常规内存访问路径
+ * */
 VMMDECL(VBOXSTRICTRC) IEMExecOneWithPrefetchedByPC(PVMCPUCC pVCpu, uint64_t OpcodeBytesPC,
                                                    const void *pvOpcodeBytes, size_t cbOpcodeBytes)
 {
     VBOXSTRICTRC rcStrict;
     if (   cbOpcodeBytes
+        //当前RIP必须与预取地址严格匹配（确保指令上下文正确）
         && pVCpu->cpum.GstCtx.rip == OpcodeBytesPC)
     {
         iemInitDecoder(pVCpu, 0 /*fExecOpts*/);
 #ifdef IEM_WITH_CODE_TLB
-        pVCpu->iem.s.uInstrBufPc      = OpcodeBytesPC;
-        pVCpu->iem.s.pbInstrBuf       = (uint8_t const *)pvOpcodeBytes;
-        pVCpu->iem.s.cbInstrBufTotal  = (uint16_t)RT_MIN(X86_PAGE_SIZE, cbOpcodeBytes);
+        //优势：支持页粒度缓存，适合密集指令流
+        //TLB作用：相当于为指令获取构建软件TLB
+        pVCpu->iem.s.uInstrBufPc      = OpcodeBytesPC;// 缓存指令页PC
+        pVCpu->iem.s.pbInstrBuf       = (uint8_t const *)pvOpcodeBytes; // 指向外部预取缓冲区
+        pVCpu->iem.s.cbInstrBufTotal  = (uint16_t)RT_MIN(X86_PAGE_SIZE, cbOpcodeBytes); // 缓存整页指令
         pVCpu->iem.s.offCurInstrStart = 0;
         pVCpu->iem.s.offInstrNextByte = 0;
         pVCpu->iem.s.GCPhysInstrBuf   = NIL_RTGCPHYS;
 #else
         pVCpu->iem.s.cbOpcode = (uint8_t)RT_MIN(cbOpcodeBytes, sizeof(pVCpu->iem.s.abOpcode));
+        //保守策略：仅缓存有限长度指令（sizeof(pVCpu->iem.s.abOpcode)）
         memcpy(pVCpu->iem.s.abOpcode, pvOpcodeBytes, pVCpu->iem.s.cbOpcode);
 #endif
         rcStrict = VINF_SUCCESS;
@@ -9917,6 +10153,16 @@ VMMDECL(VBOXSTRICTRC) IEMExecOneWithPrefetchedByPC(PVMCPUCC pVCpu, uint64_t Opco
 }
 
 
+/*
+在虚拟 CPU (pVCpu) 上执行单条指令，同时：
+  绕过部分模拟处理程序（通过 IEM_F_BYPASS_HANDLERS 标志实现）
+  可选返回写入的字节数（通过 pcbWritten 输出参数）
+
+典型使用场景
+  VMM 内部操作：如加载 GDT 表时直接修改内存，无需触发页错误检查
+  性能优化路径：已知安全的指令快速执行
+  调试器集成：单步执行时避免触发不必要的模拟逻辑
+ * */
 VMMDECL(VBOXSTRICTRC) IEMExecOneBypassEx(PVMCPUCC pVCpu, uint32_t *pcbWritten)
 {
     uint32_t const cbOldWritten = pVCpu->iem.s.cbWritten;
@@ -9941,8 +10187,10 @@ VMMDECL(VBOXSTRICTRC) IEMExecOneBypassWithPrefetchedByPC(PVMCPUCC pVCpu, uint64_
     if (   cbOpcodeBytes
         && pVCpu->cpum.GstCtx.rip == OpcodeBytesPC)
     {
-        iemInitDecoder(pVCpu, IEM_F_BYPASS_HANDLERS);
+        iemInitDecoder(pVCpu, IEM_F_BYPASS_HANDLERS);// 设置 Bypass 模式（跳过部分检查）。
 #ifdef IEM_WITH_CODE_TLB
+        //缓存指令页
+        //适用于 跨页指令或 动态代码场景。
         pVCpu->iem.s.uInstrBufPc      = OpcodeBytesPC;
         pVCpu->iem.s.pbInstrBuf       = (uint8_t const *)pvOpcodeBytes;
         pVCpu->iem.s.cbInstrBufTotal  = (uint16_t)RT_MIN(X86_PAGE_SIZE, cbOpcodeBytes);
@@ -9950,6 +10198,7 @@ VMMDECL(VBOXSTRICTRC) IEMExecOneBypassWithPrefetchedByPC(PVMCPUCC pVCpu, uint64_
         pVCpu->iem.s.offInstrNextByte = 0;
         pVCpu->iem.s.GCPhysInstrBuf   = NIL_RTGCPHYS;
 #else
+        //仅缓存当前指令（abOpcode），适用于 单指令模拟
         pVCpu->iem.s.cbOpcode = (uint8_t)RT_MIN(cbOpcodeBytes, sizeof(pVCpu->iem.s.abOpcode));
         memcpy(pVCpu->iem.s.abOpcode, pvOpcodeBytes, pVCpu->iem.s.cbOpcode);
 #endif
@@ -9958,7 +10207,8 @@ VMMDECL(VBOXSTRICTRC) IEMExecOneBypassWithPrefetchedByPC(PVMCPUCC pVCpu, uint64_
     else
         rcStrict = iemInitDecoderAndPrefetchOpcodes(pVCpu, IEM_F_BYPASS_HANDLERS);
     if (rcStrict == VINF_SUCCESS)
-        rcStrict = iemExecOneInner(pVCpu, false, "IEMExecOneBypassWithPrefetchedByPC");
+        rcStrict = iemExecOneInner(pVCpu, false, "IEMExecOneBypassWithPrefetchedByPC");// 执行实际模拟。
+    //若初始化失败（rcStrict != VINF_SUCCESS）且存在活跃内存映射（cActiveMappings > 0），调用 iemMemRollback 清理状态。
     else if (pVCpu->iem.s.cActiveMappings > 0)
         iemMemRollback(pVCpu);
 
@@ -9976,13 +10226,24 @@ VMMDECL(VBOXSTRICTRC) IEMExecOneBypassWithPrefetchedByPC(PVMCPUCC pVCpu, uint64_
  * @returns Strict VBox status code.
  * @param   pVCpu   The cross context virtual CPU structure of the calling EMT.
  */
+//在虚拟 CPU (pVCpu) 上执行单条指令，并明确忽略指令的 LOCK 前缀（原子性保证被跳过）。
+//适用于需要快速执行但无需处理原子内存访问的场景（如调试、特殊指令模拟）。
+//解码当前指令 → 查表分发到对应处理函数 → 模拟指令效果（寄存器/内存更新）。
+/*
+  指令 LOCK ADD [EAX], 1 执行：
+  常规路径：触发总线锁定，确保原子递增。
+  本函数路径：忽略 LOCK，直接执行 ADD [EAX], 1（可能被中断打断）。
+*/
 VMMDECL(VBOXSTRICTRC) IEMExecOneIgnoreLock(PVMCPUCC pVCpu)
 {
     /*
      * Do the decoding and emulation.
      */
+    //标志位 IEM_F_X86_DISREGARD_LOCK：强制忽略指令的 LOCK 前缀（如 LOCK CMPXCHG 被视为普通 CMPXCHG）
     VBOXSTRICTRC rcStrict = iemInitDecoderAndPrefetchOpcodes(pVCpu, IEM_F_X86_DISREGARD_LOCK);
     if (rcStrict == VINF_SUCCESS)
+        //参数 true 表示忽略锁前缀（与初始化标志一致）。
+        //参数 "IEMExecOneIgnoreLock" 用于调试日志标识。
         rcStrict = iemExecOneInner(pVCpu, true, "IEMExecOneIgnoreLock");
     else if (pVCpu->iem.s.cActiveMappings > 0)
         iemMemRollback(pVCpu);
@@ -9998,11 +10259,24 @@ VMMDECL(VBOXSTRICTRC) IEMExecOneIgnoreLock(PVMCPUCC pVCpu)
  * Code common to IEMExecLots and IEMExecRecompilerThreaded that attempts to
  * inject a pending TRPM trap.
  */
+/*
+ * 外部中断注入：
+设备触发中断 → TRPMHasTrap 标记 → 本函数检查 EFLAGS.IF=1 → 注入 IRQ 向量。
+嵌套虚拟化拦截：
+    Guest 执行时触发外部中断 → L0 Hypervisor 拦截并模拟 → 通过本函数尝试注入到 L1 Guest
+      → 若 L1 设置拦截则触发 VM-Exit。
+ * */
+/*
+检查当前虚拟 CPU 是否有待处理的中断/陷阱（通过 TRPMHasTrap 确认），并在满足条件时将其注入到客户机执行流中。
+主要用于处理硬件中断（如外部设备中断）或虚拟化异常事件。
+ * */
 VBOXSTRICTRC iemExecInjectPendingTrap(PVMCPUCC pVCpu)
 {
     Assert(TRPMHasTrap(pVCpu));
 
+    //跳过某些指令（如 STI、MOV SS）执行后的短暂窗口期（此时中断被临时屏蔽）。
     if (   !CPUMIsInInterruptShadow(&pVCpu->cpum.GstCtx)
+    //确保当前未被不可屏蔽中断（NMI）阻塞。
         && !CPUMAreInterruptsInhibitedByNmi(&pVCpu->cpum.GstCtx))
     {
         /** @todo Can we centralize this under CPUMCanInjectInterrupt()? */
@@ -10021,7 +10295,7 @@ VBOXSTRICTRC iemExecInjectPendingTrap(PVMCPUCC pVCpu)
             }
         }
 #else
-        bool fIntrEnabled = pVCpu->cpum.GstCtx.eflags.Bits.u1IF;
+        bool fIntrEnabled = pVCpu->cpum.GstCtx.eflags.Bits.u1IF;//直接读取 Guest EFLAGS 的 IF 位
 #endif
         if (fIntrEnabled)
         {
@@ -10029,11 +10303,14 @@ VBOXSTRICTRC iemExecInjectPendingTrap(PVMCPUCC pVCpu)
             TRPMEVENT   enmType;
             uint32_t    uErrCode;
             RTGCPTR     uCr2;
+            //获取陷阱信息：包括中断向量号（u8TrapNo）、类型（enmType，如 TRPM_HARDWARE_INT）、错误码（uErrCode）和 CR2（用于页错误）。
             int rc2 = TRPMQueryTrapAll(pVCpu, &u8TrapNo, &enmType, &uErrCode, &uCr2, NULL /*pu8InstLen*/, NULL /*fIcebp*/);
             AssertRC(rc2);
             Assert(enmType == TRPM_HARDWARE_INT);
+            //通过 IEMInjectTrap 将中断/异常插入客户机执行流。
             VBOXSTRICTRC rcStrict = IEMInjectTrap(pVCpu, u8TrapNo, enmType, (uint16_t)uErrCode, uCr2, 0 /*cbInstr*/);
 
+            //清理陷阱状态
             TRPMResetTrap(pVCpu);
 
 #if defined(VBOX_WITH_NESTED_HWVIRT_SVM) || defined(VBOX_WITH_NESTED_HWVIRT_VMX)
@@ -10050,7 +10327,14 @@ VBOXSTRICTRC iemExecInjectPendingTrap(PVMCPUCC pVCpu)
     return VINF_SUCCESS;
 }
 
-
+//在虚拟 CPU (pVCpu) 上批量执行指令流，支持中断注入、定时器轮询和嵌套虚拟化处理，返回实际执行的指令数和状态码。
+/*
+ *
+  pVCpu：当前虚拟 CPU 的控制结构。
+  cMaxInstructions：最大允许执行的指令数（硬性限制）。
+  cPollRate：定时器轮询频率（按位掩码方式触发，如 0xFF 表示每 256 条指令轮询一次）。
+  pcInstructions：输出参数，返回实际执行的指令数（可选）。
+ * */
 VMMDECL(VBOXSTRICTRC) IEMExecLots(PVMCPUCC pVCpu, uint32_t cMaxInstructions, uint32_t cPollRate, uint32_t *pcInstructions)
 {
     uint32_t const cInstructionsAtStart = pVCpu->iem.s.cInstructions;
@@ -10062,6 +10346,7 @@ VMMDECL(VBOXSTRICTRC) IEMExecLots(PVMCPUCC pVCpu, uint32_t cMaxInstructions, uin
      */
     /** @todo What if we are injecting an exception and not an interrupt? Is that
      *        possible here? For now we assert it is indeed only an interrupt. */
+    //中断注入检查：通过 TRPMHasTrap 检测是否有待处理的中断，若有则调用iemExecInjectPendingTrap注入
     if (!TRPMHasTrap(pVCpu))
     { /* likely */ }
     else
@@ -10076,6 +10361,7 @@ VMMDECL(VBOXSTRICTRC) IEMExecLots(PVMCPUCC pVCpu, uint32_t cMaxInstructions, uin
     /*
      * Initial decoder init w/ prefetch, then setup setjmp.
      */
+    // 初始化解码器并预取操作码
     VBOXSTRICTRC rcStrict = iemInitDecoderAndPrefetchOpcodes(pVCpu, 0 /*fExecOpts*/);
     if (rcStrict == VINF_SUCCESS)
     {
@@ -10087,6 +10373,7 @@ VMMDECL(VBOXSTRICTRC) IEMExecLots(PVMCPUCC pVCpu, uint32_t cMaxInstructions, uin
             /*
              * The run loop.  We limit ourselves to 4096 instructions right now.
              */
+            // 递减计数确保不超过 cMaxInstructions。
             uint32_t cMaxInstructionsGccStupidity = cMaxInstructions;
             PVMCC pVM = pVCpu->CTX_SUFF(pVM);
             for (;;)
@@ -10101,7 +10388,9 @@ VMMDECL(VBOXSTRICTRC) IEMExecLots(PVMCPUCC pVCpu, uint32_t cMaxInstructions, uin
                 /*
                  * Do the decoding and emulation.
                  */
+                // 获取操作码并调用对应的解释函数
                 uint8_t b; IEM_OPCODE_GET_FIRST_U8(&b);
+                //通过查表 (g_apfnIemInterpretOnlyOneByteMap) 分发指令到对应的解释函数。
                 rcStrict = FNIEMOP_CALL(g_apfnIemInterpretOnlyOneByteMap[b]);
 #ifdef VBOX_STRICT
                 CPUMAssertGuestRFlagsCookie(pVM, pVCpu);
@@ -10134,6 +10423,7 @@ VMMDECL(VBOXSTRICTRC) IEMExecLots(PVMCPUCC pVCpu, uint32_t cMaxInstructions, uin
 #ifndef VBOX_WITH_NESTED_HWVIRT_VMX
                         uint64_t fCpu = pVCpu->fLocalForcedActions;
 #endif
+                        //强制事件检查：过滤非关键事件（如 TLB 刷新），仅保留中断等需立即处理的事件。
                         fCpu &= VMCPU_FF_ALL_MASK & ~(  VMCPU_FF_PGM_SYNC_CR3
                                                       | VMCPU_FF_PGM_SYNC_CR3_NON_GLOBAL
                                                       | VMCPU_FF_TLB_FLUSH
@@ -10147,6 +10437,7 @@ VMMDECL(VBOXSTRICTRC) IEMExecLots(PVMCPUCC pVCpu, uint32_t cMaxInstructions, uin
                             if (--cMaxInstructionsGccStupidity > 0)
                             {
                                 /* Poll timers every now an then according to the caller's specs. */
+                                //按 cPollRate 定期调用 TMTimerPollBool 检查定时器到期。
                                 if (   (cMaxInstructionsGccStupidity & cPollRate) != 0
                                     || !TMTimerPollBool(pVM, pVCpu))
                                 {
@@ -10186,6 +10477,17 @@ VMMDECL(VBOXSTRICTRC) IEMExecLots(PVMCPUCC pVCpu, uint32_t cMaxInstructions, uin
     }
     else
     {
+        //若存在未提交的内存访问 (cActiveMappings > 0)，调用 iemMemRollback 回滚。
+        /*
+         * 假设执行以下指令时发生中断：
+             MOV [0x1000], eax  ; 写内存操作开始（cActiveMappings++）
+             ADD EBX, ECX        ; 尚未执行
+
+           中断触发：在 MOV 指令的映射建立后、提交前,，会通过 iemMemMap 函数锁定内存页并建立临时映射
+              （如处理分页、权限校验），此时 cActiveMappings 递增（cActiveMappings == 1），发生外部中断。
+           回滚操作：iemMemRollback 撤销 MOV 的临时映射，内存地址 0x1000 的写入被丢弃。
+           中断处理：IEM 将中断注入后，虚拟机从原 MOV 指令的起始点重新执行，确保原子性。
+        */
         if (pVCpu->iem.s.cActiveMappings > 0)
             iemMemRollback(pVCpu);
 
@@ -10194,6 +10496,7 @@ VMMDECL(VBOXSTRICTRC) IEMExecLots(PVMCPUCC pVCpu, uint32_t cMaxInstructions, uin
          * When a nested-guest causes an exception intercept (e.g. #PF) when fetching
          * code as part of instruction execution, we need this to fix-up VINF_SVM_VMEXIT.
          */
+        //处理嵌套虚拟化的特殊状态码（如 VINF_SVM_VMEXIT）。
         rcStrict = iemExecStatusCodeFiddling(pVCpu, rcStrict);
 #endif
     }
@@ -10222,6 +10525,19 @@ VMMDECL(VBOXSTRICTRC) IEMExecLots(PVMCPUCC pVCpu, uint32_t cMaxInstructions, uin
  *                              The max number of instructions without exits.
  * @param   pStats              Where to return statistics.
  */
+/*
+ *
+  在虚拟 CPU (pVCpu) 上执行指令流，同时统计执行过程中的关键指标（如指令数、退出事件等），
+    直到满足退出条件（如达到最大指令数、触发中断等）。
+
+  pVCpu：当前虚拟 CPU 的控制结构。
+  fWillExit：保留参数（暂未使用）。
+  cMinInstructions：最少需执行的指令数（即使满足退出条件也会继续执行）。
+  cMaxInstructions：最大允许执行的指令数（硬性限制，默认 4096 条）。
+  cMaxInstructionsWithoutExits：连续执行无退出的最大指令数阈值。
+  pStats：输出统计信息（指令数、退出次数等）。
+*/
+
 VMMDECL(VBOXSTRICTRC) IEMExecForExits(PVMCPUCC pVCpu, uint32_t fWillExit, uint32_t cMinInstructions, uint32_t cMaxInstructions,
                                       uint32_t cMaxInstructionsWithoutExits, PIEMEXECFOREXITSTATS pStats)
 {
@@ -10238,6 +10554,7 @@ VMMDECL(VBOXSTRICTRC) IEMExecForExits(PVMCPUCC pVCpu, uint32_t fWillExit, uint32
     /*
      * Initial decoder init w/ prefetch, then setup setjmp.
      */
+    //初始化解码器并预取操作码。
     VBOXSTRICTRC rcStrict = iemInitDecoderAndPrefetchOpcodes(pVCpu, 0 /*fExecOpts*/);
     if (rcStrict == VINF_SUCCESS)
     {
@@ -10270,13 +10587,17 @@ VMMDECL(VBOXSTRICTRC) IEMExecForExits(PVMCPUCC pVCpu, uint32_t fWillExit, uint32
                 uint32_t const cPotentialExits = pVCpu->iem.s.cPotentialExits;
 
                 uint8_t b; IEM_OPCODE_GET_FIRST_U8(&b);
+                // 解码并执行单条指令
+                // 通过查表 (g_apfnIemInterpretOnlyOneByteMap) 调用对应指令的处理函数
                 rcStrict = FNIEMOP_CALL(g_apfnIemInterpretOnlyOneByteMap[b]);
 
+                // 2. 退出检测
                 if (   cPotentialExits != pVCpu->iem.s.cPotentialExits
                     && cInstructionSinceLastExit > 0 /* don't count the first */ )
                 {
-                    pStats->cExits += 1;
+                    pStats->cExits += 1; //退出事件次数（如虚拟化异常、外部中断等)
                     if (cInstructionSinceLastExit > pStats->cMaxExitDistance)
+                        //cMaxExitDistance 连续执行指令的最大间隔（无退出事件)
                         pStats->cMaxExitDistance = cInstructionSinceLastExit;
                     cInstructionSinceLastExit = 0;
                 }
@@ -10288,6 +10609,7 @@ VMMDECL(VBOXSTRICTRC) IEMExecForExits(PVMCPUCC pVCpu, uint32_t fWillExit, uint32
                     pStats->cInstructions++;
                     cInstructionSinceLastExit++;
 
+                    // 3. 嵌套虚拟化处理
 #ifdef VBOX_WITH_NESTED_HWVIRT_VMX
                     /* Perform any VMX nested-guest instruction boundary actions. */
                     uint64_t fCpu = pVCpu->fLocalForcedActions;
@@ -10319,9 +10641,9 @@ VMMDECL(VBOXSTRICTRC) IEMExecForExits(PVMCPUCC pVCpu, uint32_t fWillExit, uint32
                                               || (   !(fCpu & ~(VMCPU_FF_INTERRUPT_APIC | VMCPU_FF_INTERRUPT_PIC))
                                                   && !pVCpu->cpum.GstCtx.rflags.Bits.u1IF))
                                           && !VM_FF_IS_ANY_SET(pVM, VM_FF_ALL_MASK) )
-                                      || pStats->cInstructions < cMinInstructions))
+                                      || pStats->cInstructions < cMinInstructions))//确保至少执行 cMinInstructions 条指令
                         {
-                            if (pStats->cInstructions < cMaxInstructions)
+                            if (pStats->cInstructions < cMaxInstructions)//cInstructions 总执行指令数
                             {
                                 if (cInstructionSinceLastExit <= cMaxInstructionsWithoutExits)
                                 {
@@ -10407,6 +10729,42 @@ VMMDECL(VBOXSTRICTRC) IEMExecForExits(PVMCPUCC pVCpu, uint32_t fWillExit, uint32
  * @param   cbInstr             The instruction length (only relevant for
  *                              software interrupts).
  */
+/*
+  硬件中断（外部设备触发）
+  软件中断（INT n指令）
+  CPU异常（#PF/#GP等）
+ * */
+/*
+  u8TrapNo   uint8_t     中断/异常号（0-31对应x86异常，32-255为用户定义）
+  enmType    TRPMEVENT     事件类型（TRPM_HARDWARE_INT/TRPM_SOFTWARE_INT/TRPM_TRAP）
+  uErrCode   uint16_t     错误码（如#PF的页错误码）
+  uCr2       RTGCPTR      异常地址（仅#PF有效）
+*/
+/**
+功能：向 Guest 注入 硬件中断（TRPM_HARDWARE_INT）、软件中断（TRPM_SOFTWARE_INT）或 CPU异常（TRPM_TRAP）。
+硬件加速：在 VT-x 下，实际通过 VM-Entry 的
+   事件注入机制（VMCS 的 VM_ENTRY_INTR_INFO_FIELD）完成，此函数仅构造参数。
+ */
+
+ /*
+硬件加速优势
+  中断注入：通过 VMCS 字段直接注入，无需软件模拟 IDT 查表。
+  CR2 传递：对于 #PF，Guest 的 CR2 由 CPU 自动加载，VMM 仅需通过 VMCS 设置值。
+  错误码处理：CPU 自动将错误码压入 Guest 栈，无需 VMM 干预。
+(2) 与 EPT 的交互
+  #PF 异常：
+    若因 EPT Violation触发，VMM 先处理 EPT 映射，再通过此函数重新注入异常。
+    uCr2 直接来自 EPT 违规的 GPA，由硬件自动转换为 GVA。
+NMI 处理：
+    注释 @todo 显示当前未区分 NMI 与普通异常（X86_XCPT_NMI），需依赖 VT-x 的 NMI 虚拟化特性。
+
+  判定因素                由VMM处理                            由Guest处理
+  异常类型            EPT Violation、NMI等特权级异常       普通#GP、#PF等非特权异常
+  VM-Entry控制字段    VM_ENTRY_INTR_INFO_FIELD标记为VMM保留   标记为Guest可处理的异常类型
+  Guest IDT状态         Guest IDT未配置或无效               Guest IDT已正确注册处理程序
+  嵌套虚拟化层级    L1 Hypervisor要求L0处理                L1 Hypervisor授权L2
+  *
+  * */
 VMM_INT_DECL(VBOXSTRICTRC) IEMInjectTrap(PVMCPUCC pVCpu, uint8_t u8TrapNo, TRPMEVENT enmType, uint16_t uErrCode, RTGCPTR uCr2,
                                          uint8_t cbInstr)
 {
@@ -10419,24 +10777,25 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMInjectTrap(PVMCPUCC pVCpu, uint8_t u8TrapNo, TRPME
     uint32_t fFlags;
     switch (enmType)
     {
-        case TRPM_HARDWARE_INT:
+        case TRPM_HARDWARE_INT://外部设备中断（如 IOAPIC），通过 VT-x 的 Interrupt Window 机制注入
             Log(("IEMInjectTrap: %#4x ext\n", u8TrapNo));
             fFlags = IEM_XCPT_FLAGS_T_EXT_INT;
-            uErrCode = uCr2 = 0;
+            uErrCode = uCr2 = 0;// 硬件中断无错误码和CR2
             break;
 
-        case TRPM_SOFTWARE_INT:
+        case TRPM_SOFTWARE_INT://INT n 指令触发，由 Guest 中断描述符表（IDT）处理
             Log(("IEMInjectTrap: %#4x soft\n", u8TrapNo));
             fFlags = IEM_XCPT_FLAGS_T_SOFT_INT;
             uErrCode = uCr2 = 0;
             break;
 
-        case TRPM_TRAP:
+        case TRPM_TRAP:// CPU异常
         case TRPM_NMI: /** @todo Distinguish NMI from exception 2. */
             Log(("IEMInjectTrap: %#4x trap err=%#x cr2=%#RGv\n", u8TrapNo, uErrCode, uCr2));
             fFlags = IEM_XCPT_FLAGS_T_CPU_XCPT;
             if (u8TrapNo == X86_XCPT_PF)
-                fFlags |= IEM_XCPT_FLAGS_CR2;
+                fFlags |= IEM_XCPT_FLAGS_CR2;// #PF需要CR2
+            // 对特定异常强制添加错误码
             switch (u8TrapNo)
             {
                 case X86_XCPT_DF:
@@ -10456,35 +10815,44 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMInjectTrap(PVMCPUCC pVCpu, uint8_t u8TrapNo, TRPME
 
     VBOXSTRICTRC rcStrict = iemRaiseXcptOrInt(pVCpu, cbInstr, u8TrapNo, fFlags, uErrCode, uCr2);
 
+    //若存在未提交的内存映射（cActiveMappings > 0），调用 iemMemRollback 清理，确保 原子性。
     if (pVCpu->iem.s.cActiveMappings > 0)
         iemMemRollback(pVCpu);
 
     return rcStrict;
 }
 
+VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedOut(PVMCPUCC pVCpu, uint8_t cbInstr, uint16_t u16Port, bool fImm, uint8_t cbReg)
+{
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 1);
+    Assert(cbReg <= 4 && cbReg != 3);
 
-/**
- * Injects the active TRPM event.
- *
- * @returns Strict VBox status code.
- * @param   pVCpu               The cross context virtual CPU structure.
- */
-VMMDECL(VBOXSTRICTRC) IEMInjectTrpmEvent(PVMCPUCC pVCpu)
+    iemInitExec(pVCpu, 0 /*fExecOpts*/);
+    VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_3(iemCImpl_out, u16Port, cbReg,
+                                             ((uint8_t)fImm << 7) | 0xf /** @todo never worked with intercepts */);
+    Assert(!pVCpu->iem.s.cActiveMappings);
+    return iemUninitExecAndFiddleStatusAndMaybeReenter(pVCpu, rcStrict);
+}
+
+//异常/中断注入枢纽，负责将TRPM模块捕获的硬件事件（如#GP、#PF等）安全注入到客户机，
+MMDECL(VBOXSTRICTRC) IEMInjectTrpmEvent(PVMCPUCC pVCpu)
 {
 #ifndef IEM_IMPLEMENTS_TASKSWITCH
     IEM_RETURN_ASPECT_NOT_IMPLEMENTED_LOG(("Event injection\n"));
 #else
-    uint8_t     u8TrapNo;
-    TRPMEVENT   enmType;
+    uint8_t     u8TrapNo;//u8TrapNo：中断/异常号（如14=#PF）
+    TRPMEVENT   enmType; //enmType：区分硬件中断(TRPM_HARDWARE_INT)、软件中断(TRPM_SOFTWARE_INT)或异常(TRPM_TRAP
     uint32_t    uErrCode;
     RTGCUINTPTR uCr2;
     uint8_t     cbInstr;
+    //从TRPM模块查询待注入事件详情
     int rc = TRPMQueryTrapAll(pVCpu, &u8TrapNo, &enmType, &uErrCode, &uCr2, &cbInstr, NULL /* fIcebp */);
     if (RT_FAILURE(rc))
         return rc;
 
     /** @todo r=ramshankar: Pass ICEBP info. to IEMInjectTrap() below and handle
      *        ICEBP \#DB injection as a special case. */
+    //通过IEM进行虚拟化环境下的异常模拟
     VBOXSTRICTRC rcStrict = IEMInjectTrap(pVCpu, u8TrapNo, enmType, uErrCode, uCr2, cbInstr);
 #ifdef VBOX_WITH_NESTED_HWVIRT_SVM
     if (rcStrict == VINF_SVM_VMEXIT)
@@ -10498,6 +10866,7 @@ VMMDECL(VBOXSTRICTRC) IEMInjectTrpmEvent(PVMCPUCC pVCpu)
      *        delivered to the guest? See @bugref{6607}.  */
     if (   rcStrict == VINF_SUCCESS
         || rcStrict == VINF_IEM_RAISED_XCPT)
+        //事件注入后的状态清理
         TRPMResetTrap(pVCpu);
 
     return rcStrict;
@@ -10661,10 +11030,17 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecStringIoWrite(PVMCPUCC pVCpu, uint8_t cbValue,
  *                              checked or not.  It's typically checked in the
  *                              HM scenario.
  */
+// REP INS 指令族（字符串端口输入），处理从I/O端口到内存的连续数据传输
+/*
+  地址模式切换（16/32/64位）
+  数据宽度适配（8/16/32位）
+  重复前缀（REP）的循环控制
+  与VT-x/AMD-V的硬件加速协同
+ * */
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecStringIoRead(PVMCPUCC pVCpu, uint8_t cbValue, IEMMODE enmAddrMode,
                                                bool fRepPrefix, uint8_t cbInstr, bool fIoChecked)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 1);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 1); // 操作码：6C(INSB)/6D(INSW/INSD)
 
     /*
      * State init.
@@ -10677,10 +11053,10 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecStringIoRead(PVMCPUCC pVCpu, uint8_t cbValue, 
     VBOXSTRICTRC rcStrict;
     if (fRepPrefix)
     {
-        switch (enmAddrMode)
+        switch (enmAddrMode)// 地址模式
         {
             case IEMMODE_16BIT:
-                switch (cbValue)
+                switch (cbValue)// 数据宽度
                 {
                     case 1: rcStrict = iemCImpl_rep_ins_op8_addr16(pVCpu, cbInstr, fIoChecked); break;
                     case 2: rcStrict = iemCImpl_rep_ins_op16_addr16(pVCpu, cbInstr, fIoChecked); break;
@@ -10717,6 +11093,7 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecStringIoRead(PVMCPUCC pVCpu, uint8_t cbValue, 
         }
     }
     else
+    // 单次传输分支
     {
         switch (enmAddrMode)
         {
@@ -10809,7 +11186,7 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedOut(PVMCPUCC pVCpu, uint8_t cbInstr, ui
  */
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedIn(PVMCPUCC pVCpu, uint8_t cbInstr, uint16_t u16Port, bool fImm, uint8_t cbReg)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 1);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 1); // 操作码：E4/E5
     Assert(cbReg <= 4 && cbReg != 3);
 
     iemInitExec(pVCpu, 0 /*fExecOpts*/);
@@ -10855,6 +11232,9 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedMovCRxWrite(PVMCPUCC pVCpu, uint8_t cbI
  *
  * @remarks In ring-0 not all of the state needs to be synced in.
  */
+//模拟 MOV reg, CRx 指令（读取控制寄存器到通用寄存器）
+//iCrReg	源控制寄存器索引（0-15对应CR0-CR15）
+//iGReg	    目标通用寄存器索引（0-15对应EAX-R15）
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedMovCRxRead(PVMCPUCC pVCpu, uint8_t cbInstr, uint8_t iGReg, uint8_t iCrReg)
 {
     IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2);
@@ -10881,6 +11261,9 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedMovCRxRead(PVMCPUCC pVCpu, uint8_t cbIn
  *
  * @remarks In ring-0 not all of the state needs to be synced in.
  */
+//MOV DRx, reg 指令（将通用寄存器值写入调试寄存器）
+//iDrReg	目标调试寄存器索引（0-7对应DR0-DR7）
+//iGReg	    源通用寄存器索引  （0-15对应EAX-R15）
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedMovDRxWrite(PVMCPUCC pVCpu, uint8_t cbInstr, uint8_t iDrReg, uint8_t iGReg)
 {
     IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2);
@@ -10954,7 +11337,7 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedClts(PVMCPUCC pVCpu, uint8_t cbInstr)
  */
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedLmsw(PVMCPUCC pVCpu, uint8_t cbInstr, uint16_t uValue, RTGCPTR GCPtrEffDst)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 3);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 3);// 操作码：0F 01 /6
 
     iemInitExec(pVCpu, 0 /*fExecOpts*/);
     VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_2(iemCImpl_lmsw, uValue, GCPtrEffDst);
@@ -10976,9 +11359,13 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedLmsw(PVMCPUCC pVCpu, uint8_t cbInstr, u
  */
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedXsetbv(PVMCPUCC pVCpu, uint8_t cbInstr)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 3);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 3);//（操作码：0F 01 D1）
 
     iemInitExec(pVCpu, 0 /*fExecOpts*/);
+    /*
+     * 设置虚拟CPU执行环境
+       清除临时状态标记（如内存映射计数）
+    */
     VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_0(iemCImpl_xsetbv);
     Assert(!pVCpu->iem.s.cActiveMappings);
     return iemUninitExecAndFiddleStatusAndMaybeReenter(pVCpu, rcStrict);
@@ -10994,9 +11381,15 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedXsetbv(PVMCPUCC pVCpu, uint8_t cbInstr)
  *
  * @remarks In ring-0 not all of the state needs to be synced in.
  */
+// 模拟 x86 的 WBINVD（Write Back and Invalidate Cache）指令
+/*
+   将处理器内部缓存数据写回内存
+   随后无效化缓存内容
+   在虚拟化环境中严格隔离客户机与宿主机的缓存操作
+ * */
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedWbinvd(PVMCPUCC pVCpu, uint8_t cbInstr)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2);//0F 09
 
     iemInitExec(pVCpu, 0 /*fExecOpts*/);
     VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_0(iemCImpl_wbinvd);
@@ -11014,9 +11407,12 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedWbinvd(PVMCPUCC pVCpu, uint8_t cbInstr)
  *
  * @remarks In ring-0 not all of the state needs to be synced in.
  */
+//模拟执行 INVD（无效化缓存）指令
+//在 VT-x 中通常配置为触发 VM-exit
+//配置 VMX_PROCBASED_CTLS2_INVD_EXIT 控制位决定是否触发 VM-exit
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedInvd(PVMCPUCC pVCpu, uint8_t cbInstr)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2); //0F 08
 
     iemInitExec(pVCpu, 0 /*fExecOpts*/);
     VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_0(iemCImpl_invd);
@@ -11037,11 +11433,18 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedInvd(PVMCPUCC pVCpu, uint8_t cbInstr)
  *
  * @remarks In ring-0 not all of the state needs to be synced in.
  */
+/*
+ * 日志示例：
+     IEM: INVLPG GCPtr=0xfffff80080001000 -> GCPhys=0x0000000123400000 (VINF_SUCCESS)
+     PGM: EPT sync for GPA=0x12340000 on VPID=1
+ * */
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedInvlpg(PVMCPUCC pVCpu, uint8_t cbInstr, RTGCPTR GCPtrPage)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 3);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 3); //0F 01 /7
 
     iemInitExec(pVCpu, 0 /*fExecOpts*/);
+    //EPT 辅助捕获​​：通过将客户机代码页标记为不可执行（EPT XN 位），
+    //触发 #PF 异常并转向 IEM 模拟。
     VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_1(iemCImpl_invlpg, GCPtrPage);
     Assert(!pVCpu->iem.s.cActiveMappings);
     return iemUninitExecAndFiddleStatusAndMaybeReenter(pVCpu, rcStrict);
@@ -11062,12 +11465,19 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedInvlpg(PVMCPUCC pVCpu, uint8_t cbInstr,
  *
  * @remarks In ring-0 not all of the state needs to be synced in.
  */
+//模拟执行 INVPCID（无效化进程上下文标识）指令
+/*
+     * iEffSeg    内存操作数段寄存器索引（如 DS、SS）
+       GCPtrDesc  描述符地址（客户机虚拟地址）
+       uType      无效化类型（0=单个地址，1=单个PCID，2=全局PCID，3=全局保留）
+*/
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedInvpcid(PVMCPUCC pVCpu, uint8_t cbInstr, uint8_t iEffSeg, RTGCPTR GCPtrDesc,
                                                  uint64_t uType)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 4);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 4); //66 0F 38 82
 
     iemInitExec(pVCpu, 0 /*fExecOpts*/);
+
     VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_3(iemCImpl_invpcid, iEffSeg, GCPtrDesc, uType);
     Assert(!pVCpu->iem.s.cActiveMappings);
     return iemUninitExecAndFiddleStatusAndMaybeReenter(pVCpu, rcStrict);
@@ -11086,10 +11496,27 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedInvpcid(PVMCPUCC pVCpu, uint8_t cbInstr
  */
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedCpuid(PVMCPUCC pVCpu, uint8_t cbInstr)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2);//0F A2
     IEM_CTX_ASSERT(pVCpu, IEM_CPUMCTX_EXTRN_EXEC_DECODED_NO_MEM_MASK | CPUMCTX_EXTRN_RAX | CPUMCTX_EXTRN_RCX);
 
     iemInitExec(pVCpu, 0 /*fExecOpts*/);
+    /*
+     * 在 iemCImpl_cpuid 中实现：
+        功能号路由：
+         switch (uLeaf) {
+             case 0x0: // 基本最大功能号
+             case 0x1: // 处理器型号/特性
+             case 0x80000000: // 扩展功能号
+             case 0x40000000: // Hypervisor 信息
+                 // 虚拟化定制响应
+         }
+        虚拟化增强：
+         修改返回的 CPU 品牌字符串（GenuineIntel → VirtualBox）
+         屏蔽部分物理 CPU 特性（如 TSX）
+         返回自定义的拓扑信息（处理器核心数等）
+        结果写入
+         EAX/EBX/ECX/EDX ← 虚拟化的 CPU 特性信息
+     * */
     VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_0(iemCImpl_cpuid);
     Assert(!pVCpu->iem.s.cActiveMappings);
     return iemUninitExecAndFiddleStatusAndMaybeReenter(pVCpu, rcStrict);
@@ -11106,12 +11533,24 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedCpuid(PVMCPUCC pVCpu, uint8_t cbInstr)
  *
  * @remarks Not all of the state needs to be synced in.
  */
+//执行 RDPMC（读取性能监控计数器）指令
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedRdpmc(PVMCPUCC pVCpu, uint8_t cbInstr)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2);//0F 33
     IEM_CTX_ASSERT(pVCpu, IEM_CPUMCTX_EXTRN_EXEC_DECODED_NO_MEM_MASK | CPUMCTX_EXTRN_CR4);
 
     iemInitExec(pVCpu, 0 /*fExecOpts*/);
+    /*
+     * 在 iemCImpl_rdpmc 中实现：
+    权限检查：
+         若 CR4.PCE=0 且当前非 Ring 0，触发 #GP 异常
+    计数器验证：
+         检查 ECX 指定的计数器索引是否有效（通常 0-3 为通用计数器）
+    虚拟化处理：
+         uint64_t uValue = pVCpu->cpum.s.GuestMsrs.msr.PERFCTR[uPmcIdx];
+    结果写入
+         EDX:EAX ← 64 位性能计数器值
+     * */
     VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_0(iemCImpl_rdpmc);
     Assert(!pVCpu->iem.s.cActiveMappings);
     return iemUninitExecAndFiddleStatusAndMaybeReenter(pVCpu, rcStrict);
@@ -11131,10 +11570,21 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedRdpmc(PVMCPUCC pVCpu, uint8_t cbInstr)
  */
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedRdtsc(PVMCPUCC pVCpu, uint8_t cbInstr)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2); //指令长度（必须为 2 字节，对应 RDTSC 的 0F 31 编码）
     IEM_CTX_ASSERT(pVCpu, IEM_CPUMCTX_EXTRN_EXEC_DECODED_NO_MEM_MASK | CPUMCTX_EXTRN_CR4);
 
     iemInitExec(pVCpu, 0 /*fExecOpts*/);
+    /*
+     * 权限检查：
+           若 CR4.TSD=1 且当前非 Ring 0，触发 #GP 异常
+           虚拟 TSC 计算：
+           uint64_t uTsc = TMCpuTickGet(pVCpu) + pVCpu->tm.s.offTSCRawSrc;
+        虚拟化增强：
+           自动应用 TSC 偏移（offTSCRawSrc）
+           支持 TSC 多速率缩放（当启用 TSC scaling 时）
+        结果写入
+           EDX:EAX ← 64 位虚拟 TSC 值
+    */
     VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_0(iemCImpl_rdtsc);
     Assert(!pVCpu->iem.s.cActiveMappings);
     return iemUninitExecAndFiddleStatusAndMaybeReenter(pVCpu, rcStrict);
@@ -11153,12 +11603,27 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedRdtsc(PVMCPUCC pVCpu, uint8_t cbInstr)
  * @remarks Not all of the state needs to be synced in.  Recommended
  *          to include CPUMCTX_EXTRN_TSC_AUX, to avoid extra fetch call.
  */
+//执行 RDTSCP（带处理器ID的时间戳读取）指令
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedRdtscp(PVMCPUCC pVCpu, uint8_t cbInstr)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 3);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 3);//指令长度（必须为3字节，对应RDTSCP的0F 01 F9编码）
+    // 必须加载CR4寄存器（检查TSD标志位）
+    //CPUMCTX_EXTRN_TSC_AUX
+    // 确保TSC_AUX寄存器（处理器ID）可用
     IEM_CTX_ASSERT(pVCpu, IEM_CPUMCTX_EXTRN_EXEC_DECODED_NO_MEM_MASK | CPUMCTX_EXTRN_CR4 | CPUMCTX_EXTRN_TSC_AUX);
 
     iemInitExec(pVCpu, 0 /*fExecOpts*/);
+    /*
+     * 权限检查：
+          若CR4.TSD=1且当前非Ring 0，触发#GP异常
+       虚拟TSC计算：
+          uint64_t uTsc = TMCpuTickGet(pVCpu) + pVCpu->tm.s.offTSCRawSrc;
+       处理器ID获取：
+          uint32_t uAux = CPUMGetGuestTscAux(pVCpu); // 从虚拟CPU状态获取
+       结果写入
+          EDX:EAX ← 64位虚拟TSC值
+          ECX ← 处理器ID（来自TSC_AUX MSR）
+     * */
     VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_0(iemCImpl_rdtscp);
     Assert(!pVCpu->iem.s.cActiveMappings);
     return iemUninitExecAndFiddleStatusAndMaybeReenter(pVCpu, rcStrict);
@@ -11177,12 +11642,35 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedRdtscp(PVMCPUCC pVCpu, uint8_t cbInstr)
  * @remarks Not all of the state needs to be synced in.  Requires RCX and
  *          (currently) all MSRs.
  */
+//执行 RDMSR（读模型特定寄存器）指令
+//成功时返回 VINF_SUCCESS，结果存储在 EDX:EAX
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedRdmsr(PVMCPUCC pVCpu, uint8_t cbInstr)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2);
-    IEM_CTX_ASSERT(pVCpu, IEM_CPUMCTX_EXTRN_EXEC_DECODED_NO_MEM_MASK | CPUMCTX_EXTRN_RCX | CPUMCTX_EXTRN_ALL_MSRS);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2);//指令长度（必须为 2 字节，对应 RDMSR 的 0F 32 编码）
+    IEM_CTX_ASSERT(pVCpu, IEM_CPUMCTX_EXTRN_EXEC_DECODED_NO_MEM_MASK | CPUMCTX_EXTRN_RCX | CPUMCTX_EXTRN_ALL_MSRS);// 必须加载 ECX（MSR 编号),确保 MSR 寄存器状态可用
 
     iemInitExec(pVCpu, 0 /*fExecOpts*/);
+    /*
+     * 失败时可能返回：
+           VINF_CPUM_R3_MSR_READ：需要切换到 Ring-3 处理
+           VINF_EM_RAW_RING_SWITCH：权限不足（非 Ring 0 执行）
+           VINF_EM_RAW_GUEST_TRAP：访问保留/未实现的 MSR
+     * */
+    /*
+     * 权限检查：必须在 Ring 0 执行（否则触发 #GP）
+       寄存器解码：
+       ECX：指定 MSR 寄存器编号
+       结果写入 EDX:EAX（64 位值，EDX=高32位，EAX=低32位）
+       分类处理：
+       switch (uMsr) {
+           case MSR_IA32_TSC:       // 时间戳计数器
+           case MSR_IA32_APICBASE:  // APIC 基址寄存器
+           case MSR_EFER:           // 扩展功能寄存器
+               // 特殊处理逻辑...
+           default:
+               // 通用 MSR 处理
+       }
+     * */
     VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_0(iemCImpl_rdmsr);
     Assert(!pVCpu->iem.s.cActiveMappings);
     return iemUninitExecAndFiddleStatusAndMaybeReenter(pVCpu, rcStrict);
@@ -11201,13 +11689,32 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedRdmsr(PVMCPUCC pVCpu, uint8_t cbInstr)
  * @remarks Not all of the state needs to be synced in.  Requires RCX, RAX, RDX,
  *          and (currently) all MSRs.
  */
+//执行 WRMSR（写模型特定寄存器）指令
+//对敏感 MSR（如 IA32_FEATURE_CONTROL）会触发 VM-exit
+//部分 MSR 写入会同步更新虚拟化组件状态（如 EFER.LME 影响分页模式）
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedWrmsr(PVMCPUCC pVCpu, uint8_t cbInstr)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 2);//指令长度（必须为 2 字节，对应 WRMSR 的 0F 30 编码）
     IEM_CTX_ASSERT(pVCpu, IEM_CPUMCTX_EXTRN_EXEC_DECODED_NO_MEM_MASK
-                        | CPUMCTX_EXTRN_RCX | CPUMCTX_EXTRN_RAX | CPUMCTX_EXTRN_RDX | CPUMCTX_EXTRN_ALL_MSRS);
+                        | CPUMCTX_EXTRN_RCX | CPUMCTX_EXTRN_RAX | CPUMCTX_EXTRN_RDX | CPUMCTX_EXTRN_ALL_MSRS);// 必须加载 ECX/EAX/EDX, 确保 MSR 寄存器状态可用
 
     iemInitExec(pVCpu, 0 /*fExecOpts*/);
+    /*
+     * 核心逻辑在 iemCImpl_wrmsr 中实现：
+       权限检查：必须在 Ring 0 执行（否则触发 #GP）
+       寄存器解码：
+         ECX：指定 MSR 寄存器编号
+         EDX:EAX：64 位写入数据（EDX=高32位，EAX=低32位）
+       分类处理：
+         switch (uMsr) {
+             case MSR_IA32_APICBASE:   // APIC 基址寄存器
+             case MSR_EFER:            // 扩展功能寄存器
+             case MSR_FS_BASE:         // FS 段基址
+                 // 特殊处理逻辑...
+             default:
+                 // 通用 MSR 处理
+         }
+     * */
     VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_0(iemCImpl_wrmsr);
     Assert(!pVCpu->iem.s.cActiveMappings);
     return iemUninitExecAndFiddleStatusAndMaybeReenter(pVCpu, rcStrict);
@@ -11227,15 +11734,35 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedWrmsr(PVMCPUCC pVCpu, uint8_t cbInstr)
  * @remarks ASSUMES the default segment of DS and no segment override prefixes
  *          are used.
  */
+//执行已解码的 MONITOR 指令
+//VBOXSTRICTRC 状态码，常见值包括：
+/*
+  VINF_SUCCESS：监视地址设置成功
+  VINF_EM_RAW_NOT_PRESENT：CPU 不支持 MONITOR/MWAIT 功能
+  VINF_EM_RAW_RING_SWITCH：权限不足（非 Ring 0 执行）
+*/
+
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedMonitor(PVMCPUCC pVCpu, uint8_t cbInstr)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 3);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 3);//指令长度（必须为 3 字节，对应 MONITOR 的 0F 01 C8 编码）
+    //确保内存操作数已解码
+    //强制 DS 段寄存器已加载（用于地址计算）
     IEM_CTX_ASSERT(pVCpu, IEM_CPUMCTX_EXTRN_EXEC_DECODED_MEM_MASK | CPUMCTX_EXTRN_DS);
 
     iemInitExec(pVCpu, 0 /*fExecOpts*/);
+    /*
+     * 调用 iemCImpl_monitor 实现函数，并传入 X86_SREG_DS 段寄存器索引
+       内部主要操作：
+         a. 检查 CPUID.01H:ECX.MONITOR[bit 3] 是否支持
+         b. 验证当前运行级别为 Ring 0
+         c. 从 EAX/RBX 寄存器组合计算监视地址
+         d. 设置虚拟 CPU 的监视状态：
+            pVCpu->iem.s.Monitor.uAddrStart = 线性地址
+            pVCpu->iem.s.Monitor.fActive = true
+     * */
     VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_1(iemCImpl_monitor, X86_SREG_DS);
     Assert(!pVCpu->iem.s.cActiveMappings);
-    return iemUninitExecAndFiddleStatusAndMaybeReenter(pVCpu, rcStrict);
+    return iemUninitExecAndFiddleStatusAndMaybeReenter(pVCpu, rcStrict);// 处理可能的重新调度
 }
 
 
@@ -11250,12 +11777,22 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedMonitor(PVMCPUCC pVCpu, uint8_t cbInstr
  *
  * @remarks Not all of the state needs to be synced in.
  */
+//于执行已解码的 MWAIT 指令
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedMwait(PVMCPUCC pVCpu, uint8_t cbInstr)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 3);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 3);//指令长度（必须为 3 字节，因 MWAIT 是 0F 01 C9 三字节指令）。
+    //IEM_CPUMCTX_EXTRN_EXEC_DECODED_NO_MEM_MASK：确保非内存相关解码状态有效。
+    //CPUMCTX_EXTRN_RCX | CPUMCTX_EXTRN_RAX：确保 RAX（扩展功能标志）和 RCX（休眠提示）寄存器已加载。
     IEM_CTX_ASSERT(pVCpu, IEM_CPUMCTX_EXTRN_EXEC_DECODED_NO_MEM_MASK | CPUMCTX_EXTRN_RCX | CPUMCTX_EXTRN_RAX);
 
     iemInitExec(pVCpu, 0 /*fExecOpts*/);
+
+    /*
+     * 检查 CPUID 是否支持 MWAIT（通过 RAX 扩展功能标志）。
+       验证当前权限级别（Ring 0 才允许执行 MWAIT）。
+       解析 RCX 寄存器中的休眠提示（如支持的休眠级别）。
+       设置虚拟 CPU 的监视休眠状态，返回 VINF_EM_HALT。
+     * */
     VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_0(iemCImpl_mwait);
     Assert(!pVCpu->iem.s.cActiveMappings);
     return iemUninitExecAndFiddleStatusAndMaybeReenter(pVCpu, rcStrict);
@@ -11273,14 +11810,20 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedMwait(PVMCPUCC pVCpu, uint8_t cbInstr)
  *
  * @remarks Not all of the state needs to be synced in.
  */
+//执行已解码的 HLT（停机）指令
 VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedHlt(PVMCPUCC pVCpu, uint8_t cbInstr)
 {
-    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 1);
+    IEMEXEC_ASSERT_INSTR_LEN_RETURN(cbInstr, 1);//指令长度（必须为 1 字节，因 HLT 是单字节指令 0xF4）。
 
-    iemInitExec(pVCpu, 0 /*fExecOpts*/);
+    iemInitExec(pVCpu, 0 /*fExecOpts*/);// 初始化 IEM 执行状态
+    /*
+     * 检查当前 CPU 权限级别（Ring 0 才允许执行 HLT）。
+       设置虚拟 CPU 的休眠状态标志。
+       返回 VINF_EM_HALT 通知调度器休眠。
+     * */
     VBOXSTRICTRC rcStrict = IEM_CIMPL_CALL_0(iemCImpl_hlt);
-    Assert(!pVCpu->iem.s.cActiveMappings);
-    return iemUninitExecAndFiddleStatusAndMaybeReenter(pVCpu, rcStrict);
+    Assert(!pVCpu->iem.s.cActiveMappings);//断言确认无活跃的内存映射（防止内存泄漏）。
+    return iemUninitExecAndFiddleStatusAndMaybeReenter(pVCpu, rcStrict);// 清理执行环境，并处理可能的重新调度。
 }
 
 
@@ -11302,19 +11845,24 @@ VMM_INT_DECL(VBOXSTRICTRC) IEMExecDecodedHlt(PVMCPUCC pVCpu, uint8_t cbInstr)
  * @remarks The caller should check the flags to determine if the error code and
  *          CR2 are valid for the event.
  */
+//获取当前正在处理的 CPU 异常信息
+/*
+ * 在模拟指令引发异常（如 MOV [eax], ecx 触发 #GP）时，
+ * IEM 会递增 cXcptRecursions，并调用此函数获取异常详情，以便生成中断门或任务切换。
+ * */
 VMM_INT_DECL(bool) IEMGetCurrentXcpt(PVMCPUCC pVCpu, uint8_t *puVector, uint32_t *pfFlags, uint32_t *puErr, uint64_t *puCr2)
 {
     bool const fRaisingXcpt = pVCpu->iem.s.cXcptRecursions > 0;
     if (fRaisingXcpt)
     {
         if (puVector)
-            *puVector = pVCpu->iem.s.uCurXcpt;
+            *puVector = pVCpu->iem.s.uCurXcpt;//用于接收异常向量号（如 0x0E 表示 #PF）。
         if (pfFlags)
-            *pfFlags = pVCpu->iem.s.fCurXcpt;
+            *pfFlags = pVCpu->iem.s.fCurXcpt;//用于接收异常标志位（如 IEM_XCPT_FLAGS_ERR 表示含错误码）。
         if (puErr)
-            *puErr = pVCpu->iem.s.uCurXcptErr;
+            *puErr = pVCpu->iem.s.uCurXcptErr;//用于接收异常错误码（如 #PF 的页错误属性）。
         if (puCr2)
-            *puCr2 = pVCpu->iem.s.uCurXcptCr2;
+            *puCr2 = pVCpu->iem.s.uCurXcptCr2;//用于接收 CR2 寄存器的值（仅 #PF 异常有效）。
     }
     return fRaisingXcpt;
 }
@@ -11332,6 +11880,7 @@ VMM_INT_DECL(bool) IEMGetCurrentXcpt(PVMCPUCC pVCpu, uint8_t *puVector, uint32_t
  * @param   pVCpu           The cross context virtual CPU structure of the calling
  *                          thread, for error reporting only.
  */
+//用于处理非常规状态码合并场景
 DECL_NO_INLINE(static, VBOXSTRICTRC) iemR3MergeStatusSlow(VBOXSTRICTRC rcStrict, VBOXSTRICTRC rcStrictCommit,
                                                           unsigned iMemMap, PVMCPUCC pVCpu)
 {
@@ -11344,11 +11893,18 @@ DECL_NO_INLINE(static, VBOXSTRICTRC) iemR3MergeStatusSlow(VBOXSTRICTRC rcStrict,
     if (rcStrict == rcStrictCommit)
         return rcStrictCommit;
 
+    /*
+     * 两个状态码的具体值（%Rrc）。
+       内存映射槽索引（iMemMap）。
+       内存访问标志（fAccess）。
+       物理地址及长度（GCPhysFirst/Second 和 cbFirst/Second）。
+     * */
     AssertLogRelMsgFailed(("rcStrictCommit=%Rrc rcStrict=%Rrc iMemMap=%u fAccess=%#x FirstPg=%RGp LB %u SecondPg=%RGp LB %u\n",
                            VBOXSTRICTRC_VAL(rcStrictCommit), VBOXSTRICTRC_VAL(rcStrict), iMemMap,
                            pVCpu->iem.s.aMemMappings[iMemMap].fAccess,
                            pVCpu->iem.s.aMemBbMappings[iMemMap].GCPhysFirst, pVCpu->iem.s.aMemBbMappings[iMemMap].cbFirst,
                            pVCpu->iem.s.aMemBbMappings[iMemMap].GCPhysSecond, pVCpu->iem.s.aMemBbMappings[iMemMap].cbSecond));
+    //表示内部程序错误
     return VERR_IOM_FF_STATUS_IPE;
 }
 
@@ -11364,14 +11920,20 @@ DECL_NO_INLINE(static, VBOXSTRICTRC) iemR3MergeStatusSlow(VBOXSTRICTRC rcStrict,
  * @param   pVCpu           The cross context virtual CPU structure of the calling
  *                          thread, for error reporting only.
  */
+/*
+  rcStrict：当前累积的状态码（可能来自前序操作）。
+  rcStrictCommit：新操作（如本次内存写入）的状态码。
+  iMemMap：内存映射槽索引（仅用于错误处理路径）。
+  pVCpu：指向虚拟 CPU 上下文的指针（仅用于错误处理路径）。
+ * */
 DECLINLINE(VBOXSTRICTRC) iemR3MergeStatus(VBOXSTRICTRC rcStrict, VBOXSTRICTRC rcStrictCommit, unsigned iMemMap, PVMCPUCC pVCpu)
 {
     /* Simple. */
     if (RT_LIKELY(rcStrict == VINF_SUCCESS || rcStrict == VINF_EM_RAW_TO_R3))
-        return rcStrictCommit;
+        return rcStrictCommit;//直接返回新状态码 rcStrictCommit，覆盖旧状态。
 
     if (RT_LIKELY(rcStrictCommit == VINF_SUCCESS))
-        return rcStrict;
+        return rcStrict;//保持原状态 rcStrict 不变。
 
     /* EM scheduling status codes. */
     if (RT_LIKELY(   rcStrict >= VINF_EM_FIRST
@@ -11379,10 +11941,11 @@ DECLINLINE(VBOXSTRICTRC) iemR3MergeStatus(VBOXSTRICTRC rcStrict, VBOXSTRICTRC rc
     {
         if (RT_LIKELY(   rcStrictCommit >= VINF_EM_FIRST
                       && rcStrictCommit <= VINF_EM_LAST))
-            return rcStrict < rcStrictCommit ? rcStrict : rcStrictCommit;
+            return rcStrict < rcStrictCommit ? rcStrict : rcStrictCommit;//返回优先级更高的状态码（数值更小的优先级更高）。
     }
 
     /* Unlikely */
+    // 示例：VINF_EM_RESCHEDULE（-2600）优先级高于 VINF_EM_RESCHEDULE_REM（-2650）
     return iemR3MergeStatusSlow(rcStrict, rcStrictCommit, iMemMap, pVCpu);
 }
 
@@ -11395,25 +11958,27 @@ DECLINLINE(VBOXSTRICTRC) iemR3MergeStatus(VBOXSTRICTRC rcStrict, VBOXSTRICTRC rc
  * @param   pVCpu       The cross context virtual CPU structure of the calling EMT.
  * @param   rcStrict    The status code returned by ring-0 or raw-mode.
  */
+//当虚拟机 CPU 触发强制标志（VMCPU_FF_IEM）时，该函数会将缓存的数据提交到物理内存。
 VMMR3_INT_DECL(VBOXSTRICTRC) IEMR3ProcessForceFlag(PVM pVM, PVMCPUCC pVCpu, VBOXSTRICTRC rcStrict)
 {
     /*
      * Reset the pending commit.
      */
     AssertMsg(  (pVCpu->iem.s.aMemMappings[0].fAccess | pVCpu->iem.s.aMemMappings[1].fAccess | pVCpu->iem.s.aMemMappings[2].fAccess)
-              & (IEM_ACCESS_PENDING_R3_WRITE_1ST | IEM_ACCESS_PENDING_R3_WRITE_2ND),
+              & (IEM_ACCESS_PENDING_R3_WRITE_1ST | IEM_ACCESS_PENDING_R3_WRITE_2ND),//确认是否存在待提交的写入
               ("%#x %#x %#x\n",
                pVCpu->iem.s.aMemMappings[0].fAccess, pVCpu->iem.s.aMemMappings[1].fAccess, pVCpu->iem.s.aMemMappings[2].fAccess));
-    VMCPU_FF_CLEAR(pVCpu, VMCPU_FF_IEM);
+    VMCPU_FF_CLEAR(pVCpu, VMCPU_FF_IEM);//清除 VMCPU_FF_IEM 标志，表示已开始处理
 
     /*
      * Commit the pending bounce buffers (usually just one).
      */
     unsigned cBufs = 0;
     unsigned iMemMap = RT_ELEMENTS(pVCpu->iem.s.aMemMappings);
-    while (iMemMap-- > 0)
+    while (iMemMap-- > 0)//遍历 3 个内存映射槽（aMemMappings[0..2]），检查是否有待写入的数据
         if (pVCpu->iem.s.aMemMappings[iMemMap].fAccess & (IEM_ACCESS_PENDING_R3_WRITE_1ST | IEM_ACCESS_PENDING_R3_WRITE_2ND))
         {
+            //必须为写入操作（IEM_ACCESS_TYPE_WRITE）且启用了缓存（IEM_ACCESS_BOUNCE_BUFFERED）。
             Assert(pVCpu->iem.s.aMemMappings[iMemMap].fAccess & IEM_ACCESS_TYPE_WRITE);
             Assert(pVCpu->iem.s.aMemMappings[iMemMap].fAccess & IEM_ACCESS_BOUNCE_BUFFERED);
             Assert(!pVCpu->iem.s.aMemBbMappings[iMemMap].fUnassigned);
@@ -11422,6 +11987,8 @@ VMMR3_INT_DECL(VBOXSTRICTRC) IEMR3ProcessForceFlag(PVM pVM, PVMCPUCC pVCpu, VBOX
             uint16_t const  cbSecond = pVCpu->iem.s.aMemBbMappings[iMemMap].cbSecond;
             uint8_t const  *pbBuf    = &pVCpu->iem.s.aBounceBuffers[iMemMap].ab[0];
 
+            //若存在第一阶段待写入数据（PENDING_R3_WRITE_1ST），
+            //调用 PGMPhysWrite 将缓存数据（aBounceBuffers）写入目标物理地址（GCPhysFirst）。
             if (pVCpu->iem.s.aMemMappings[iMemMap].fAccess & IEM_ACCESS_PENDING_R3_WRITE_1ST)
             {
                 VBOXSTRICTRC rcStrictCommit1 = PGMPhysWrite(pVM,
@@ -11435,6 +12002,7 @@ VMMR3_INT_DECL(VBOXSTRICTRC) IEMR3ProcessForceFlag(PVM pVM, PVMCPUCC pVCpu, VBOX
                      VBOXSTRICTRC_VAL(rcStrictCommit1), VBOXSTRICTRC_VAL(rcStrict)));
             }
 
+            //若存在第二阶段待写入数据（PENDING_R3_WRITE_2ND），同样调用 PGMPhysWrite 处理剩余数据（GCPhysSecond）。
             if (pVCpu->iem.s.aMemMappings[iMemMap].fAccess & IEM_ACCESS_PENDING_R3_WRITE_2ND)
             {
                 VBOXSTRICTRC rcStrictCommit2 = PGMPhysWrite(pVM,
@@ -11442,18 +12010,22 @@ VMMR3_INT_DECL(VBOXSTRICTRC) IEMR3ProcessForceFlag(PVM pVM, PVMCPUCC pVCpu, VBOX
                                                             pbBuf + cbFirst,
                                                             cbSecond,
                                                             PGMACCESSORIGIN_IEM);
+                //通过 iemR3MergeStatus 合并多次写入的结果状态
                 rcStrict = iemR3MergeStatus(rcStrict, rcStrictCommit2, iMemMap, pVCpu);
+                //日志记录：写入操作的地址、长度和结果会被记录
                 Log(("IEMR3ProcessForceFlag: iMemMap=%u GCPhysSecond=%RGp LB %#x %Rrc => %Rrc\n",
                      iMemMap, pVCpu->iem.s.aMemBbMappings[iMemMap].GCPhysSecond, cbSecond,
                      VBOXSTRICTRC_VAL(rcStrictCommit2), VBOXSTRICTRC_VAL(rcStrict)));
             }
             cBufs++;
-            pVCpu->iem.s.aMemMappings[iMemMap].fAccess = IEM_ACCESS_INVALID;
+            pVCpu->iem.s.aMemMappings[iMemMap].fAccess = IEM_ACCESS_INVALID;//每处理完一个映射槽，将其标记为无效
         }
 
+    //最终断言确认处理的缓存数量（cBufs）与活跃映射数（cActiveMappings）一致。
     AssertMsg(cBufs > 0 && cBufs == pVCpu->iem.s.cActiveMappings,
               ("cBufs=%u cActiveMappings=%u - %#x %#x %#x\n", cBufs, pVCpu->iem.s.cActiveMappings,
                pVCpu->iem.s.aMemMappings[0].fAccess, pVCpu->iem.s.aMemMappings[1].fAccess, pVCpu->iem.s.aMemMappings[2].fAccess));
+    //重置活跃映射计数为 0，返回最终状态码
     pVCpu->iem.s.cActiveMappings = 0;
     return rcStrict;
 }

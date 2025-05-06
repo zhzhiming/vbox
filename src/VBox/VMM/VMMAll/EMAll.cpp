@@ -338,15 +338,38 @@ EMRZSetPendingIoPortWrite(PVMCPU pVCpu, RTIOPORT uPort, uint8_t cbInstr, uint8_t
  *
  * @note    Must not be used when I/O port breakpoints are pending or when single stepping.
  */
+//标记待处理的 I/O 端口读操作
+/*
+  pVCpu：指向当前虚拟 CPU（VCPU）的上下文结构体。
+  uPort：目标 I/O 端口号（如 0x60 对应键盘控制器）。
+  cbInstr：触发该操作的指令长度（字节数）。
+  cbValue：待读取数据的字节宽度（1/2/4 字节）。
+ * */
+/*
+I/O 虚拟化机制
+    硬件辅助虚拟化（VT-x）：Guest 执行 IN 指令时触发 VM-Exit，由 VMM 处理端口访问
+    软件模拟（IEM）：若未启用硬件加速，EM 通过指令解释器捕获 I/O 操作
+    延迟处理原因
+
+    上下文切换开销：直接处理 I/O 可能导致频繁的 Ring-0 ↔ Ring-3 切换，通过标记挂起操作批量处理可提升性能
+    复杂模拟需求：某些端口（如 0x3F8 串口）需调用宿主系统的驱动或模拟设备，需在用户态（Ring-3）完成
+*/
+
+/*
+特性            VirtualBox (EM)                         KVM
+I/O 处理位置	混合模式（Ring-0 标记 → Ring-3 执行）   内核态直接模拟（通过 QEMU 设备模型）57
+性能优化	    延迟批量处理	                        事件fd 异步通知机制57
+适用场景	    复杂设备模拟（如 USB 控制器）	        高性能直通设备（如 VT-d）
+ * */
 VMMRZ_INT_DECL(VBOXSTRICTRC)
 EMRZSetPendingIoPortRead(PVMCPU pVCpu, RTIOPORT uPort, uint8_t cbInstr, uint8_t cbValue)
 {
-    Assert(pVCpu->em.s.PendingIoPortAccess.cbValue == 0);
+    Assert(pVCpu->em.s.PendingIoPortAccess.cbValue == 0);//确保当前无其他挂起的 I/O 操作
     pVCpu->em.s.PendingIoPortAccess.uPort     = uPort;
     pVCpu->em.s.PendingIoPortAccess.cbValue   = cbValue;
     pVCpu->em.s.PendingIoPortAccess.cbInstr   = cbInstr;
-    pVCpu->em.s.PendingIoPortAccess.uValue    = UINT32_C(0x52454144); /* 'READ' */
-    return VINF_EM_PENDING_R3_IOPORT_READ;
+    pVCpu->em.s.PendingIoPortAccess.uValue    = UINT32_C(0x52454144); /* 'READ' *///通过魔数 0x52454144（ASCII "READ"）标识读操作。
+    return VINF_EM_PENDING_R3_IOPORT_READ;//通知调用方需切换到 Ring-3 emR3NemHandleRC 处理
 }
 
 #endif /* IN_RING3 */
@@ -371,6 +394,7 @@ DECL_FORCE_INLINE(void) emHistoryExecSetContinueExitRecIdx(PVMCPU pVCpu, VBOXSTR
         /*
          * Only status codes that EMHandleRCTmpl.h will resume EMHistoryExec with.
          */
+            //仅以下状态码会触发记录（需后续 Ring-3 emR3NemHandleRC 处理）：
         case VINF_IOM_R3_IOPORT_READ:           /* -> emR3ExecuteIOInstruction */
         case VINF_IOM_R3_IOPORT_WRITE:          /* -> emR3ExecuteIOInstruction */
         case VINF_IOM_R3_IOPORT_COMMIT_WRITE:   /* -> VMCPU_FF_IOM -> VINF_EM_RESUME_R3_HISTORY_EXEC -> emR3ExecuteIOInstruction */
@@ -403,6 +427,49 @@ DECL_FORCE_INLINE(void) emHistoryExecSetContinueExitRecIdx(PVMCPU pVCpu, VBOXSTR
  *                          or update call.
  * @param   fWillExit       Flags indicating to IEM what will cause exits, TBD.
  */
+//根据退出记录（Exit Record）动态管理虚拟 CPU 的指令执行策略，优化虚拟机性能。
+/*
+  pVCpu：当前虚拟 CPU 的上下文。
+  pExitRec：退出记录，包含执行行为配置（如最大无退出指令数）。
+  fWillExit：标志位，指示可能的退出条件。
+ * */
+/*
+  批量执行：通过 EXEC_WITH_MAX 减少频繁退出带来的性能损耗。
+  自适应探测：通过 EXEC_PROBE 分析指令流特征，动态选择最优执行模式。
+  容错处理：忽略非关键错误（如未实现指令），确保虚拟机持续运行。
+ * */
+/*
+ * (1) EMEXITACTION_EXEC_WITH_MAX（批量执行模式）
+目标：尝试至少执行 cMinInstructions 条指令，但允许提前退出。
+处理流程：
+  若在 cMinInstructions 内触发退出：
+  通过 emHistoryExecSetContinueExitRecIdx 记录退出位置（pVCpu->em.s.idxContinueExitRec）。
+  不强制完成剩余指令，直接返回当前状态码（如 VINF_EM_HALT）。
+  若退出原因是 未实现指令（VERR_IEM_INSTR_NOT_IMPLEMENTED）：
+  忽略错误并返回 VINF_SUCCESS（除非一条指令都未执行）。
+统计调整：
+  仍会记录已执行的指令数（ExecStats.cInstructions），但不会计入“节省的退出次数”（因为未达到优化目标）。
+(2) EMEXITACTION_EXEC_PROBE（探测模式）
+目标：动态探测最佳执行窗口，可能调整后续策略。
+处理流程：
+  若在 cHistoryProbeMinInstructions 内触发退出：
+  检查退出次数（ExecStats.cExits）：
+  如果退出 ≥ 2 次：转换为 EXEC_WITH_MAX 模式，并基于实际退出间隔（ExecStats.cMaxExitDistance）设置 cMaxInstructionsWithoutExit。
+  如果退出仅 1 次：降级为普通模式（NORMAL_PROBED），后续不再优化。
+  若在非 Ring-3 环境且需进一步处理，触发 Ring-3 回退（StatHistoryProbedToRing3）。
+统计记录：
+  无论是否完成最小指令数，均记录已执行的指令数（StatHistoryProbeInstructions）。
+ * */
+
+/*
+ * 实际场景示例
+假设配置 cMinInstructions = 10，但执行到第 5 条指令时遇到 IN 指令（触发 I/O 退出）：
+EXEC_WITH_MAX 模式：
+  立即停止执行，返回 VINF_EM_HALT。
+  记录已执行的 5 条指令，但不标记为“优化成功”。
+EXEC_PROBE 模式：
+  如果这是近期第 2 次退出，可能将 cMaxInstructionsWithoutExit 设为 5，后续改用更保守的批量执行。
+ * */
 VMM_INT_DECL(VBOXSTRICTRC) EMHistoryExec(PVMCPUCC pVCpu, PCEMEXITREC pExitRec, uint32_t fWillExit)
 {
     Assert(pExitRec);
@@ -419,8 +486,8 @@ VMM_INT_DECL(VBOXSTRICTRC) EMHistoryExec(PVMCPUCC pVCpu, PCEMEXITREC pExitRec, u
             STAM_REL_PROFILE_START(&pVCpu->em.s.StatHistoryExec, a);
             LogFlow(("EMHistoryExec/EXEC_WITH_MAX: %RX64, max %u\n", pExitRec->uFlatPC, pExitRec->cMaxInstructionsWithoutExit));
             VBOXSTRICTRC rcStrict = IEMExecForExits(pVCpu, fWillExit,
-                                                    pExitRec->cMaxInstructionsWithoutExit /* cMinInstructions*/,
-                                                    pVCpu->em.s.cHistoryExecMaxInstructions,
+                                                    pExitRec->cMaxInstructionsWithoutExit /* cMinInstructions*/,//最小指令数,确保至少尝试执行这么多条指令
+                                                    pVCpu->em.s.cHistoryExecMaxInstructions,//最大指令数
                                                     pExitRec->cMaxInstructionsWithoutExit,
                                                     &ExecStats);
             LogFlow(("EMHistoryExec/EXEC_WITH_MAX: %Rrc cExits=%u cMaxExitDistance=%u cInstructions=%u\n",
@@ -428,16 +495,17 @@ VMM_INT_DECL(VBOXSTRICTRC) EMHistoryExec(PVMCPUCC pVCpu, PCEMEXITREC pExitRec, u
             emHistoryExecSetContinueExitRecIdx(pVCpu, rcStrict, pExitRec);
 
             /* Ignore instructions IEM doesn't know about. */
+            //忽略未实现的指令错误（如 VERR_IEM_INSTR_NOT_IMPLEMENTED），除非一条指令都未执行。
             if (   (   rcStrict != VERR_IEM_INSTR_NOT_IMPLEMENTED
                     && rcStrict != VERR_IEM_ASPECT_NOT_IMPLEMENTED)
                 || ExecStats.cInstructions == 0)
             { /* likely */ }
             else
-                rcStrict = VINF_SUCCESS;
+                rcStrict = VINF_SUCCESS;// 忽略未实现指令的错误
 
             if (ExecStats.cExits > 1)
-                STAM_REL_COUNTER_ADD(&pVCpu->em.s.StatHistoryExecSavedExits, ExecStats.cExits - 1);
-            STAM_REL_COUNTER_ADD(&pVCpu->em.s.StatHistoryExecInstructions, ExecStats.cInstructions);
+                STAM_REL_COUNTER_ADD(&pVCpu->em.s.StatHistoryExecSavedExits, ExecStats.cExits - 1);//记录节省的退出次数
+            STAM_REL_COUNTER_ADD(&pVCpu->em.s.StatHistoryExecInstructions, ExecStats.cInstructions);//记录总执行指令数
             STAM_REL_PROFILE_STOP(&pVCpu->em.s.StatHistoryExec, a);
             return rcStrict;
         }
@@ -445,42 +513,45 @@ VMM_INT_DECL(VBOXSTRICTRC) EMHistoryExec(PVMCPUCC pVCpu, PCEMEXITREC pExitRec, u
         /*
          * Probe a exit for close by exits.
          */
+        //探测当前退出点附近的指令流，动态调整后续执行策略。
         case EMEXITACTION_EXEC_PROBE:
         {
             STAM_REL_PROFILE_START(&pVCpu->em.s.StatHistoryProbe, b);
             LogFlow(("EMHistoryExec/EXEC_PROBE: %RX64\n", pExitRec->uFlatPC));
             PEMEXITREC   pExitRecUnconst = (PEMEXITREC)pExitRec;
             VBOXSTRICTRC rcStrict = IEMExecForExits(pVCpu, fWillExit,
-                                                    pVCpu->em.s.cHistoryProbeMinInstructions,
-                                                    pVCpu->em.s.cHistoryExecMaxInstructions,
-                                                    pVCpu->em.s.cHistoryProbeMaxInstructionsWithoutExit,
+                                                    pVCpu->em.s.cHistoryProbeMinInstructions,//最小指令数（探测的最低要求）
+                                                    pVCpu->em.s.cHistoryExecMaxInstructions,//最大允许执行的指令数
+                                                    pVCpu->em.s.cHistoryProbeMaxInstructionsWithoutExit,//最大无退出指令数 
                                                     &ExecStats);
             LogFlow(("EMHistoryExec/EXEC_PROBE: %Rrc cExits=%u cMaxExitDistance=%u cInstructions=%u\n",
                      VBOXSTRICTRC_VAL(rcStrict), ExecStats.cExits, ExecStats.cMaxExitDistance, ExecStats.cInstructions));
             emHistoryExecSetContinueExitRecIdx(pVCpu, rcStrict, pExitRecUnconst);
-            if (   ExecStats.cExits >= 2
+            if (   ExecStats.cExits >= 2//如果发现多次退出（cExits >= 2），切换为 EXEC_WITH_MAX 模式，并基于实际退出间隔（cMaxExitDistance）调整参数。
                 && RT_SUCCESS(rcStrict))
             {
                 Assert(ExecStats.cMaxExitDistance > 0 && ExecStats.cMaxExitDistance <= 32);
                 pExitRecUnconst->cMaxInstructionsWithoutExit = ExecStats.cMaxExitDistance;
-                pExitRecUnconst->enmAction = EMEXITACTION_EXEC_WITH_MAX;
+                pExitRecUnconst->enmAction = EMEXITACTION_EXEC_WITH_MAX;// 切换为批量执行模式
                 LogFlow(("EMHistoryExec/EXEC_PROBE: -> EXEC_WITH_MAX %u\n", ExecStats.cMaxExitDistance));
-                STAM_REL_COUNTER_INC(&pVCpu->em.s.StatHistoryProbedExecWithMax);
+                STAM_REL_COUNTER_INC(&pVCpu->em.s.StatHistoryProbedExecWithMax);//成功优化次数
             }
 #ifndef IN_RING3
+            //触发 Ring-3 处理（非 Ring-3 环境时）
             else if (   pVCpu->em.s.idxContinueExitRec != UINT16_MAX
                      && RT_SUCCESS(rcStrict))
             {
-                STAM_REL_COUNTER_INC(&pVCpu->em.s.StatHistoryProbedToRing3);
+                STAM_REL_COUNTER_INC(&pVCpu->em.s.StatHistoryProbedToRing3);//Ring-3 回退次数
                 LogFlow(("EMHistoryExec/EXEC_PROBE: -> ring-3\n"));
             }
 #endif
             else
             {
+                //否则降级为普通模式（NORMAL_PROBED）
                 pExitRecUnconst->enmAction = EMEXITACTION_NORMAL_PROBED;
                 pVCpu->em.s.idxContinueExitRec = UINT16_MAX;
                 LogFlow(("EMHistoryExec/EXEC_PROBE: -> PROBED\n"));
-                STAM_REL_COUNTER_INC(&pVCpu->em.s.StatHistoryProbedNormal);
+                STAM_REL_COUNTER_INC(&pVCpu->em.s.StatHistoryProbedNormal);//降级次数
                 if (   rcStrict == VERR_IEM_INSTR_NOT_IMPLEMENTED
                     || rcStrict == VERR_IEM_ASPECT_NOT_IMPLEMENTED)
                     rcStrict = VINF_SUCCESS;
@@ -505,15 +576,17 @@ VMM_INT_DECL(VBOXSTRICTRC) EMHistoryExec(PVMCPUCC pVCpu, PCEMEXITREC pExitRec, u
 /**
  * Worker for emHistoryAddOrUpdateRecord.
  */
+//初始化虚拟机退出记录(EMEXITREC)
+//记录虚拟机执行过程中发生的退出事件信息
 DECL_FORCE_INLINE(PCEMEXITREC) emHistoryRecordInit(PEMEXITREC pExitRec, uint64_t uFlatPC, uint32_t uFlagsAndType, uint64_t uExitNo)
 {
-    pExitRec->uFlatPC                     = uFlatPC;
-    pExitRec->uFlagsAndType               = uFlagsAndType;
-    pExitRec->enmAction                   = EMEXITACTION_NORMAL;
+    pExitRec->uFlatPC                     = uFlatPC;//记录退出时的指令地址
+    pExitRec->uFlagsAndType               = uFlagsAndType;//退出标志和类型组合值
+    pExitRec->enmAction                   = EMEXITACTION_NORMAL;//设置为默认动作
     pExitRec->bUnused                     = 0;
     pExitRec->cMaxInstructionsWithoutExit = 64;
-    pExitRec->uLastExitNo                 = uExitNo;
-    pExitRec->cHits                       = 1;
+    pExitRec->uLastExitNo                 = uExitNo;//记录最后一次退出序号
+    pExitRec->cHits                       = 1;//命中计数器初始化为1
     return NULL;
 }
 
@@ -561,6 +634,32 @@ DECL_FORCE_INLINE(PCEMEXITREC) emHistoryRecordInitReplacement(PEMEXITENTRY pHist
  * @param   pHistEntry      The exit history entry.
  * @param   uExitNo         The current exit number.
  */
+/*
+  管理虚拟CPU的退出记录（Exit Records），通过哈希表动态跟踪指令执行路径的退出行为，并基于历史数据优化后续执行策略
+    查找/更新记录：根据指令地址（uFlatPC）匹配或创建退出记录。
+    冲突处理：哈希碰撞时采用二次探测 + LRU（最近最少使用）策略。
+    策略升级：根据命中次数动态调整退出动作类型（如 NORMAL → EXEC_PROBE）。
+
+    渐进式升级：NORMAL → PROBE → WITH_MAX，避免过早优化不稳定路径。
+    退化机制：PROBE 失败后降级，防止无效探测拖累性能。
+
+    场景：客户机循环执行 CPUID 指令（频繁触发VM Exit）。
+
+首次退出：
+  创建 NORMAL 记录，cHits=1。
+第256次退出：
+  升级为 EXEC_PROBE，后续尝试批量执行（IEMExecForExits）。
+若探测成功：
+  转换为 EXEC_WITH_MAX，减少退出频率。
+若探测失败：
+  512次后降级为 NORMAL_PROBED，回退到默认处理。
+
+ 注意： 当启用EPT（Extended Page Tables）硬件功能时，它会自动处理许多原本需要通过VM Exit由VMM
+       （虚拟机监控器）处理的页表访问操作，从而减少了某些类型的VM Exit。
+        这种减少会间接影响 EMHistoryExec 这类优化机制的效果。
+
+        EPT 减少了内存相关退出，使得 EMHistoryExec 的优化目标（减少退出）主要集中在 非内存操作（如设备 I/O）。
+ * */
 static PCEMEXITREC emHistoryAddOrUpdateRecord(PVMCPU pVCpu, uint64_t uFlagsAndType, uint64_t uFlatPC,
                                               PEMEXITENTRY pHistEntry, uint64_t uExitNo)
 {
@@ -574,29 +673,29 @@ static PCEMEXITREC emHistoryAddOrUpdateRecord(PVMCPU pVCpu, uint64_t uFlagsAndTy
      */
     AssertCompile(RT_ELEMENTS(pVCpu->em.s.aExitRecords) == 1024);
 # define EM_EXIT_RECORDS_IDX_MASK 0x3ff
-    uintptr_t  idxSlot  = ((uintptr_t)uFlatPC >> 1) & EM_EXIT_RECORDS_IDX_MASK;
+    uintptr_t  idxSlot  = ((uintptr_t)uFlatPC >> 1) & EM_EXIT_RECORDS_IDX_MASK;//计算哈希索引
     PEMEXITREC pExitRec = &pVCpu->em.s.aExitRecords[idxSlot];
-    if (pExitRec->uFlatPC == uFlatPC)
+    if (pExitRec->uFlatPC == uFlatPC)//直接命中
     {
         Assert(pExitRec->enmAction != EMEXITACTION_FREE_RECORD);
         pHistEntry->idxSlot = (uint32_t)idxSlot;
         if (pExitRec->uFlagsAndType == uFlagsAndType)
         {
-            pExitRec->uLastExitNo = uExitNo;
+            pExitRec->uLastExitNo = uExitNo;//标志相同：更新最后退出号(uLastExitNo)
             STAM_REL_COUNTER_INC(&pVCpu->em.s.aStatHistoryRecHits[0]);
         }
         else
         {
             STAM_REL_COUNTER_INC(&pVCpu->em.s.aStatHistoryRecTypeChanged[0]);
-            return emHistoryRecordInit(pExitRec, uFlatPC, uFlagsAndType, uExitNo);
+            return emHistoryRecordInit(pExitRec, uFlatPC, uFlagsAndType, uExitNo);//标志不同：重新初始化记录
         }
     }
-    else if (pExitRec->enmAction == EMEXITACTION_FREE_RECORD)
+    else if (pExitRec->enmAction == EMEXITACTION_FREE_RECORD)//空闲记录
     {
         STAM_REL_COUNTER_INC(&pVCpu->em.s.aStatHistoryRecNew[0]);
-        return emHistoryRecordInitNew(pVCpu, pHistEntry, idxSlot, pExitRec, uFlatPC, uFlagsAndType, uExitNo);
+        return emHistoryRecordInitNew(pVCpu, pHistEntry, idxSlot, pExitRec, uFlatPC, uFlagsAndType, uExitNo);//初始化新记录
     }
-    else
+    else//冲突,在这个slot上已经有其他记录了
     {
         /*
          * Collision.  We calculate a new hash for stepping away from the first,
@@ -606,7 +705,13 @@ static PCEMEXITREC emHistoryAddOrUpdateRecord(PVMCPU pVCpu, uint64_t uFlagsAndTy
         uint64_t  uOldestExitNo = pExitRec->uLastExitNo;
         unsigned  iOldestStep   = 0;
         unsigned  iStep         = 1;
-        uintptr_t const idxAdd  = (uintptr_t)(uFlatPC >> 11) & (EM_EXIT_RECORDS_IDX_MASK / 4);
+        uintptr_t const idxAdd  = (uintptr_t)(uFlatPC >> 11) & (EM_EXIT_RECORDS_IDX_MASK / 4);//二次探测法：步长由地址高位（>> 11）动态计算，减少聚集。
+        /*
+         * 发生哈希冲突时：
+             采用二次探测法（最多探测8次）
+             记录最久未使用的槽位(LRU策略)
+             8次探测后替换最久未使用的记录(emHistoryRecordInitReplacement)
+         * */
         for (;;)
         {
             Assert(iStep < RT_ELEMENTS(pVCpu->em.s.aStatHistoryRecHits));
@@ -627,7 +732,7 @@ static PCEMEXITREC emHistoryAddOrUpdateRecord(PVMCPU pVCpu, uint64_t uFlagsAndTy
                 if (pExitRec->uFlagsAndType == uFlagsAndType)
                 {
                     pExitRec->uLastExitNo = uExitNo;
-                    STAM_REL_COUNTER_INC(&pVCpu->em.s.aStatHistoryRecHits[iStep]);
+                    STAM_REL_COUNTER_INC(&pVCpu->em.s.aStatHistoryRecHits[iStep]);//命中计数
                     break;
                 }
                 STAM_REL_COUNTER_INC(&pVCpu->em.s.aStatHistoryRecTypeChanged[iStep]);
@@ -637,7 +742,7 @@ static PCEMEXITREC emHistoryAddOrUpdateRecord(PVMCPU pVCpu, uint64_t uFlagsAndTy
             /* Is it free? */
             if (pExitRec->enmAction == EMEXITACTION_FREE_RECORD)
             {
-                STAM_REL_COUNTER_INC(&pVCpu->em.s.aStatHistoryRecNew[iStep]);
+                STAM_REL_COUNTER_INC(&pVCpu->em.s.aStatHistoryRecNew[iStep]);//新记录计数
                 return emHistoryRecordInitNew(pVCpu, pHistEntry, idxSlot, pExitRec, uFlatPC, uFlagsAndType, uExitNo);
             }
 
@@ -657,8 +762,9 @@ static PCEMEXITREC emHistoryAddOrUpdateRecord(PVMCPU pVCpu, uint64_t uFlagsAndTy
             else
             {
                 /* Replace the least recently used slot. */
-                STAM_REL_COUNTER_INC(&pVCpu->em.s.aStatHistoryRecReplaced[iOldestStep]);
+                STAM_REL_COUNTER_INC(&pVCpu->em.s.aStatHistoryRecReplaced[iOldestStep]);//替换计数
                 pExitRec = &pVCpu->em.s.aExitRecords[idxOldest];
+                //LRU策略：在8次探测内记录最久未使用的槽位（uLastExitNo最小），最终替换它（emHistoryRecordInitReplacement）。
                 return emHistoryRecordInitReplacement(pHistEntry, idxOldest, pExitRec, uFlatPC, uFlagsAndType, uExitNo);
             }
         }
@@ -672,10 +778,10 @@ static PCEMEXITREC emHistoryAddOrUpdateRecord(PVMCPU pVCpu, uint64_t uFlagsAndTy
         case EMEXITACTION_NORMAL:
         {
             uint64_t const cHits = ++pExitRec->cHits;
-            if (cHits < 256)
+            if (cHits < 256)//命中256次以下：保持EMEXITACTION_NORMAL
                 return NULL;
             LogFlow(("emHistoryAddOrUpdateRecord: [%#x] %#07x %16RX64: -> EXEC_PROBE\n", idxSlot, uFlagsAndType, uFlatPC));
-            pExitRec->enmAction = EMEXITACTION_EXEC_PROBE;
+            pExitRec->enmAction = EMEXITACTION_EXEC_PROBE;//命中256次以上：升级为EMEXITACTION_EXEC_PROBE
             return pExitRec;
         }
 
@@ -694,6 +800,7 @@ static PCEMEXITREC emHistoryAddOrUpdateRecord(PVMCPU pVCpu, uint64_t uFlagsAndTy
             uint64_t const cHits = ++pExitRec->cHits;
             if (cHits < 512)
                 return pExitRec;
+            //命中次数≥512时，降级为 NORMAL_PROBED（放弃优化，避免无效探测）。
             pExitRec->enmAction = EMEXITACTION_NORMAL_PROBED;
             LogFlow(("emHistoryAddOrUpdateRecord: [%#x] %#07x %16RX64: -> PROBED\n", idxSlot, uFlagsAndType, uFlatPC));
             return NULL;
@@ -723,6 +830,8 @@ VMM_INT_DECL(PCEMEXITREC) EMHistoryAddExit(PVMCPUCC pVCpu, uint32_t uFlagsAndTyp
      */
     AssertCompile(RT_ELEMENTS(pVCpu->em.s.aExitHistory) == 256);
     uint64_t uExitNo = pVCpu->em.s.iNextExit++;
+    //将退出时的关键信息（如指令地址 uFlatPC、时间戳 uTimestamp、
+    //退出类型 uFlagsAndType）存入环形缓冲区（aExitHistory）。
     PEMEXITENTRY pHistEntry = &pVCpu->em.s.aExitHistory[(uintptr_t)uExitNo & 0xff];
     pHistEntry->uFlatPC       = uFlatPC;
     pHistEntry->uTimestamp    = uTimestamp;
@@ -732,6 +841,8 @@ VMM_INT_DECL(PCEMEXITREC) EMHistoryAddExit(PVMCPUCC pVCpu, uint32_t uFlagsAndTyp
     /*
      * If common exit type, we will insert/update the exit into the exit record hash table.
      */
+    //优化高频退出路径：如果退出类型符合优化条件（如 EMEXIT_F_KIND_EM），
+    //则进一步调用 emHistoryAddOrUpdateRecord 更新哈希表，以减少未来相同路径的退出开销
     if (   (uFlagsAndType & (EMEXIT_F_KIND_MASK | EMEXIT_F_CS_EIP | EMEXIT_F_UNFLATTENED_PC)) == EMEXIT_F_KIND_EM
 #ifdef IN_RING0
         && pVCpu->em.s.fExitOptimizationEnabledR0
@@ -753,18 +864,19 @@ VMM_INT_DECL(PCEMEXITREC) EMHistoryAddExit(PVMCPUCC pVCpu, uint32_t uFlagsAndTyp
  * @param   uFlatPC         The flattened program counter (RIP).
  * @param   fFlattened      Set if RIP was subjected to CS.BASE, clear if not.
  */
+//用于更新虚拟机退出(VMExit)历史记录中的程序计数器(PC)信息
 VMM_INT_DECL(void) EMHistoryUpdatePC(PVMCPUCC pVCpu, uint64_t uFlatPC, bool fFlattened)
 {
     VMCPU_ASSERT_EMT(pVCpu);
 
     AssertCompile(RT_ELEMENTS(pVCpu->em.s.aExitHistory) == 256);
-    uint64_t     uExitNo    = pVCpu->em.s.iNextExit - 1;
+    uint64_t     uExitNo    = pVCpu->em.s.iNextExit - 1;/// 获取最近一次退出序号
     PEMEXITENTRY pHistEntry = &pVCpu->em.s.aExitHistory[(uintptr_t)uExitNo & 0xff];
-    pHistEntry->uFlatPC = uFlatPC;
+    pHistEntry->uFlatPC = uFlatPC;// 更新PC值
     if (fFlattened)
-        pHistEntry->uFlagsAndType &= ~EMEXIT_F_UNFLATTENED_PC;
+        pHistEntry->uFlagsAndType &= ~EMEXIT_F_UNFLATTENED_PC;//表示地址已平坦化
     else
-        pHistEntry->uFlagsAndType |= EMEXIT_F_UNFLATTENED_PC;
+        pHistEntry->uFlagsAndType |= EMEXIT_F_UNFLATTENED_PC;//表示原始地址
 }
 
 
@@ -852,6 +964,11 @@ VMM_INT_DECL(PCEMEXITREC) EMHistoryUpdateFlagsAndTypeAndPC(PVMCPUCC pVCpu, uint3
 /**
  * @callback_method_impl{FNDISREADBYTES}
  */
+/*
+ * 指令解码器（Disassembler）的辅助函数，用于 从客户机物理内存中安全读取指令字节流，主要用途包括：
+     指令解码：为后续的指令模拟或分析提供原始字节数据。
+     分页异常处理：处理客户机页表缺失或权限错误，必要时触发主机 TLB 无效化。
+ * */
 static DECLCALLBACK(int) emReadBytes(PDISSTATE pDis, uint8_t offInstr, uint8_t cbMinRead, uint8_t cbMaxRead)
 {
     PVMCPUCC    pVCpu    = (PVMCPUCC)pDis->pvUser;
@@ -860,13 +977,18 @@ static DECLCALLBACK(int) emReadBytes(PDISSTATE pDis, uint8_t offInstr, uint8_t c
     /*
      * Figure how much we can or must read.
      */
-    size_t      cbToRead = GUEST_PAGE_SIZE - (uSrcAddr & (GUEST_PAGE_SIZE - 1));
+    size_t      cbToRead = GUEST_PAGE_SIZE - (uSrcAddr & (GUEST_PAGE_SIZE - 1));//确保读取不跨页
     if (cbToRead > cbMaxRead)
         cbToRead = cbMaxRead;
     else if (cbToRead < cbMinRead)
         cbToRead = cbMinRead;
 
+    /*
+     * 底层读取：调用 PGMPhysSimpleReadGCPtr 通过客户机页表翻译物理地址。
+       结果缓存：将读取的字节存入 pDis->Instr.ab 缓冲区，更新已缓存长度（cbCachedInstr）。
+     * */
     int rc = PGMPhysSimpleReadGCPtr(pVCpu, &pDis->Instr.ab[offInstr], uSrcAddr, cbToRead);
+    //若剩余空间不足 cbMinRead，强制读取最小所需字节（可能跨页）。
     if (RT_FAILURE(rc))
     {
         if (cbToRead > cbMinRead)
@@ -886,9 +1008,9 @@ static DECLCALLBACK(int) emReadBytes(PDISSTATE pDis, uint8_t offInstr, uint8_t c
              */
             if (rc == VERR_PAGE_TABLE_NOT_PRESENT || rc == VERR_PAGE_NOT_PRESENT)
             {
-                HMInvalidatePage(pVCpu, uSrcAddr);
+                HMInvalidatePage(pVCpu, uSrcAddr);// 无效化主机TLB
                 if (((uSrcAddr + cbToRead - 1) >> GUEST_PAGE_SHIFT) != (uSrcAddr >> GUEST_PAGE_SHIFT))
-                    HMInvalidatePage(pVCpu, uSrcAddr + cbToRead - 1);
+                    HMInvalidatePage(pVCpu, uSrcAddr + cbToRead - 1);//跨页
             }
 #endif
         }
@@ -909,22 +1031,37 @@ static DECLCALLBACK(int) emReadBytes(PDISSTATE pDis, uint8_t offInstr, uint8_t c
  * @param   pDis            Where to return the parsed instruction info.
  * @param   pcbInstr        Where to return the instruction size. (optional)
  */
+//虚拟化引擎中用于动态反汇编当前Guest指令的核心函数，其实现涉及地址转换、权限校验和指令解码三阶段处理流程
+//获取当前Guest RIP指向的指令并进行反汇编
+#if 0
+  pDis：存储反汇编结果的结构体（操作码、操作数等）
+  pcbInstr：返回指令长度
+#endif
 VMM_INT_DECL(int) EMInterpretDisasCurrent(PVMCPUCC pVCpu, PDISSTATE pDis, unsigned *pcbInstr)
 {
 #if defined(VBOX_VMM_TARGET_ARMV8)
     return EMInterpretDisasOneEx(pVCpu, (RTGCUINTPTR)CPUMGetGuestFlatPC(pVCpu), pDis, pcbInstr);
 #else
-    PCPUMCTX pCtx = CPUMQueryGuestCtxPtr(pVCpu);
+    PCPUMCTX pCtx = CPUMQueryGuestCtxPtr(pVCpu);//获取当前vCPU的寄存器上下文
     RTGCPTR  GCPtrInstr;
 
 # if 0
     int rc = SELMToFlatEx(pVCpu, DISSELREG_CS, pCtx, pCtx->rip, 0, &GCPtrInstr);
 # else
 /** @todo Get the CPU mode as well while we're at it! */
-    int rc = SELMValidateAndConvertCSAddr(pVCpu, pCtx->eflags.u, pCtx->ss.Sel, pCtx->cs.Sel, &pCtx->cs, pCtx->rip, &GCPtrInstr);
+    /*
+  CS段有效性（包括DPL/RPL权限检查）
+  根据EFLAGS.VM标志判断虚拟8086模式5
+  将逻辑地址CS:RIP转换为平坦地址GCPtrInstr
+     * */
+    int rc = SELMValidateAndConvertCSAddr(pVCpu, pCtx->eflags.u, pCtx->ss.Sel, pCtx->cs.Sel, &pCtx->cs, pCtx->rip, &GCPtrInstr);// 段地址转换
 # endif
     if (RT_SUCCESS(rc))
-        return EMInterpretDisasOneEx(pVCpu, (RTGCUINTPTR)GCPtrInstr, pDis, pcbInstr);
+        /*
+         * (RTGCUINTPTR)GCPtrInstr：经过验证的指令物理地址
+           pDis：输出反汇编结果（操作码、前缀、操作数等）
+         * */
+        return EMInterpretDisasOneEx(pVCpu, (RTGCUINTPTR)GCPtrInstr, pDis, pcbInstr);//反汇编核心调用
 
     Log(("EMInterpretDisasOne: Failed to convert %RTsel:%RGv (cpl=%d) - rc=%Rrc !!\n",
          pCtx->cs.Sel, (RTGCPTR)pCtx->rip, pCtx->ss.Sel & X86_SEL_RPL, rc));
@@ -1015,14 +1152,29 @@ VMM_INT_DECL(VBOXSTRICTRC) EMInterpretInstruction(PVMCPUCC pVCpu)
  * @todo    At this time we do NOT check if the instruction overwrites vital information.
  *          Make sure this can't happen!! (will add some assertions/checks later)
  */
+//pDis	PDISSTATE	预解码指令状态(含操作码/操作数等)
+//用于 基于预解码状态（DISSTATE）执行单条客户机指令
+/*
+ * 实际工作流程示例
+场景：客户机执行一条 CPUID 指令。
+指令预读取：
+  前置调用 emReadBytes 将 CPUID 的字节码（0F A2）存入 pDis->Instr.ab。
+解释执行：
+  IEMExecOneBypassWithPrefetchedByPC 识别 CPUID，模拟其行为（返回虚拟 CPU 信息）。
+成功返回：
+  若模拟成功，返回 VINF_SUCCESS。
+错误处理：
+  若 IEM 未实现该指令（如新扩展指令），返回 VERR_EM_INTERPRETER，触发上层回退。
+ * */
 VMM_INT_DECL(VBOXSTRICTRC) EMInterpretInstructionDisasState(PVMCPUCC pVCpu, PDISSTATE pDis, uint64_t rip)
 {
     LogFlow(("EMInterpretInstructionDisasState %RGv\n", (RTGCPTR)rip));
 
-    VBOXSTRICTRC rc = IEMExecOneBypassWithPrefetchedByPC(pVCpu, rip, pDis->Instr.ab, pDis->cbCachedInstr);
+    //直接解释执行指令。
+    VBOXSTRICTRC rc = IEMExecOneBypassWithPrefetchedByPC(pVCpu, rip, pDis->Instr.ab, pDis->cbCachedInstr);//直接使用预解码的指令字节(pDis->Instr.ab)执行，避免重复解码
     if (RT_UNLIKELY(   rc == VERR_IEM_ASPECT_NOT_IMPLEMENTED
                     || rc == VERR_IEM_INSTR_NOT_IMPLEMENTED))
-        rc = VERR_EM_INTERPRETER;
+        rc = VERR_EM_INTERPRETER;//统一错误码, 重新编译或陷入 Ring-3,显式处理未实现指令，避免隐式行为。
 
     if (rc != VINF_SUCCESS)
         Log(("EMInterpretInstructionDisasState: returns %Rrc\n", VBOXSTRICTRC_VAL(rc)));

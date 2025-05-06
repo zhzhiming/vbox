@@ -1649,12 +1649,22 @@ DECLINLINE(void) CPUMSetGuestGif(PCPUMCTX pCtx, bool fGif)
  * @note    Does NOT clear CPUMCTX_INHIBIT_SHADOW when CPUMCTX::uRipInhibitInt
  *          differs from CPUMCTX::rip.
  */
+/*
+ * 典型场景：
+  CLI/POP SS/MOV SS指令执行后，硬件自动进入中断抑制状态
+  VM-Entry后若 VMCS 中设置了中断抑制标志，需维持该状态直到首条指令完成
+ */
 DECLINLINE(bool) CPUMIsInInterruptShadow(PCCPUMCTX pCtx)
 {
+    //中断阴影检测：判断当前 CPU 上下文是否处于 中断抑制窗口（Interrupt Shadow），
+    //即下一条指令执行前是否禁止响应外部中断
+    //CPUMCTX_INHIBIT_SHADOW：对应 x86 EFLAGS的中断抑制标记（如 EFLAGS.IF=0 或特定指令触发的硬件抑制）
     if (!(pCtx->eflags.uBoth & CPUMCTX_INHIBIT_SHADOW))
         return false;
 
     CPUMCTX_ASSERT_NOT_EXTRN(pCtx, CPUMCTX_EXTRN_RIP);
+    //uRipInhibitInt：记录触发中断抑制的指令地址
+    //当前指令指针，需与抑制触发地址匹配，确保抑制窗口未因异常或分支退出
     return pCtx->uRipInhibitInt == pCtx->rip;
 }
 
