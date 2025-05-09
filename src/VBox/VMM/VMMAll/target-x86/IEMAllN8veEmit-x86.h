@@ -2773,6 +2773,24 @@ DECL_INLINE_THROW(uint32_t) iemNativeEmitSimdFp3OpCommon_rr_u128(PIEMRECOMPILERS
 /**
  * Common emitter for packed floating point instructions with 3 operands - register, local variable variant.
  */
+// 用于生成寄存器到变量/内存的SIMD浮点运算指令（如 ADDPS xmm1, [mem]）。
+/*
+  示例：生成 ADDPS xmm0, xmm1 的机器码：
+  前缀：0x66（SSE）
+  操作码：0x0F 0x58
+  ModR/M：0xC1（xmm0编码为 0, xmm1编码为 1）
+ * */
+/*
+  pReNative      PIEMRECOMPILERSTATE           JIT编译状态（寄存器分配、代码缓冲等）
+  off              uint32_t                    当前代码偏移量
+  idxInstr         uint8_t                     指令索引（用于错误跟踪）
+  idxSimdGstRegDst uint8_t                     目标SIMD寄存器（Guest）
+  idxVarSrc        uint8_t 源变量             （可能是内存操作数）
+  bPrefixX86       uint8_t (x86)               X86指令前缀（如 0x66）
+  bOpcX86          uint8_t (x86)               X86操作码（如 0x58）
+  enmFpOp          ARMV8INSTRVECFPOP           (ARM) ARM浮点操作类型
+  enmFpSz          ARMV8INSTRVECFPSZ           (ARM) ARM浮点操作元素大小
+ * */
 DECL_INLINE_THROW(uint32_t) iemNativeEmitSimdFp3OpCommon_rv_u128(PIEMRECOMPILERSTATE pReNative, uint32_t off, uint8_t const idxInstr,
                                                                  uint8_t const idxSimdGstRegDst, uint8_t const idxVarSrc,
 #ifdef RT_ARCH_AMD64
@@ -2782,21 +2800,30 @@ DECL_INLINE_THROW(uint32_t) iemNativeEmitSimdFp3OpCommon_rv_u128(PIEMRECOMPILERS
 #endif
                                                                  )
 {
+    //为目标寄存器分配临时物理寄存器 (如 xmm0)
     uint8_t const idxSimdRegDst = iemNativeSimdRegAllocTmpForGuestSimdReg(pReNative, &off, IEMNATIVEGSTSIMDREG_SIMD(idxSimdGstRegDst),
                                                                          kIemNativeGstSimdRegLdStSz_Low128, kIemNativeGstRegUse_ReadOnly);
+    //获取源操作数的寄存器（若为内存操作数，会生成加载指令）。
     uint8_t const idxSimdRegSrc = iemNativeVarSimdRegisterAcquire(pReNative, idxVarSrc, &off, true /*fInitialized*/);
 
 #ifdef RT_ARCH_AMD64
+    // 将目标寄存器数据加载到固定临时寄存器（TMP0）
     off = iemNativeEmitSimdLoadVecRegFromVecRegU128(pReNative, off, IEMNATIVE_SIMD_REG_FIXED_TMP0, idxSimdRegDst);
+    // 生成指令字节码
     PIEMNATIVEINSTR const pCodeBuf = iemNativeInstrBufEnsure(pReNative, off, 5);
     if (bPrefixX86 != 0)
-        pCodeBuf[off++] = bPrefixX86;
+        pCodeBuf[off++] = bPrefixX86;// 如SSE前缀 `0x66`
+    // 处理REX前缀（高寄存器xmm8-xmm15需设置REX位）
     if (IEMNATIVE_SIMD_REG_FIXED_TMP0 >= 8 || idxSimdRegSrc >= 8)
         pCodeBuf[off++] =   (idxSimdRegSrc >= 8 ? X86_OP_REX_B : 0)
                           | (IEMNATIVE_SIMD_REG_FIXED_TMP0 >= 8 ? X86_OP_REX_R : 0);
-    pCodeBuf[off++] = 0x0f;
-    pCodeBuf[off++] = bOpcX86;
-    pCodeBuf[off++] = X86_MODRM_MAKE(X86_MOD_REG, IEMNATIVE_SIMD_REG_FIXED_TMP0 & 7, idxSimdRegSrc & 7);
+    // 填充操作码和ModR/M字节
+    pCodeBuf[off++] = 0x0f;// 扩展操作码前缀
+    pCodeBuf[off++] = bOpcX86; // 如 `0x58`（ADDPS）
+    // ModR/M：寄存器操作数模式
+    pCodeBuf[off++] = X86_MODRM_MAKE(X86_MOD_REG, 
+            IEMNATIVE_SIMD_REG_FIXED_TMP0 & 7, // 目标寄存器（低3位）
+            idxSimdRegSrc & 7);// 源寄存器（低3位）
 #elif defined(RT_ARCH_ARM64)
     PIEMNATIVEINSTR const pCodeBuf = iemNativeInstrBufEnsure(pReNative, off, 1);
     pCodeBuf[off++] = Armv8A64MkVecInstrFp3Op(enmFpOp, enmFpSz, IEMNATIVE_SIMD_REG_FIXED_TMP0, idxSimdRegDst, idxSimdRegSrc);
@@ -2814,15 +2841,24 @@ DECL_INLINE_THROW(uint32_t) iemNativeEmitSimdFp3OpCommon_rv_u128(PIEMRECOMPILERS
  * Common emitter for packed floating point instructions with 3 operands.
  */
 #ifdef RT_ARCH_AMD64
+//生成SIMD（单指令多数据）浮点运算的辅助函数，支持128位操作数
+//于动态生成SIMD浮点指令的JIT（即时编译）代码
+/*
+ * a_Instr：指令名称（如 ADD、SUB）。
+   a_bPrefixX86：X86指令前缀（如 0x66 对应SSE指令）。
+    a_bOpcX86：X86操作码（如 0x58 对应 ADDPS）。
+ * */
 # define IEMNATIVE_NATIVE_EMIT_FP_3OP_U128(a_Instr, a_enmArmOp, a_ArmElemSz, a_bPrefixX86, a_bOpcX86) \
     DECL_FORCE_INLINE_THROW(uint32_t) \
     RT_CONCAT3(iemNativeEmit_,a_Instr,_rr_u128)(PIEMRECOMPILERSTATE pReNative, uint32_t off, uint8_t const idxInstr, \
                                                 uint8_t const idxSimdGstRegDst, uint8_t const idxSimdGstRegSrc) \
     { \
+        //寄存器到寄存器操作（rr）例如 ADDPS xmm1, xmm2： \
         return iemNativeEmitSimdFp3OpCommon_rr_u128(pReNative, off, idxInstr, idxSimdGstRegDst, idxSimdGstRegSrc, \
                                                     a_bPrefixX86, a_bOpcX86); \
     } \
     DECL_FORCE_INLINE_THROW(uint32_t) \
+    //寄存器到变量/内存操作（rv）例如 ADDPS xmm1, [mem]： \
     RT_CONCAT3(iemNativeEmit_,a_Instr,_rv_u128)(PIEMRECOMPILERSTATE pReNative, uint32_t off, uint8_t const idxInstr, \
                                                 uint8_t const idxSimdGstRegDst, uint8_t const idxVarSrc) \
     { \

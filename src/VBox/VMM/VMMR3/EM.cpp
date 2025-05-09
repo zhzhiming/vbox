@@ -2145,13 +2145,14 @@ VMMR3_INT_DECL(int) EMR3ExecuteVM(PVM pVM, PVMCPU pVCpu)
               || pVCpu->em.s.enmState == EMSTATE_SUSPENDED,
               ("%s\n", emR3GetStateName(pVCpu->em.s.enmState)));
 
-    int rc = setjmp(pVCpu->em.s.u.FatalLongJump);
+    //用于捕获致命错误（如 triple fault），跳转到错误处理流程。
+    int rc = setjmp(pVCpu->em.s.u.FatalLongJump);// 设置异常跳转点
     if (rc == 0)
     {
         /*
          * Start the virtual time.
          */
-        TMR3NotifyResume(pVM, pVCpu);
+        TMR3NotifyResume(pVM, pVCpu);// 初始化虚拟时间
 
         /*
          * The Outer Main Loop.
@@ -2163,12 +2164,13 @@ VMMR3_INT_DECL(int) EMR3ExecuteVM(PVM pVM, PVMCPU pVCpu)
 
         /* If resuming after a pause or a state load, restore the previous
            state or else we'll start executing code. Else, just reschedule. */
+        //状态初始化：根据虚拟机和 vCPU 的当前状态（如 EMSTATE_HALTED、EMSTATE_WAIT_SIPI）选择执行引擎。
         if (    pVCpu->em.s.enmState == EMSTATE_SUSPENDED
             &&  (   pVCpu->em.s.enmPrevState == EMSTATE_WAIT_SIPI
                  || pVCpu->em.s.enmPrevState == EMSTATE_HALTED))
             pVCpu->em.s.enmState = pVCpu->em.s.enmPrevState;
         else
-            pVCpu->em.s.enmState = emR3Reschedule(pVM, pVCpu);
+            pVCpu->em.s.enmState = emR3Reschedule(pVM, pVCpu);// 初始状态调度
         Log(("EMR3ExecuteVM: enmState=%s\n", emR3GetStateName(pVCpu->em.s.enmState)));
 
         STAM_REL_PROFILE_ADV_START(&pVCpu->em.s.StatTotal, x);
@@ -2182,6 +2184,7 @@ VMMR3_INT_DECL(int) EMR3ExecuteVM(PVM pVM, PVMCPU pVCpu)
              *
              * Do forced actions.
              */
+            // 处理强制动作（Forced Actions）
             if (   !fFFDone
                 && RT_SUCCESS(rc)
                 && rc != VINF_EM_TERMINATE
@@ -2189,7 +2192,7 @@ VMMR3_INT_DECL(int) EMR3ExecuteVM(PVM pVM, PVMCPU pVCpu)
                 && (   VM_FF_IS_ANY_SET(pVM, VM_FF_ALL_REM_MASK)
                     || VMCPU_FF_IS_ANY_SET(pVCpu, VMCPU_FF_ALL_REM_MASK & ~VMCPU_FF_UNHALT)))
             {
-                rc = emR3ForcedActions(pVM, pVCpu, rc);
+                rc = emR3ForcedActions(pVM, pVCpu, rc);// 处理中断、定时器等事件
                 VBOXVMM_EM_FF_ALL_RET(pVCpu, rc);
             }
             else if (fFFDone)
@@ -2204,13 +2207,14 @@ VMMR3_INT_DECL(int) EMR3ExecuteVM(PVM pVM, PVMCPU pVCpu)
              */
             Log2(("EMR3ExecuteVM: rc=%Rrc\n", rc));
             EMSTATE const enmOldState = pVCpu->em.s.enmState;
+            // 根据返回码（rc）调度状态
             switch (rc)
             {
                 /*
                  * Keep doing what we're currently doing.
                  */
                 case VINF_SUCCESS:
-                    break;
+                    break; // 继续当前执行模式
 
                 /*
                  * Reschedule - to main execution engine (HM, NEM, IEM/REM).
@@ -2225,7 +2229,7 @@ VMMR3_INT_DECL(int) EMR3ExecuteVM(PVM pVM, PVMCPU pVCpu)
                             if (HMCanExecuteGuest(pVM, pVCpu, &pVCpu->cpum.GstCtx))
                             {
                                 Log2(("EMR3ExecuteVM: VINF_EM_RESCHEDULE_EXEC_ENGINE: %d -> %d (EMSTATE_HM)\n", enmOldState, EMSTATE_HM));
-                                pVCpu->em.s.enmState = EMSTATE_HM;
+                                pVCpu->em.s.enmState = EMSTATE_HM;// 切换到硬件加速模式
                                 break;
                             }
                         }
@@ -2250,7 +2254,7 @@ VMMR3_INT_DECL(int) EMR3ExecuteVM(PVM pVM, PVMCPU pVCpu)
                     Assert(!pVM->em.s.fIemExecutesAll || pVCpu->em.s.enmState != EMSTATE_IEM);
                     Log2(("EMR3ExecuteVM: VINF_EM_RESCHEDULE_REM: %d -> %d (EMSTATE_REM)\n",
                           enmOldState, EMSTATE_RECOMPILER));
-                    pVCpu->em.s.enmState = EMSTATE_RECOMPILER;
+                    pVCpu->em.s.enmState = EMSTATE_RECOMPILER;// 切换到重编译器
                     break;
 
                 /*
@@ -2491,6 +2495,7 @@ VMMR3_INT_DECL(int) EMR3ExecuteVM(PVM pVM, PVMCPU pVCpu)
             /*
              * Act on the new state.
              */
+            // 执行当前状态的指令
             switch (enmNewState)
             {
                 /*

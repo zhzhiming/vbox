@@ -9060,6 +9060,15 @@ iemNativeEmitSimdLoadVecRegFromVecRegU128Ex(PIEMNATIVEINSTR pCodeBuf, uint32_t o
 /**
  * Emits a vecdst = vecsrc load, 128-bit.
  */
+/*
+当模拟器需要翻译Guest的SIMD指令时（如x86的 MOVAPS xmm0, xmm1）：
+    JIT编译器调用此函数，传入目标寄存器（xmm0）和源寄存器（xmm1）。
+    函数生成对应的Host机器码：
+    x86 Host：直接生成 MOVAPS 指令。
+    ARM Host：生成等效的NEON指令。
+    生成的机器码被写入可执行内存，后续由CPU直接运行。
+
+ * */
 DECL_INLINE_THROW(uint32_t)
 iemNativeEmitSimdLoadVecRegFromVecRegU128(PIEMRECOMPILERSTATE pReNative, uint32_t off, uint8_t iVecRegDst, uint8_t iVecRegSrc)
 {
@@ -9070,7 +9079,7 @@ iemNativeEmitSimdLoadVecRegFromVecRegU128(PIEMRECOMPILERSTATE pReNative, uint32_
 #else
 # error "port me"
 #endif
-    IEMNATIVE_ASSERT_INSTR_BUF_ENSURE(pReNative, off);
+    IEMNATIVE_ASSERT_INSTR_BUF_ENSURE(pReNative, off);// 确保缓冲区未溢出。
     return off;
 }
 

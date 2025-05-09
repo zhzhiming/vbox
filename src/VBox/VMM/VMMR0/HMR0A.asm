@@ -708,9 +708,9 @@ BEGINPROC RT_CONCAT(hmR0VmxStartVm,%1)
 .save_xmm_no_need:
   %endif
  %endif
-        push    xBP
+        push    xBP     ;建立栈帧，保存基址寄存器（xBP），并设置SEH（结构化异常处理）框架
         SEH64_PUSH_xBP
-        mov     xBP, xSP
+        mov     xBP, xSP ;xBP用于访问局部变量（如frm_*定义的栈偏移量）
         SEH64_SET_FRAME_xBP 0
         pushf
         cli
@@ -801,7 +801,7 @@ BEGINPROC RT_CONCAT(hmR0VmxStartVm,%1)
 
  %if %4 != 0
         ; Save the non-volatile SSE host register state.
-        movdqa  [rbp + frm_saved_xmm6 ], xmm6
+        movdqa  [rbp + frm_saved_xmm6 ], xmm6 ; 保存XMM6-XMM15
         movdqa  [rbp + frm_saved_xmm7 ], xmm7
         movdqa  [rbp + frm_saved_xmm8 ], xmm8
         movdqa  [rbp + frm_saved_xmm9 ], xmm9
@@ -811,7 +811,7 @@ BEGINPROC RT_CONCAT(hmR0VmxStartVm,%1)
         movdqa  [rbp + frm_saved_xmm13], xmm13
         movdqa  [rbp + frm_saved_xmm14], xmm14
         movdqa  [rbp + frm_saved_xmm15], xmm15
-        stmxcsr [rbp + frm_saved_mxcsr]
+        stmxcsr [rbp + frm_saved_mxcsr]      ; 保存MXCSR寄存器
 
         ; Load the guest state related to the above non-volatile and volatile SSE registers. Trashes rcx, eax and edx.
         lea     rcx, [rdi + CPUMCTX.XState]
@@ -858,7 +858,7 @@ BEGINPROC RT_CONCAT(hmR0VmxStartVm,%1)
  %endif
 
         ; Save host LDTR.
-        sldt    word [rbp + frm_saved_ldtr]
+        sldt    word [rbp + frm_saved_ldtr] ; 保存LDTR
 
  %ifndef VMX_SKIP_TR
         ; The host TR limit is reset to 0x67; save & restore it manually.
@@ -867,7 +867,7 @@ BEGINPROC RT_CONCAT(hmR0VmxStartVm,%1)
 
  %ifndef VMX_SKIP_GDTR
         ; VT-x only saves the base of the GDTR & IDTR and resets the limit to 0xffff; we must restore the limit correctly!
-        sgdt    [rbp + frm_saved_gdtr]
+        sgdt    [rbp + frm_saved_gdtr] ; 保存GDTR
  %endif
  %ifndef VMX_SKIP_IDTR
         sidt    [rbp + frm_saved_idtr]
@@ -913,10 +913,12 @@ BEGINPROC RT_CONCAT(hmR0VmxStartVm,%1)
  %endif
 
         ; Resume or start VM?
+        ; 检查fResume标志
         cmp     bl, 0                   ; fResume
 
         ; Load guest general purpose registers.
-        mov     rax, qword [rdi + CPUMCTX.eax]
+        ;从CPUMCTX结构体加载Guest的寄存器值到物理寄存器
+        mov     rax, qword [rdi + CPUMCTX.eax] ; 加载Guest通用寄存器
         mov     rbx, qword [rdi + CPUMCTX.ebx]
         mov     rcx, qword [rdi + CPUMCTX.ecx]
         mov     rdx, qword [rdi + CPUMCTX.edx]
@@ -932,10 +934,10 @@ BEGINPROC RT_CONCAT(hmR0VmxStartVm,%1)
         mov     r15, qword [rdi + CPUMCTX.r15]
         mov     rdi, qword [rdi + CPUMCTX.edi]
 
-        je      .vmlaunch64_launch
+        je      .vmlaunch64_launch ; 首次启动用vmlaunch
 
-        vmresume
-        jc      NAME(RT_CONCAT(hmR0VmxStartVmHostRIP,%1).vmxstart64_invalid_vmcs_ptr)
+        vmresume                   ; 否则用vmresume
+        jc      NAME(RT_CONCAT(hmR0VmxStartVmHostRIP,%1).vmxstart64_invalid_vmcs_ptr); 失败处理
         jz      NAME(RT_CONCAT(hmR0VmxStartVmHostRIP,%1).vmxstart64_start_failed)
         jmp     NAME(RT_CONCAT(hmR0VmxStartVmHostRIP,%1)) ; here if vmresume detected a failure
 
@@ -954,7 +956,7 @@ ALIGNCODE(8)
  %endif
         mov     [r9 + VMXVMCSINFO.uHostRip], rcx
         mov     eax, VMX_VMCS_HOST_RIP                      ;; @todo It is only strictly necessary to write VMX_VMCS_HOST_RIP when
-        vmwrite rax, rcx                                    ;;       the VMXVMCSINFO::pfnStartVM function changes (eventually
+        vmwrite rax, rcx                                    ;;       the VMXVMCSINFO::pfnStartVM function changes (eventually    ; 写入VMCS_HOST_RIP
  %ifdef VBOX_STRICT                                         ;;       take the Windows/SSE stuff into account then)...
         jna     NAME(RT_CONCAT(hmR0VmxStartVmHostRIP,%1).vmwrite_failed)
  %endif
@@ -967,7 +969,7 @@ ALIGNCODE(8)
  %endif
         mov     [r9 + VMXVMCSINFO.uHostRsp], rsp
         mov     eax, VMX_VMCS_HOST_RSP
-        vmwrite rax, rsp
+        vmwrite rax, rsp                                       ; 写入VMCS_HOST_RSP 确保VM-Exit时CPU能正确返回到Host的指令指针和栈位置
  %ifdef VBOX_STRICT
         jna     NAME(RT_CONCAT(hmR0VmxStartVmHostRIP,%1).vmwrite_failed)
  %endif
@@ -977,7 +979,6 @@ ALIGNCODE(64)
 GLOBALNAME RT_CONCAT(hmR0VmxStartVmHostRIP,%1)
         RESTORE_STATE_VMX 0, %2, %3, %4
         mov     eax, VINF_SUCCESS
-
 .vmstart64_end:
  %if %4 != 0
         mov     r11d, eax               ; save the return code.
@@ -1027,6 +1028,7 @@ GLOBALNAME RT_CONCAT(hmR0VmxStartVmHostRIP,%1)
         mov     eax, r11d
  %endif  ; %4 != 0
 
+        ;平衡栈指针并返回，状态码存储在eax中（VINF_SUCCESS或错误码）
         lea     rsp, [rbp + frm_fRFlags]
         popf
         leave

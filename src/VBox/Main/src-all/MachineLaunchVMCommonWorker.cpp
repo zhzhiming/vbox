@@ -81,6 +81,17 @@
  *                               if required.  Content is defined by the flags.
  * @param   aPid                 The PID of created process is returned here
  */
+/*
+aNameOrId                 const Utf8Str &                      虚拟机的名称或唯一标识符
+aComment                  const Utf8Str &                      虚拟机的注释（可选）
+aFrontend                 const Utf8Str &                      指定前端类型（如 "gui"、"sdl"、"headless"）
+aEnvironmentChanges       const std::vector<com::Utf8Str> &    需要修改的环境变量列表
+aExtraArg                 const Utf8Str &                      额外的命令行参数（可选）
+aFilename                 const Utf8Str &                      可执行文件名（仅在 macOS 特殊处理时使用）
+aFlags                    uint32_t                             进程创建标志（如是否隐藏窗口）
+aExtraData                void *                               额外数据（通常为 NULL）
+aPid                      RTPROCESS &                          输出参数，返回启动的进程 ID
+ * */
 int MachineLaunchVMCommonWorker(const Utf8Str &aNameOrId,
                                 const Utf8Str &aComment,
                                 const Utf8Str &aFrontend,
@@ -100,7 +111,7 @@ int MachineLaunchVMCommonWorker(const Utf8Str &aNameOrId,
 
     /* Get the path to the executable directory w/ trailing slash: */
     char szPath[RTPATH_MAX];
-    int vrc = RTPathAppPrivateArch(szPath, sizeof(szPath));
+    int vrc = RTPathAppPrivateArch(szPath, sizeof(szPath));//获取 VirtualBox 的安装目录（如 /usr/lib/virtualbox/）。确保路径以分隔符结尾（如 /）。
     AssertRCReturn(vrc, vrc);
     size_t cbBufLeft = RTPathEnsureTrailingSeparator(szPath, sizeof(szPath));
     AssertReturn(cbBufLeft > 0, VERR_FILENAME_TOO_LONG);
@@ -109,11 +120,14 @@ int MachineLaunchVMCommonWorker(const Utf8Str &aNameOrId,
 
     /* The process started when launching a VM with separate UI/VM processes is always
      * the UI process, i.e. needs special handling as it won't claim the session. */
+    //如果 aFrontend 包含 "separate"（不区分大小写），则标记 fSeparate = true，表示前端（如 GUI）和 VM 进程分开运行。
     bool fSeparate = aFrontend.endsWith("separate", Utf8Str::CaseInsensitive); NOREF(fSeparate);
 
     aPid = NIL_RTPROCESS;
 
     RTENV hEnv = RTENV_DEFAULT;
+    //如果 aEnvironmentChanges 非空，则根据当前模块（VBoxSVC 或 VBoxSDS）克隆或创建环境变量修改记录。
+    //遍历 aEnvironmentChanges，逐个应用环境变量修改。
     if (!aEnvironmentChanges.empty())
     {
 #ifdef IN_VBOXSVC
@@ -136,7 +150,7 @@ int MachineLaunchVMCommonWorker(const Utf8Str &aNameOrId,
             AssertRCReturnStmt(vrc, RTEnvDestroy(hEnv), vrc);
         }
     }
-
+   //根据前端类型启动对应程序
 #ifdef VBOX_WITH_QTGUI
     if (   !aFrontend.compare("gui", Utf8Str::CaseInsensitive)
         || !aFrontend.compare("GUI/Qt", Utf8Str::CaseInsensitive)
